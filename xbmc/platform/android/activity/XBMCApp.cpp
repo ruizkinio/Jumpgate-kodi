@@ -8,6 +8,7 @@
 
 #include "XBMCApp.h"
 
+#include "ModiKodiThresholds.h"
 #include "SubtitleDownloader.h"
 #include "TraktScrobbler.h"
 
@@ -421,6 +422,27 @@ void CXBMCApp::onStop()
 void CXBMCApp::onDestroy()
 {
   android_printf("%s", __PRETTY_FUNCTION__);
+
+  // Safety-net: save resume position to local file (F-008)
+  // Local file I/O only -- no Bridge POST (too slow for onDestroy)
+  if (m_externalPlayerMode.load(std::memory_order_relaxed) && m_traktScrobbler)
+  {
+    std::string imdb = m_traktScrobbler->GetImdbId();
+    if (!imdb.empty())
+    {
+      int season = m_traktScrobbler->GetSeason();
+      int episode = m_traktScrobbler->GetEpisode();
+      int64_t posMs = m_lastPlaybackTimeMs.load(std::memory_order_relaxed);
+      int64_t durMs = m_lastPlaybackDurationMs.load(std::memory_order_relaxed);
+      if (posMs > 0)
+      {
+        // Empty bridgeUrl skips the Bridge POST (SaveResumeForContent supports this)
+        SaveResumeForContent(imdb, season, episode, posMs, durMs, "");
+        android_printf("ModiKodi: onDestroy safety-net resume saved for %s pos=%lld dur=%lld",
+                       imdb.c_str(), (long long)posMs, (long long)durMs);
+      }
+    }
+  }
 
   if (m_subtitleDownloader)
   {
@@ -1001,6 +1023,13 @@ void CXBMCApp::OnPlayBackStopped()
 
 void CXBMCApp::ExitExternalPlayerMode(bool completed)
 {
+  // Kill timing analysis (F-012):
+  // ProcessSlow updates m_lastPlaybackTimeMs every ~500ms. ExitExternalPlayerMode
+  // reads the atomic values, which may be stale by up to 500ms. For a 2-hour movie
+  // this is 0.007% -- negligible for resume purposes. We do NOT snap fresh position
+  // from the player here because ApplicationPlayer may already be shutting down
+  // (OnStop announcement already fired) and GetTime() could return 0.
+
   if (!m_externalPlayerMode.load(std::memory_order_relaxed))
     return;
 
@@ -1048,7 +1077,7 @@ void CXBMCApp::SaveResumePosition()
 
   // Determine if playback completed (>90%)
   bool completed = (durMs > 0 && posMs > 0 &&
-                    static_cast<float>(posMs) / static_cast<float>(durMs) > 0.9f);
+                    static_cast<float>(posMs) / static_cast<float>(durMs) > ModiKodi::RESUME_CLEAR_RATIO);
 
   // Load existing resume store
   std::string storePath = CSpecialProtocol::TranslatePath(RESUME_STORE_FILE);
@@ -1166,7 +1195,7 @@ int CXBMCApp::LoadResumePosition(const std::string& imdbId, int season, int epis
     return 0;
 
   // If position is > 95% of duration, content was watched — start over
-  if (dur > 0 && static_cast<float>(pos) / static_cast<float>(dur) > 0.95f)
+  if (dur > 0 && static_cast<float>(pos) / static_cast<float>(dur) > ModiKodi::RESUME_DISCARD_RATIO)
     return 0;
 
   return static_cast<int>(pos);
@@ -1228,6 +1257,15 @@ void CXBMCApp::OnContentIdentified()
 
   m_resumeApplied.store(true, std::memory_order_relaxed);
   m_traktScrobbler->ClearBridgeResume();
+
+  // Propagate to SubtitleDownloader for late subtitle download (F-011)
+  // Always auto-download regardless of playback position (per user decision)
+  // Silent download -- no toast notification (per user decision)
+  if (m_subtitleDownloader)
+  {
+    m_subtitleDownloader->SetContentInfo(imdb, title, year, season, episode);
+    m_subtitleDownloader->TriggerSearch();
+  }
 }
 
 // --- Settings ---
@@ -1904,7 +1942,7 @@ static void SaveResumeForContent(const std::string& imdbId, int season, int epis
     key += ":" + std::to_string(season) + ":" + std::to_string(episode);
 
   bool completed = (durMs > 0 && posMs > 0 &&
-                    static_cast<float>(posMs) / static_cast<float>(durMs) > 0.9f);
+                    static_cast<float>(posMs) / static_cast<float>(durMs) > ModiKodi::RESUME_CLEAR_RATIO);
 
   // Load existing resume store
   std::string storePath = CSpecialProtocol::TranslatePath("special://profile/modikodi_resume.json");

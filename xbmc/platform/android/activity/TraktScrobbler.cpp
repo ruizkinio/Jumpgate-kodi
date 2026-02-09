@@ -6,6 +6,7 @@
 
 #include "TraktScrobbler.h"
 
+#include "ModiKodiThresholds.h"
 #include "ServiceBroker.h"
 #include "application/ApplicationComponents.h"
 #include "application/ApplicationPlayer.h"
@@ -80,6 +81,46 @@ void TraktScrobbler::Deinitialize()
 
   CServiceBroker::GetAnnouncementManager()->RemoveAnnouncer(this);
   m_initialized = false;
+
+  // Check if we need to send a ScrobbleStop (F-008: clear "currently watching" on exit)
+  bool shouldScrobbleStop = m_scrobbleActive && m_contentIdentified;
+
+  if (shouldScrobbleStop)
+  {
+    // Capture state by value before releasing lock
+    float progress = GetPlaybackProgress();
+    std::string scrobbleJson = BuildScrobbleJson(progress);
+    std::string accessToken = m_accessToken;
+    m_scrobbleActive = false; // Prevent concurrent ProcessSlow from sending updates
+
+    lock.unlock();
+
+    // Synchronous ScrobbleStop with tight 2s timeout (process may die any moment)
+    if (!scrobbleJson.empty() && !accessToken.empty())
+    {
+      XFILE::CCurlFile curl;
+      curl.SetRequestHeader("Content-Type", "application/json");
+      curl.SetRequestHeader("trakt-api-version", "2");
+      curl.SetRequestHeader("trakt-api-key", TRAKT_CLIENT_ID);
+      curl.SetRequestHeader("Authorization", "Bearer " + accessToken);
+      curl.SetTimeout(2);
+
+      std::string url = std::string(TRAKT_API_URL) + "/scrobble/stop";
+      std::string response;
+      bool ok = curl.Post(url, scrobbleJson, response);
+      CLog::Log(LOGINFO, "TraktScrobbler: Deinitialize ScrobbleStop {} at {:.1f}%",
+                ok ? "succeeded" : "failed", progress);
+    }
+    else
+    {
+      CLog::Log(LOGINFO, "TraktScrobbler: Deinitialize ScrobbleStop skipped (empty json or token)");
+    }
+  }
+  else
+  {
+    lock.unlock();
+  }
+
   CLog::Log(LOGINFO, "TraktScrobbler: Deinitialized");
 }
 
@@ -246,7 +287,7 @@ void TraktScrobbler::Announce(AnnouncementFlag flag,
 
       // Build watch history JSON under lock (reads content fields)
       std::string historyJson;
-      bool shouldSyncHistory = (progress > 80.0f && wasIdentified);
+      bool shouldSyncHistory = (progress > ModiKodi::TRAKT_HISTORY_SYNC_PCT && wasIdentified);
       if (shouldSyncHistory)
         historyJson = BuildSyncHistoryJson();
 
@@ -1127,7 +1168,7 @@ bool TraktScrobbler::QueryBridgeServer()
       int resumePos = static_cast<int>(data["resume"]["position"].asInteger(0));
       int resumeDur = static_cast<int>(data["resume"]["duration"].asInteger(0));
       if (resumeDur > 0 && resumePos > 0 &&
-          static_cast<float>(resumePos) / static_cast<float>(resumeDur) < 0.95f)
+          static_cast<float>(resumePos) / static_cast<float>(resumeDur) < ModiKodi::RESUME_DISCARD_RATIO)
       {
         m_bridgeResumePositionMs.store(resumePos, std::memory_order_relaxed);
         CLog::Log(LOGINFO, "TraktScrobbler: Bridge resume data - pos={} dur={}", resumePos, resumeDur);

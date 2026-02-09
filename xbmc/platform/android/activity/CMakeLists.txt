@@ -48,6 +48,7 @@ set(HEADERS AndroidJoyStick.h
             JNIXBMCSpeechRecognitionListener.h
             JNIXBMCConnectivityManagerNetworkCallback.h
             JNIXBMCBroadcastReceiver.h
+            ModiKodiThresholds.h
             SubtitleDownloader.h
             TraktScrobbler.h
             XBMCApp.h)

@@ -35,6 +35,9 @@ public:
                       int episode);
   void ClearContentInfo();
 
+  // Late subtitle download (F-011: propagate late content identification)
+  void TriggerSearch();
+
   // Language settings
   void SetLanguages(const std::string& languages);
   std::string GetLanguages() const;

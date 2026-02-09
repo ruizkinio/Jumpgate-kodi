@@ -360,6 +360,266 @@ void SubtitleDownloader::ClearContentInfo()
   m_subtitleLoaded = false;
 }
 
+// ---------------------------------------------------------------------------
+// TriggerSearch: Late subtitle download for Bridge-identified content (F-011).
+// Called from XBMCApp::OnContentIdentified() when content is identified after
+// playback has already started. Follows copy-release-do-reacquire pattern.
+// ---------------------------------------------------------------------------
+void SubtitleDownloader::TriggerSearch()
+{
+  std::unique_lock lock(m_critSection);
+
+  if (m_subtitleLoaded)
+  {
+    CLog::Log(LOGDEBUG, "SubtitleDownloader: Subtitles already loaded, skipping late search");
+    return;
+  }
+
+  if (m_imdbId.empty() && m_title.empty())
+  {
+    CLog::Log(LOGDEBUG, "SubtitleDownloader: No content info for subtitle search");
+    return;
+  }
+
+  if (m_apiKey.empty())
+  {
+    CLog::Log(LOGINFO, "SubtitleDownloader: No API key cached, skipping late search");
+    return;
+  }
+
+  // Copy all state for I/O
+  std::string apiKey = m_apiKey;
+  std::string username = m_username;
+  std::string password = m_password;
+  std::string jwtToken = m_jwtToken;
+  std::string imdbId = m_imdbId;
+  std::string title = m_title;
+  int year = m_year;
+  int season = m_season;
+  int episode = m_episode;
+  std::string languages = m_languages;
+  std::string imdbSnapshot = m_imdbId; // for check-and-abort
+
+  lock.unlock();
+
+  CLog::Log(LOGINFO, "SubtitleDownloader: Late subtitle download triggered for {}", imdbId);
+
+  // --- Login if needed (HTTP) ---
+  if (jwtToken.empty())
+  {
+    if (apiKey.empty() || username.empty() || password.empty())
+    {
+      CLog::Log(LOGWARNING, "SubtitleDownloader: Incomplete credentials, skipping late login");
+      return;
+    }
+
+    CVariant body(CVariant::VariantTypeObject);
+    body["username"] = username;
+    body["password"] = password;
+
+    std::string jsonBody;
+    CJSONVariantWriter::Write(body, jsonBody, true);
+
+    std::string response;
+    if (!OSPostWithCredentials("/login", jsonBody, response, apiKey, jwtToken))
+    {
+      CLog::Log(LOGERROR, "SubtitleDownloader: Late login request failed");
+      return;
+    }
+
+    CVariant result;
+    if (!CJSONVariantParser::Parse(response, result))
+    {
+      CLog::Log(LOGERROR, "SubtitleDownloader: Failed to parse late login response");
+      return;
+    }
+
+    jwtToken = result["token"].asString();
+    if (jwtToken.empty())
+    {
+      CLog::Log(LOGERROR, "SubtitleDownloader: No token in late login response");
+      return;
+    }
+
+    CLog::Log(LOGINFO, "SubtitleDownloader: Late login successful");
+
+    // Check-and-abort before writing token
+    lock.lock();
+    if (m_imdbId != imdbSnapshot)
+    {
+      CLog::Log(LOGINFO, "SubtitleDownloader: Discarding stale late login (content changed)");
+      return;
+    }
+    m_jwtToken = jwtToken;
+    lock.unlock();
+  }
+
+  // --- Search and download subtitles (HTTP) ---
+
+  // Parse languages list
+  std::vector<std::string> langs;
+  std::string langStr = languages;
+  size_t pos = 0;
+  while ((pos = langStr.find(',')) != std::string::npos)
+  {
+    std::string lang = langStr.substr(0, pos);
+    StringUtils::Trim(lang);
+    if (!lang.empty())
+      langs.push_back(lang);
+    langStr = langStr.substr(pos + 1);
+  }
+  StringUtils::Trim(langStr);
+  if (!langStr.empty())
+    langs.push_back(langStr);
+  if (langs.empty())
+    langs.push_back("en");
+
+  int loaded = 0;
+  for (const auto& lang : langs)
+  {
+    // Build search endpoint from copied state
+    std::string endpoint = "/subtitles?languages=" + lang;
+
+    if (!imdbId.empty())
+    {
+      std::string imdbNum = imdbId;
+      if (StringUtils::StartsWith(imdbNum, "tt"))
+        imdbNum = imdbNum.substr(2);
+      endpoint += "&imdb_id=" + imdbNum;
+    }
+    else if (!title.empty())
+    {
+      std::string encodedTitle = title;
+      StringUtils::Replace(encodedTitle, " ", "+");
+      endpoint += "&query=" + encodedTitle;
+    }
+    else
+    {
+      continue;
+    }
+
+    if (season >= 0 && episode >= 0)
+    {
+      endpoint += "&season_number=" + std::to_string(season);
+      endpoint += "&episode_number=" + std::to_string(episode);
+    }
+
+    CLog::Log(LOGINFO, "SubtitleDownloader: Late search [{}]: {}", lang, endpoint);
+
+    // Search HTTP
+    std::string searchResponse;
+    if (!OSGetWithCredentials(endpoint, searchResponse, apiKey, jwtToken))
+    {
+      CLog::Log(LOGERROR, "SubtitleDownloader: Late search failed for '{}'", lang);
+      continue;
+    }
+
+    CVariant searchResult;
+    if (!CJSONVariantParser::Parse(searchResponse, searchResult))
+      continue;
+
+    const CVariant& searchData = searchResult["data"];
+    if (!searchData.isArray() || searchData.size() == 0)
+    {
+      CLog::Log(LOGWARNING, "SubtitleDownloader: No late subtitle results for '{}'", lang);
+      continue;
+    }
+
+    const CVariant& first = searchData[0];
+    const CVariant& attributes = first["attributes"];
+    const CVariant& files = attributes["files"];
+
+    if (!files.isArray() || files.size() == 0)
+      continue;
+
+    int fileId = files[0]["file_id"].asInteger(0);
+    std::string fileName = files[0]["file_name"].asString();
+
+    if (fileId == 0)
+      continue;
+
+    CLog::Log(LOGINFO, "SubtitleDownloader: Late found subtitle [{}]: {} (file_id={})",
+              lang, fileName, fileId);
+
+    // Download HTTP
+    CVariant dlBody(CVariant::VariantTypeObject);
+    dlBody["file_id"] = fileId;
+
+    std::string dlJsonBody;
+    CJSONVariantWriter::Write(dlBody, dlJsonBody, true);
+
+    std::string dlResponse;
+    if (!OSPostWithCredentials("/download", dlJsonBody, dlResponse, apiKey, jwtToken))
+    {
+      CLog::Log(LOGERROR, "SubtitleDownloader: Late download request failed for '{}'", lang);
+      continue;
+    }
+
+    CVariant dlResult;
+    if (!CJSONVariantParser::Parse(dlResponse, dlResult))
+      continue;
+
+    std::string downloadLink = dlResult["link"].asString();
+    if (downloadLink.empty())
+      continue;
+
+    std::string subtitleContent;
+    XFILE::CCurlFile curl;
+    curl.SetTimeout(15);
+    if (!curl.Get(downloadLink, subtitleContent))
+    {
+      CLog::Log(LOGERROR, "SubtitleDownloader: Failed to download late subtitle file [{}]", lang);
+      continue;
+    }
+
+    // Save to temp file
+    std::string saveFileName = "subtitle_" + lang + ".srt";
+    std::string savePath = CSpecialProtocol::TranslatePath("special://temp/" + saveFileName);
+
+    XFILE::CFile file;
+    if (!file.OpenForWrite(savePath, true))
+      continue;
+
+    ssize_t written = file.Write(subtitleContent.c_str(), subtitleContent.size());
+    file.Close();
+
+    if (written != static_cast<ssize_t>(subtitleContent.size()))
+      continue;
+
+    // Load into player
+    auto& components = CServiceBroker::GetAppComponents();
+    auto appPlayer = components.GetComponent<CApplicationPlayer>();
+    appPlayer->AddSubtitle(savePath);
+
+    CLog::Log(LOGINFO, "SubtitleDownloader: Late subtitle loaded [{}]: {}", lang, savePath);
+    loaded++;
+  }
+
+  // Re-acquire lock to update state with staleness check
+  lock.lock();
+  if (m_imdbId != imdbSnapshot)
+  {
+    CLog::Log(LOGINFO, "SubtitleDownloader: Discarding stale late subtitle results (content changed)");
+    return;
+  }
+
+  if (loaded > 0)
+  {
+    m_subtitleLoaded = true;
+    lock.unlock();
+    CLog::Log(LOGINFO, "SubtitleDownloader: Late subtitle download complete ({} track(s))", loaded);
+    if (loaded > 1)
+    {
+      CGUIDialogKaiToast::QueueNotification(CGUIDialogKaiToast::Info,
+          "Subtitles", "Loaded " + std::to_string(loaded) + " subtitle track(s)", 3000, true);
+    }
+  }
+  else
+  {
+    CLog::Log(LOGWARNING, "SubtitleDownloader: Late subtitle download found no results");
+  }
+}
+
 void SubtitleDownloader::SetLanguages(const std::string& languages)
 {
   std::unique_lock lock(m_critSection);
