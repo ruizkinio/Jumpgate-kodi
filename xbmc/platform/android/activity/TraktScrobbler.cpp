@@ -1580,7 +1580,7 @@ std::string TraktScrobbler::ExtractTitleFromUrl(const std::string& url)
 
   StringUtils::Replace(bestSegment, ".", " ");
 
-  std::regex titleYearPattern("^(.+?)\\s+((?:19|20)\\d{2})\\b");
+  std::regex titleYearPattern("^(.+?)\\s+\\(?((?:19|20)\\d{2})\\)?\\b");
   std::smatch match;
   if (std::regex_search(bestSegment, match, titleYearPattern))
   {

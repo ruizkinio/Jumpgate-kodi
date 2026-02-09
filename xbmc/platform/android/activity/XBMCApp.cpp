@@ -133,6 +133,11 @@ using namespace KODI::GUILIB;
 using namespace KODI::VIDEO;
 using namespace std::chrono_literals;
 
+// Forward declaration for static helper used in both Deinitialize() and onNewIntent()
+static void SaveResumeForContent(const std::string& imdbId, int season, int episode,
+                                 int64_t posMs, int64_t durMs,
+                                 const std::string& bridgeUrl);
+
 std::shared_ptr<CNativeWindow> CNativeWindow::CreateFromSurface(CJNISurfaceHolder holder)
 {
   ANativeWindow* window = ANativeWindow_fromSurface(xbmc_jnienv(), holder.getSurface().get_raw());
