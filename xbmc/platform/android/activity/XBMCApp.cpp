@@ -1335,8 +1335,20 @@ void CXBMCApp::CheckForUpdate()
   if (remoteVersion.empty())
     return;
 
-  // Simple version comparison (semver-like: compare as strings for now)
-  if (remoteVersion != MODIKODI_VERSION && remoteVersion > MODIKODI_VERSION)
+  // Semver comparison using major/minor/patch fields from Bridge
+  int remoteMajor = static_cast<int>(data["major"].asInteger());
+  int remoteMinor = static_cast<int>(data["minor"].asInteger());
+  int remotePatch = static_cast<int>(data["patch"].asInteger());
+
+  // Parse local version
+  int localMajor = 0, localMinor = 0, localPatch = 0;
+  sscanf(MODIKODI_VERSION, "%d.%d.%d", &localMajor, &localMinor, &localPatch);
+
+  bool isNewer = (remoteMajor > localMajor) ||
+                 (remoteMajor == localMajor && remoteMinor > localMinor) ||
+                 (remoteMajor == localMajor && remoteMinor == localMinor && remotePatch > localPatch);
+
+  if (isNewer)
   {
     CLog::Log(LOGINFO, "CXBMCApp: Update available: {} -> {}", MODIKODI_VERSION, remoteVersion);
     CGUIDialogKaiToast::QueueNotification(
