@@ -9,6 +9,7 @@
 #include "interfaces/IAnnouncer.h"
 #include "threads/CriticalSection.h"
 
+#include <atomic>
 #include <string>
 
 class TraktScrobbler : public ANNOUNCEMENT::IAnnouncer
@@ -52,8 +53,9 @@ public:
   bool IsAuthenticatedPublic() const;
 
   // Bridge resume data (populated by QueryBridgeServer when available)
-  int GetBridgeResumePosition() const { return m_bridgeResumePositionMs; }
-  void ClearBridgeResume() { m_bridgeResumePositionMs = 0; }
+  // Uses std::atomic for lock-free cross-thread access (F-009 fix)
+  int GetBridgeResumePosition() const { return m_bridgeResumePositionMs.load(std::memory_order_relaxed); }
+  void ClearBridgeResume() { m_bridgeResumePositionMs.store(0, std::memory_order_relaxed); }
 
   // Trakt playback sync (cross-device resume)
   int GetTraktResumePosition();
@@ -76,6 +78,7 @@ private:
   bool ScrobbleStop(float progress);
   bool ScrobblePause(float progress);
   bool SyncWatchHistory();
+  std::string BuildSyncHistoryJson();
 
   // Content identification
   bool IdentifyContent();
@@ -87,7 +90,16 @@ private:
   // Bridge auto-detect
   void DetectBridgeUrl();
 
-  // HTTP helpers
+  // HTTP helpers (lock-free: accept token as parameter, no member access)
+  bool TraktPostWithToken(const std::string& endpoint,
+                          const std::string& jsonBody,
+                          std::string& response,
+                          const std::string& accessToken);
+  bool TraktGetWithToken(const std::string& endpoint,
+                         std::string& response,
+                         const std::string& accessToken);
+
+  // HTTP helpers (legacy wrappers: read token under lock, then call *WithToken)
   bool TraktPost(const std::string& endpoint,
                  const std::string& jsonBody,
                  std::string& response);
@@ -127,7 +139,8 @@ private:
   std::string m_bridgeUrl;
 
   // Bridge resume data (from /identify response)
-  int m_bridgeResumePositionMs{0};
+  // std::atomic for lock-free access from XBMCApp (F-009 fix)
+  std::atomic<int> m_bridgeResumePositionMs{0};
 
   // Periodic scrobble progress update (keeps Trakt /users/me/watching fresh)
   int64_t m_lastScrobbleUpdateTime{0};
