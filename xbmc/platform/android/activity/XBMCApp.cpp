@@ -2073,6 +2073,107 @@ void CXBMCApp::onNewIntent(CJNIIntent intent)
       if (mkEpisode >= 0) episode = mkEpisode;
     }
 
+    // --- Rapid content switching: stop old scrobble + save resume (F-007) ---
+    // Before clearing content for the new intent, capture the old content's state
+    // and fire-and-forget a ScrobbleStop + resume save on a detached thread.
+    if (m_traktScrobbler)
+    {
+      // Capture ALL state by value for the detached thread (zero references to this)
+      std::string oldImdbId = m_traktScrobbler->GetImdbId();
+      std::string oldTraktSlug = m_traktScrobbler->GetTraktSlug();
+      std::string oldTitle = m_traktScrobbler->GetTitle();
+      int oldYear = m_traktScrobbler->GetYear();
+      int oldSeason = m_traktScrobbler->GetSeason();
+      int oldEpisode = m_traktScrobbler->GetEpisode();
+      bool wasScrobbling = m_traktScrobbler->IsScrobbleActive();
+      std::string accessToken = m_traktScrobbler->GetAccessToken();
+      std::string bridgeUrl = m_traktScrobbler->GetBridgeUrl();
+      int64_t oldPosMs = m_lastPlaybackTimeMs.load(std::memory_order_relaxed);
+      int64_t oldDurMs = m_lastPlaybackDurationMs.load(std::memory_order_relaxed);
+
+      // Calculate progress for ScrobbleStop
+      float oldProgress = (oldDurMs > 0)
+          ? static_cast<float>(oldPosMs) / static_cast<float>(oldDurMs) * 100.0f
+          : 0.0f;
+
+      // Always attempt ScrobbleStop + resume save, even if content was never identified
+      // (per user decision: no-op on Trakt is acceptable, avoids edge cases)
+      if (oldPosMs > 0 || wasScrobbling)
+      {
+        CLog::Log(LOGINFO, "CXBMCApp: Rapid switch - saving old content state (imdb={}, pos={}, scrobbling={})",
+                  oldImdbId, oldPosMs, wasScrobbling);
+
+        // Fire-and-forget: detached thread captures everything by value
+        std::thread([oldImdbId, oldTraktSlug, oldTitle, oldYear, oldSeason, oldEpisode,
+                     wasScrobbling, accessToken, bridgeUrl, oldPosMs, oldDurMs, oldProgress]() {
+          // Save resume position for old content (local file + Bridge POST)
+          SaveResumeForContent(oldImdbId, oldSeason, oldEpisode, oldPosMs, oldDurMs, bridgeUrl);
+
+          // Send ScrobbleStop to Trakt if we were scrobbling and have content info
+          if (wasScrobbling && !accessToken.empty() && (!oldImdbId.empty() || !oldTraktSlug.empty()))
+          {
+            // Build scrobble JSON manually (can't use member method from detached thread)
+            CVariant root(CVariant::VariantTypeObject);
+            bool isEpisode = (oldSeason >= 0 && oldEpisode >= 0);
+
+            if (isEpisode)
+            {
+              CVariant show(CVariant::VariantTypeObject);
+              CVariant ids(CVariant::VariantTypeObject);
+              if (!oldImdbId.empty()) ids["imdb"] = oldImdbId;
+              if (!oldTraktSlug.empty()) ids["slug"] = oldTraktSlug;
+              show["ids"] = ids;
+              if (!oldTitle.empty()) show["title"] = oldTitle;
+              if (oldYear > 0) show["year"] = oldYear;
+
+              CVariant ep(CVariant::VariantTypeObject);
+              ep["season"] = oldSeason;
+              ep["number"] = oldEpisode;
+
+              root["show"] = show;
+              root["episode"] = ep;
+            }
+            else
+            {
+              CVariant movie(CVariant::VariantTypeObject);
+              CVariant ids(CVariant::VariantTypeObject);
+              if (!oldImdbId.empty()) ids["imdb"] = oldImdbId;
+              if (!oldTraktSlug.empty()) ids["slug"] = oldTraktSlug;
+              movie["ids"] = ids;
+              if (!oldTitle.empty()) movie["title"] = oldTitle;
+              if (oldYear > 0) movie["year"] = oldYear;
+              root["movie"] = movie;
+            }
+
+            root["progress"] = static_cast<double>(oldProgress);
+
+            std::string json;
+            if (CJSONVariantWriter::Write(root, json, true))
+            {
+              XFILE::CCurlFile curl;
+              curl.SetRequestHeader("Content-Type", "application/json");
+              curl.SetRequestHeader("trakt-api-version", "2");
+              curl.SetRequestHeader("trakt-api-key", "d4161a7a106424551add171e5470112e4afdaf2438e6ef2fe0548edc75924868");
+              curl.SetRequestHeader("Authorization", "Bearer " + accessToken);
+              curl.SetTimeout(5);
+
+              std::string url = std::string("https://api.trakt.tv") + "/scrobble/stop";
+              std::string response;
+              if (curl.Post(url, json, response))
+                CLog::Log(LOGINFO, "CXBMCApp: Rapid switch - ScrobbleStop sent for old content");
+              else
+                CLog::Log(LOGWARNING, "CXBMCApp: Rapid switch - ScrobbleStop failed (accepting loss)");
+            }
+          }
+        }).detach();
+      }
+
+      // Reset playback position/duration for new content
+      m_lastPlaybackTimeMs.store(0, std::memory_order_relaxed);
+      m_lastPlaybackDurationMs.store(0, std::memory_order_relaxed);
+    }
+    // --- End rapid content switching ---
+
     // Pass content info to TraktScrobbler
     if (m_traktScrobbler)
     {
