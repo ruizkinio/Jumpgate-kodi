@@ -261,7 +261,7 @@ void CXBMCApp::onStart()
                                               "isExternalPlayerMode", "()Z");
     if (extMode)
     {
-      m_externalPlayerMode = true;
+      m_externalPlayerMode.store(true, std::memory_order_relaxed);
       android_printf("CXBMCApp: External player mode detected at startup");
     }
 
@@ -516,7 +516,7 @@ void CXBMCApp::Initialize()
   CServiceBroker::GetAnnouncementManager()->AddAnnouncer(
       this, ANNOUNCEMENT::Input | ANNOUNCEMENT::Player | ANNOUNCEMENT::Info);
 
-  if (m_externalPlayerMode)
+  if (m_externalPlayerMode.load(std::memory_order_relaxed))
   {
     LoadSettings();
 
@@ -716,7 +716,7 @@ void CXBMCApp::run()
   android_printf(" => running XBMC_Run...");
 
   auto appParams = std::make_shared<CAppParams>();
-  if (m_externalPlayerMode)
+  if (m_externalPlayerMode.load(std::memory_order_relaxed))
     appParams->SetExternalPlayerMode(true);
   CAppEnvironment::SetUp(appParams);
   status = XBMC_Run(true);
@@ -1000,22 +1000,25 @@ void CXBMCApp::OnPlayBackStopped()
 
 void CXBMCApp::ExitExternalPlayerMode(bool completed)
 {
-  if (!m_externalPlayerMode)
+  if (!m_externalPlayerMode.load(std::memory_order_relaxed))
     return;
 
+  int64_t posMs = m_lastPlaybackTimeMs.load(std::memory_order_relaxed);
+  int64_t durMs = m_lastPlaybackDurationMs.load(std::memory_order_relaxed);
+
   CLog::Log(LOGINFO, "CXBMCApp: Exiting external player mode (completed={}, pos={}, dur={})",
-            completed, m_lastPlaybackTimeMs, m_lastPlaybackDurationMs);
+            completed, posMs, durMs);
 
   // Save resume position before exiting
   SaveResumePosition();
 
-  m_externalPlayerMode = false; // prevent re-entry
+  m_externalPlayerMode.store(false, std::memory_order_relaxed); // prevent re-entry
 
   // Call Java-side exitExternalPlayerMode to setResult() and finish()
   call_method<void>(m_context,
                     "exitExternalPlayerMode", "(JJZ)V",
-                    static_cast<jlong>(m_lastPlaybackTimeMs),
-                    static_cast<jlong>(m_lastPlaybackDurationMs),
+                    static_cast<jlong>(posMs),
+                    static_cast<jlong>(durMs),
                     static_cast<jboolean>(completed));
 }
 
@@ -1039,8 +1042,8 @@ void CXBMCApp::SaveResumePosition()
   if (season >= 0 && episode >= 0)
     key += ":" + std::to_string(season) + ":" + std::to_string(episode);
 
-  int64_t posMs = m_lastPlaybackTimeMs;
-  int64_t durMs = m_lastPlaybackDurationMs;
+  int64_t posMs = m_lastPlaybackTimeMs.load(std::memory_order_relaxed);
+  int64_t durMs = m_lastPlaybackDurationMs.load(std::memory_order_relaxed);
 
   // Determine if playback completed (>90%)
   bool completed = (durMs > 0 && posMs > 0 &&
@@ -1208,7 +1211,7 @@ void CXBMCApp::OnContentIdentified()
   if (savedPos <= 0)
     savedPos = m_traktScrobbler->GetTraktResumePosition();
 
-  if (savedPos > 0 && m_resumePositionMs <= 0)
+  if (savedPos > 0 && m_resumePositionMs.load(std::memory_order_relaxed) <= 0)
   {
     auto& components = CServiceBroker::GetAppComponents();
     const auto appPlayer = components.GetComponent<CApplicationPlayer>();
@@ -1222,7 +1225,7 @@ void CXBMCApp::OnContentIdentified()
     }
   }
 
-  m_resumeApplied = true;
+  m_resumeApplied.store(true, std::memory_order_relaxed);
   m_traktScrobbler->ClearBridgeResume();
 }
 
@@ -1482,7 +1485,7 @@ void CXBMCApp::ProcessSlow()
 
   // Track playback position for external player mode result
   // Track during both PLAYING and PAUSED states (video/audio flag stays set when paused)
-  if (m_externalPlayerMode && (m_playback_state & (PLAYBACK_STATE_VIDEO | PLAYBACK_STATE_AUDIO)))
+  if (m_externalPlayerMode.load(std::memory_order_relaxed) && (m_playback_state & (PLAYBACK_STATE_VIDEO | PLAYBACK_STATE_AUDIO)))
   {
     const auto& components = CServiceBroker::GetAppComponents();
     const auto appPlayer = components.GetComponent<CApplicationPlayer>();
@@ -1491,25 +1494,25 @@ void CXBMCApp::ProcessSlow()
     // Only update if we got valid values (player may return 0 briefly during transitions)
     if (currentTime > 0 || totalTime > 0)
     {
-      m_lastPlaybackTimeMs = currentTime;
-      m_lastPlaybackDurationMs = totalTime;
+      m_lastPlaybackTimeMs.store(currentTime, std::memory_order_relaxed);
+      m_lastPlaybackDurationMs.store(totalTime, std::memory_order_relaxed);
     }
   }
 
   // Trakt scrobbler: poll for device code auth
-  if (m_traktScrobbler && m_externalPlayerMode)
+  if (m_traktScrobbler && m_externalPlayerMode.load(std::memory_order_relaxed))
     m_traktScrobbler->ProcessSlow();
 
   // Content-ID based late resume: when content is identified after playback starts
-  if (m_externalPlayerMode && m_traktScrobbler && !m_resumeApplied)
+  if (m_externalPlayerMode.load(std::memory_order_relaxed) && m_traktScrobbler && !m_resumeApplied.load(std::memory_order_relaxed))
     OnContentIdentified();
 
   // Settings dialog (triggered by Menu key from input thread)
-  if (m_externalPlayerMode && m_settingsRequested.exchange(false))
+  if (m_externalPlayerMode.load(std::memory_order_relaxed) && m_settingsRequested.exchange(false))
     ShowSettingsDialog();
 
   // One-time update check
-  if (m_externalPlayerMode && !m_updateChecked && GetSettingBool("auto_update_check", true))
+  if (m_externalPlayerMode.load(std::memory_order_relaxed) && !m_updateChecked && GetSettingBool("auto_update_check", true))
   {
     m_updateChecked = true;
     CheckForUpdate();
@@ -1952,7 +1955,7 @@ void CXBMCApp::onNewIntent(CJNIIntent intent)
   // (ACTION_GET_CONTENT is Kodi's internal leanback navigation, not external player)
   if (!targetFile.empty() && action == CJNIIntent::ACTION_VIEW)
   {
-    m_externalPlayerMode = true;
+    m_externalPlayerMode.store(true, std::memory_order_relaxed);
     CLog::Log(LOGINFO, "CXBMCApp: External player mode activated for: {}", targetFile);
 
     // Create TraktScrobbler lazily if not yet initialized
@@ -2040,8 +2043,8 @@ void CXBMCApp::onNewIntent(CJNIIntent intent)
         CLog::Log(LOGINFO, "CXBMCApp: Resume from local store: {} ms", resumePositionMs);
     }
 
-    m_resumePositionMs = resumePositionMs;
-    m_resumeApplied = (resumePositionMs > 0); // Mark applied if we got it from intent/store
+    m_resumePositionMs.store(resumePositionMs, std::memory_order_relaxed);
+    m_resumeApplied.store((resumePositionMs > 0), std::memory_order_relaxed); // Mark applied if we got it from intent/store
   }
 
   if (!targetFile.empty() &&
@@ -2084,10 +2087,11 @@ void CXBMCApp::onNewIntent(CJNIIntent intent)
         item->SetPath(item->GetVideoInfoTag()->m_strFileNameAndPath);
       }
       // Set resume position if provided by caller (in external player mode)
-      if (m_externalPlayerMode && m_resumePositionMs > 0)
+      int resumeMs = m_resumePositionMs.load(std::memory_order_relaxed);
+      if (m_externalPlayerMode.load(std::memory_order_relaxed) && resumeMs > 0)
       {
-        item->SetStartOffset(static_cast<int64_t>(m_resumePositionMs));
-        CLog::Log(LOGINFO, "CXBMCApp: Setting start offset to {} ms for resume", m_resumePositionMs);
+        item->SetStartOffset(static_cast<int64_t>(resumeMs));
+        CLog::Log(LOGINFO, "CXBMCApp: Setting start offset to {} ms for resume", resumeMs);
       }
       CServiceBroker::GetAppMessenger()->PostMsg(TMSG_MEDIA_PLAY, 0, 0, static_cast<void*>(item));
     }
@@ -2367,7 +2371,7 @@ void CXBMCApp::UnregisterInputDeviceEventHandler()
 bool CXBMCApp::onInputDeviceEvent(const AInputEvent* event)
 {
   // Intercept Menu key in external player mode to show settings dialog
-  if (m_externalPlayerMode && AInputEvent_getType(event) == AINPUT_EVENT_TYPE_KEY)
+  if (m_externalPlayerMode.load(std::memory_order_relaxed) && AInputEvent_getType(event) == AINPUT_EVENT_TYPE_KEY)
   {
     int32_t keycode = AKeyEvent_getKeyCode(event);
     int32_t action = AKeyEvent_getAction(event);
