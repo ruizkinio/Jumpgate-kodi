@@ -53,7 +53,18 @@ private:
   bool SearchSubtitles(const std::string& language, int& outFileId, std::string& outFileName);
   bool DownloadSubtitle(int fileId, const std::string& fileName, const std::string& language);
 
-  // HTTP helpers
+  // HTTP helpers (lock-free: accept credentials as parameter, no member access)
+  bool OSGetWithCredentials(const std::string& endpoint,
+                            std::string& response,
+                            const std::string& apiKey,
+                            const std::string& jwtToken);
+  bool OSPostWithCredentials(const std::string& endpoint,
+                             const std::string& jsonBody,
+                             std::string& response,
+                             const std::string& apiKey,
+                             const std::string& jwtToken);
+
+  // HTTP helpers (legacy wrappers: read credentials from members)
   bool OSGet(const std::string& endpoint, std::string& response);
   bool OSPost(const std::string& endpoint, const std::string& jsonBody,
               std::string& response);
