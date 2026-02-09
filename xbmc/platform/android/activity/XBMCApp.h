@@ -185,8 +185,8 @@ public:
   void OnPlayBackStopped();
 
   // External player mode
-  bool IsExternalPlayerMode() const { return m_externalPlayerMode; }
-  void SetExternalPlayerMode(bool mode) { m_externalPlayerMode = mode; }
+  bool IsExternalPlayerMode() const { return m_externalPlayerMode.load(std::memory_order_relaxed); }
+  void SetExternalPlayerMode(bool mode) { m_externalPlayerMode.store(mode, std::memory_order_relaxed); }
   void ExitExternalPlayerMode(bool completed);
 
   // Version
@@ -303,12 +303,12 @@ private:
   int64_t m_frameTimeNanos{0};
   float m_refreshRate{0.0f};
 
-  // External player mode state
-  bool m_externalPlayerMode{false};
-  int64_t m_lastPlaybackTimeMs{0};
-  int64_t m_lastPlaybackDurationMs{0};
-  int m_resumePositionMs{0};
-  bool m_resumeApplied{false}; // Prevents double-seek from content-ID resume
+  // External player mode state (atomic: written on JNI thread, read on Kodi Main thread)
+  std::atomic<bool> m_externalPlayerMode{false};
+  std::atomic<int64_t> m_lastPlaybackTimeMs{0};     // F-003: atomic prevents torn reads on ARM32
+  std::atomic<int64_t> m_lastPlaybackDurationMs{0};  // F-003: atomic prevents torn reads on ARM32
+  std::atomic<int> m_resumePositionMs{0};
+  std::atomic<bool> m_resumeApplied{false}; // Prevents double-seek from content-ID resume
 
   // Resume store file
   static constexpr const char* RESUME_STORE_FILE = "special://profile/modikodi_resume.json";
