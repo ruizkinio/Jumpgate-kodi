@@ -56,7 +56,7 @@ void TraktScrobbler::Initialize()
     return;
 
   LoadTokens();
-  m_bridgeUrl = BRIDGE_SERVER_URL;
+  m_bridgeUrl = BRIDGE_CLOUD_URL;
   DetectBridgeUrl();
   CServiceBroker::GetAnnouncementManager()->AddAnnouncer(this, ANNOUNCEMENT::Player);
   m_initialized = true;
@@ -693,32 +693,32 @@ bool TraktScrobbler::SyncWatchHistory()
 void TraktScrobbler::DetectBridgeUrl()
 {
   // If user configured a URL via settings (SetBridgeUrl), keep it
-  if (!m_bridgeUrl.empty() && m_bridgeUrl != BRIDGE_SERVER_URL)
+  if (!m_bridgeUrl.empty() && m_bridgeUrl != BRIDGE_CLOUD_URL)
   {
     CLog::Log(LOGINFO, "TraktScrobbler: Using user-configured Bridge URL: {}", m_bridgeUrl);
     return;
   }
 
-  // Try localhost (ADB reverse or local Bridge)
-  const std::string localUrl = "http://127.0.0.1:7515";
+  // Try localhost first (ADB reverse or local Bridge — useful for development)
   XFILE::CCurlFile curl;
   curl.SetTimeout(2);
   std::string response;
 
-  if (curl.Get(localUrl + "/manifest.json", response))
+  if (curl.Get(std::string(BRIDGE_LOCAL_URL) + "/manifest.json", response))
   {
     CVariant data;
     if (CJSONVariantParser::Parse(response, data) &&
         data["id"].asString() == "com.modikodi.bridge")
     {
-      m_bridgeUrl = localUrl;
-      CLog::Log(LOGINFO, "TraktScrobbler: Bridge auto-detected at {}", m_bridgeUrl);
+      m_bridgeUrl = BRIDGE_LOCAL_URL;
+      CLog::Log(LOGINFO, "TraktScrobbler: Bridge auto-detected locally at {}", m_bridgeUrl);
       return;
     }
   }
 
-  // No Bridge found — keep default but log
-  CLog::Log(LOGDEBUG, "TraktScrobbler: Bridge not detected, using default: {}", m_bridgeUrl);
+  // Fall back to cloud URL (default for end users)
+  m_bridgeUrl = BRIDGE_CLOUD_URL;
+  CLog::Log(LOGINFO, "TraktScrobbler: Using cloud Bridge at {}", m_bridgeUrl);
 }
 
 bool TraktScrobbler::QueryBridgeServer()

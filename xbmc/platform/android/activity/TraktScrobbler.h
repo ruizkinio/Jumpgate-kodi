@@ -143,9 +143,9 @@ private:
   static constexpr const char* TRAKT_CLIENT_ID = "d4161a7a106424551add171e5470112e4afdaf2438e6ef2fe0548edc75924868";
   static constexpr const char* TRAKT_CLIENT_SECRET = "b5fcd7cb5d9bb963784d11bbf8535bc0d25d46225016191eb48e50792d2155c0";
 
-  // ModiKodi Bridge server URL for zero-config content identification
-  // Change this to your deployment URL (e.g., https://your-bridge.onrender.com)
-  static constexpr const char* BRIDGE_SERVER_URL = "http://127.0.0.1:7515";
+  // ModiKodi Bridge server URLs
+  static constexpr const char* BRIDGE_CLOUD_URL = "https://modikodi.fly.dev";
+  static constexpr const char* BRIDGE_LOCAL_URL = "http://127.0.0.1:7515";
 
   mutable CCriticalSection m_critSection;
 };
