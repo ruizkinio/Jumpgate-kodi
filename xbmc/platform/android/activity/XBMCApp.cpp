@@ -8,6 +8,9 @@
 
 #include "XBMCApp.h"
 
+#include "SubtitleDownloader.h"
+#include "TraktScrobbler.h"
+
 #include "AndroidKey.h"
 #include "CompileInfo.h"
 #include "FileItem.h"
@@ -25,8 +28,14 @@
 #include "cores/AudioEngine/Interfaces/AE.h"
 #include "cores/AudioEngine/Sinks/AESinkAUDIOTRACK.h"
 #include "cores/VideoPlayer/VideoRenderers/RenderManager.h"
+#include "filesystem/CurlFile.h"
+#include "filesystem/File.h"
 #include "filesystem/SpecialProtocol.h"
 #include "filesystem/VideoDatabaseFile.h"
+#include "dialogs/GUIDialogKaiToast.h"
+#include "dialogs/GUIDialogSelect.h"
+#include "dialogs/GUIDialogYesNo.h"
+#include "guilib/GUIKeyboardFactory.h"
 #include "guilib/GUIComponent.h"
 #include "guilib/GUIWindowManager.h"
 #include "guilib/guiinfo/GUIInfoLabels.h"
@@ -43,6 +52,7 @@
 #include "settings/SettingsComponent.h"
 #include "threads/Event.h"
 #include "utils/JSONVariantParser.h"
+#include "utils/JSONVariantWriter.h"
 #include "utils/StringUtils.h"
 #include "utils/TimeUtils.h"
 #include "utils/URIUtils.h"
@@ -68,6 +78,7 @@
 #include <time.h>
 
 #include <android/bitmap.h>
+#include <android/input.h>
 #include <android/configuration.h>
 #include <android/log.h>
 #include <android/native_window.h>
@@ -100,6 +111,7 @@
 #include <androidjni/View.h>
 #include <androidjni/Window.h>
 #include <androidjni/WindowManager.h>
+#include <androidjni/jutils-details.hpp>
 #include <crossguid/guid.hpp>
 #include <dlfcn.h>
 #include <jni.h>
@@ -244,6 +256,15 @@ void CXBMCApp::onStart()
 
   if (m_firstrun)
   {
+    // Check if Java-side detected external player mode (set in Main.onCreate)
+    jboolean extMode = call_method<jboolean>(m_context,
+                                              "isExternalPlayerMode", "()Z");
+    if (extMode)
+    {
+      m_externalPlayerMode = true;
+      android_printf("CXBMCApp: External player mode detected at startup");
+    }
+
     // Register sink
     AE::CAESinkFactory::ClearSinks();
     CAESinkAUDIOTRACK::Register();
@@ -400,6 +421,18 @@ void CXBMCApp::onDestroy()
 {
   android_printf("%s", __PRETTY_FUNCTION__);
 
+  if (m_subtitleDownloader)
+  {
+    m_subtitleDownloader->Deinitialize();
+    m_subtitleDownloader.reset();
+  }
+
+  if (m_traktScrobbler)
+  {
+    m_traktScrobbler->Deinitialize();
+    m_traktScrobbler.reset();
+  }
+
   unregisterReceiver(*this);
 
   UnregisterDisplayListener();
@@ -482,6 +515,26 @@ void CXBMCApp::Initialize()
 {
   CServiceBroker::GetAnnouncementManager()->AddAnnouncer(
       this, ANNOUNCEMENT::Input | ANNOUNCEMENT::Player | ANNOUNCEMENT::Info);
+
+  if (m_externalPlayerMode)
+  {
+    LoadSettings();
+
+    m_traktScrobbler = std::make_unique<TraktScrobbler>();
+    m_traktScrobbler->Initialize();
+
+    // Pass Bridge URL from settings if configured
+    std::string bridgeUrl = GetSettingString("bridge_url", "");
+    if (!bridgeUrl.empty())
+      m_traktScrobbler->SetBridgeUrl(bridgeUrl);
+
+    m_subtitleDownloader = std::make_unique<SubtitleDownloader>();
+    m_subtitleDownloader->Initialize();
+
+    // Pass subtitle language from settings
+    std::string subLangs = GetSettingString("subtitle_languages", "en");
+    m_subtitleDownloader->SetLanguages(subLangs);
+  }
 }
 
 void CXBMCApp::Deinitialize()
@@ -662,7 +715,10 @@ void CXBMCApp::run()
   m_firstrun = false;
   android_printf(" => running XBMC_Run...");
 
-  CAppEnvironment::SetUp(std::make_shared<CAppParams>());
+  auto appParams = std::make_shared<CAppParams>();
+  if (m_externalPlayerMode)
+    appParams->SetExternalPlayerMode(true);
+  CAppEnvironment::SetUp(appParams);
   status = XBMC_Run(true);
   CAppEnvironment::TearDown();
 
@@ -942,6 +998,458 @@ void CXBMCApp::OnPlayBackStopped()
   ReleaseAudioFocus();
 }
 
+void CXBMCApp::ExitExternalPlayerMode(bool completed)
+{
+  if (!m_externalPlayerMode)
+    return;
+
+  CLog::Log(LOGINFO, "CXBMCApp: Exiting external player mode (completed={}, pos={}, dur={})",
+            completed, m_lastPlaybackTimeMs, m_lastPlaybackDurationMs);
+
+  // Save resume position before exiting
+  SaveResumePosition();
+
+  m_externalPlayerMode = false; // prevent re-entry
+
+  // Call Java-side exitExternalPlayerMode to setResult() and finish()
+  call_method<void>(m_context,
+                    "exitExternalPlayerMode", "(JJZ)V",
+                    static_cast<jlong>(m_lastPlaybackTimeMs),
+                    static_cast<jlong>(m_lastPlaybackDurationMs),
+                    static_cast<jboolean>(completed));
+}
+
+void CXBMCApp::SaveResumePosition()
+{
+  if (!m_traktScrobbler)
+    return;
+
+  std::string imdb = m_traktScrobbler->GetImdbId();
+  if (imdb.empty())
+  {
+    CLog::Log(LOGDEBUG, "CXBMCApp: SaveResumePosition - no IMDB ID, skipping");
+    return;
+  }
+
+  int season = m_traktScrobbler->GetSeason();
+  int episode = m_traktScrobbler->GetEpisode();
+
+  // Build content key
+  std::string key = imdb;
+  if (season >= 0 && episode >= 0)
+    key += ":" + std::to_string(season) + ":" + std::to_string(episode);
+
+  int64_t posMs = m_lastPlaybackTimeMs;
+  int64_t durMs = m_lastPlaybackDurationMs;
+
+  // Determine if playback completed (>90%)
+  bool completed = (durMs > 0 && posMs > 0 &&
+                    static_cast<float>(posMs) / static_cast<float>(durMs) > 0.9f);
+
+  // Load existing resume store
+  std::string storePath = CSpecialProtocol::TranslatePath(RESUME_STORE_FILE);
+  CVariant store(CVariant::VariantTypeObject);
+
+  XFILE::CFile file;
+  std::vector<uint8_t> buffer;
+  if (file.LoadFile(storePath, buffer) > 0)
+  {
+    std::string json(buffer.begin(), buffer.end());
+    CJSONVariantParser::Parse(json, store);
+  }
+
+  if (completed)
+  {
+    // Remove entry — content is fully watched
+    if (store.isMember(key))
+      store.erase(key);
+    CLog::Log(LOGINFO, "CXBMCApp: Resume cleared for {} (completed)", key);
+  }
+  else if (posMs > 0)
+  {
+    // Save position
+    CVariant entry(CVariant::VariantTypeObject);
+    entry["position"] = posMs;
+    entry["duration"] = durMs;
+    entry["timestamp"] = static_cast<int64_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+    store[key] = entry;
+    CLog::Log(LOGINFO, "CXBMCApp: Resume saved for {} - pos={} dur={}", key, posMs, durMs);
+  }
+
+  // Cleanup entries older than 30 days
+  int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::system_clock::now().time_since_epoch())
+                    .count();
+  std::vector<std::string> expiredKeys;
+  for (auto it = store.begin_map(); it != store.end_map(); ++it)
+  {
+    int64_t ts = it->second["timestamp"].asInteger(0);
+    if (ts > 0 && (now - ts) > 30 * 24 * 3600)
+      expiredKeys.push_back(it->first);
+  }
+  for (const auto& k : expiredKeys)
+    store.erase(k);
+
+  // Write back
+  std::string json;
+  if (CJSONVariantWriter::Write(store, json, true))
+  {
+    XFILE::CFile outFile;
+    if (outFile.OpenForWrite(storePath, true))
+    {
+      outFile.Write(json.c_str(), json.size());
+      outFile.Close();
+    }
+  }
+
+  // POST to Bridge /resume (fire-and-forget, 2s timeout)
+  {
+    XFILE::CCurlFile curl;
+    curl.SetRequestHeader("Content-Type", "application/json");
+    curl.SetTimeout(2);
+
+    CVariant body(CVariant::VariantTypeObject);
+    body["imdb"] = imdb;
+    body["season"] = (season >= 0) ? std::to_string(season) : "";
+    body["episode"] = (episode >= 0) ? std::to_string(episode) : "";
+    body["position"] = posMs;
+    body["duration"] = durMs;
+
+    std::string bodyJson;
+    CJSONVariantWriter::Write(body, bodyJson, true);
+
+    std::string bridgeUrl = m_traktScrobbler->GetBridgeUrl() + "/resume";
+    std::string response;
+    curl.Post(bridgeUrl, bodyJson, response);
+    // Ignore errors — Bridge may not be running
+  }
+}
+
+int CXBMCApp::LoadResumePosition(const std::string& imdbId, int season, int episode)
+{
+  if (imdbId.empty())
+    return 0;
+
+  std::string key = imdbId;
+  if (season >= 0 && episode >= 0)
+    key += ":" + std::to_string(season) + ":" + std::to_string(episode);
+
+  std::string storePath = CSpecialProtocol::TranslatePath(RESUME_STORE_FILE);
+
+  XFILE::CFile file;
+  std::vector<uint8_t> buffer;
+  if (file.LoadFile(storePath, buffer) <= 0)
+    return 0;
+
+  std::string json(buffer.begin(), buffer.end());
+  CVariant store;
+  if (!CJSONVariantParser::Parse(json, store) || !store.isMember(key))
+    return 0;
+
+  const CVariant& entry = store[key];
+  int64_t pos = entry["position"].asInteger(0);
+  int64_t dur = entry["duration"].asInteger(0);
+  int64_t ts = entry["timestamp"].asInteger(0);
+
+  // Check expiry (30 days)
+  int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::system_clock::now().time_since_epoch())
+                    .count();
+  if (ts > 0 && (now - ts) > 30 * 24 * 3600)
+    return 0;
+
+  // If position is > 95% of duration, content was watched — start over
+  if (dur > 0 && static_cast<float>(pos) / static_cast<float>(dur) > 0.95f)
+    return 0;
+
+  return static_cast<int>(pos);
+}
+
+void CXBMCApp::OnContentIdentified()
+{
+  if (!m_traktScrobbler || !m_traktScrobbler->IsContentIdentified())
+    return;
+
+  std::string imdb = m_traktScrobbler->GetImdbId();
+  if (imdb.empty())
+    return;
+
+  std::string title = m_traktScrobbler->GetTitle();
+  int year = m_traktScrobbler->GetYear();
+  int season = m_traktScrobbler->GetSeason();
+  int episode = m_traktScrobbler->GetEpisode();
+
+  // Show content identification toast
+  std::string toastMsg;
+  if (!title.empty())
+  {
+    toastMsg = title;
+    if (year > 0)
+      toastMsg += " (" + std::to_string(year) + ")";
+    if (season >= 0 && episode >= 0)
+      toastMsg += " S" + std::to_string(season) + "E" + std::to_string(episode);
+  }
+  else
+  {
+    toastMsg = imdb;
+    if (season >= 0 && episode >= 0)
+      toastMsg += " S" + std::to_string(season) + "E" + std::to_string(episode);
+  }
+  CGUIDialogKaiToast::QueueNotification(
+      CGUIDialogKaiToast::Info, "ModiKodi", "Identified: " + toastMsg, 5000, true);
+
+  // Check resume position: Bridge → local store → Trakt sync
+  int savedPos = m_traktScrobbler->GetBridgeResumePosition();
+  if (savedPos <= 0)
+    savedPos = LoadResumePosition(imdb, season, episode);
+  if (savedPos <= 0)
+    savedPos = m_traktScrobbler->GetTraktResumePosition();
+
+  if (savedPos > 0 && m_resumePositionMs <= 0)
+  {
+    auto& components = CServiceBroker::GetAppComponents();
+    const auto appPlayer = components.GetComponent<CApplicationPlayer>();
+    // Only seek if player is in the first 60 seconds (avoid disrupting user if they've been watching)
+    if (appPlayer->GetTime() < 60000)
+    {
+      appPlayer->SeekTime(savedPos);
+      CLog::Log(LOGINFO, "CXBMCApp: Late resume to {} ms (content identified after playback start)", savedPos);
+      CGUIDialogKaiToast::QueueNotification(
+          CGUIDialogKaiToast::Info, "ModiKodi", "Resuming playback", 3000, true);
+    }
+  }
+
+  m_resumeApplied = true;
+  m_traktScrobbler->ClearBridgeResume();
+}
+
+// --- Settings ---
+
+void CXBMCApp::LoadSettings()
+{
+  std::unique_lock lock(m_settingsMutex);
+
+  std::string path = CSpecialProtocol::TranslatePath(SETTINGS_FILE);
+  XFILE::CFile file;
+  std::vector<uint8_t> buffer;
+
+  if (file.LoadFile(path, buffer) > 0)
+  {
+    std::string json(buffer.begin(), buffer.end());
+    if (CJSONVariantParser::Parse(json, m_settings))
+    {
+      CLog::Log(LOGINFO, "CXBMCApp: Settings loaded from {}", path);
+      return;
+    }
+  }
+
+  // Initialize defaults
+  m_settings = CVariant(CVariant::VariantTypeObject);
+  m_settings["subtitle_languages"] = "en";
+  m_settings["trakt_enabled"] = true;
+  m_settings["subtitles_enabled"] = true;
+  m_settings["bridge_url"] = "";
+  m_settings["auto_update_check"] = true;
+  CLog::Log(LOGINFO, "CXBMCApp: Settings initialized with defaults");
+}
+
+void CXBMCApp::SaveSettings()
+{
+  std::unique_lock lock(m_settingsMutex);
+
+  std::string json;
+  if (!CJSONVariantWriter::Write(m_settings, json, true))
+  {
+    CLog::Log(LOGERROR, "CXBMCApp: Failed to serialize settings");
+    return;
+  }
+
+  std::string path = CSpecialProtocol::TranslatePath(SETTINGS_FILE);
+  XFILE::CFile outFile;
+  if (outFile.OpenForWrite(path, true))
+  {
+    outFile.Write(json.c_str(), json.size());
+    outFile.Close();
+    CLog::Log(LOGINFO, "CXBMCApp: Settings saved");
+  }
+}
+
+std::string CXBMCApp::GetSettingString(const std::string& key, const std::string& defaultVal) const
+{
+  std::unique_lock lock(m_settingsMutex);
+  if (m_settings.isMember(key))
+    return m_settings[key].asString();
+  return defaultVal;
+}
+
+bool CXBMCApp::GetSettingBool(const std::string& key, bool defaultVal) const
+{
+  std::unique_lock lock(m_settingsMutex);
+  if (m_settings.isMember(key))
+    return m_settings[key].asBoolean();
+  return defaultVal;
+}
+
+void CXBMCApp::SetSetting(const std::string& key, const std::string& value)
+{
+  {
+    std::unique_lock lock(m_settingsMutex);
+    m_settings[key] = value;
+  }
+  SaveSettings();
+}
+
+void CXBMCApp::SetSetting(const std::string& key, bool value)
+{
+  {
+    std::unique_lock lock(m_settingsMutex);
+    m_settings[key] = value;
+  }
+  SaveSettings();
+}
+
+void CXBMCApp::CheckForUpdate()
+{
+  if (!m_traktScrobbler)
+    return;
+
+  std::string bridgeUrl = m_traktScrobbler->GetBridgeUrl();
+  if (bridgeUrl.empty())
+    return;
+
+  XFILE::CCurlFile curl;
+  curl.SetTimeout(3);
+  std::string response;
+
+  if (!curl.Get(bridgeUrl + "/version", response))
+    return;
+
+  CVariant data;
+  if (!CJSONVariantParser::Parse(response, data))
+    return;
+
+  std::string remoteVersion = data["version"].asString();
+  if (remoteVersion.empty())
+    return;
+
+  // Simple version comparison (semver-like: compare as strings for now)
+  if (remoteVersion != MODIKODI_VERSION && remoteVersion > MODIKODI_VERSION)
+  {
+    CLog::Log(LOGINFO, "CXBMCApp: Update available: {} -> {}", MODIKODI_VERSION, remoteVersion);
+    CGUIDialogKaiToast::QueueNotification(
+        CGUIDialogKaiToast::Info, "ModiKodi",
+        "Update available: v" + remoteVersion, 7000, true);
+  }
+  else
+  {
+    CLog::Log(LOGDEBUG, "CXBMCApp: Version up to date ({})", MODIKODI_VERSION);
+  }
+}
+
+void CXBMCApp::ShowSettingsDialog()
+{
+  CGUIDialogSelect* dialog =
+      CServiceBroker::GetGUI()->GetWindowManager().GetWindow<CGUIDialogSelect>(
+          WINDOW_DIALOG_SELECT);
+
+  if (!dialog)
+    return;
+
+  dialog->Reset();
+  dialog->SetHeading(CVariant{"ModiKodi Settings"});
+
+  // Menu items
+  dialog->Add("Subtitle Languages (" + GetSettingString("subtitle_languages", "en") + ")");
+  dialog->Add(std::string("Trakt Account") +
+              (m_traktScrobbler && m_traktScrobbler->IsAuthenticatedPublic()
+                   ? " (Connected)"
+                   : " (Not connected)"));
+  dialog->Add("OpenSubtitles Account");
+  dialog->Add("Bridge Server URL");
+  dialog->Add("About ModiKodi");
+
+  dialog->Open();
+
+  if (!dialog->IsConfirmed())
+    return;
+
+  int sel = dialog->GetSelectedItem();
+
+  switch (sel)
+  {
+    case 0: // Subtitle Languages
+    {
+      std::string langs = GetSettingString("subtitle_languages", "en");
+      if (CGUIKeyboardFactory::ShowAndGetInput(
+              langs, CVariant{"Subtitle languages (comma-separated: en,es,fr)"}, true))
+      {
+        if (langs.empty())
+          langs = "en";
+        SetSetting("subtitle_languages", langs);
+        CGUIDialogKaiToast::QueueNotification(
+            CGUIDialogKaiToast::Info, "ModiKodi",
+            "Subtitle languages: " + langs, 3000, true);
+      }
+      break;
+    }
+    case 1: // Trakt Account
+    {
+      if (m_traktScrobbler && m_traktScrobbler->IsAuthenticatedPublic())
+      {
+        bool signOut = CGUIDialogYesNo::ShowAndGetInput(
+            CVariant{"Trakt Account"},
+            CVariant{"Connected to Trakt. Sign out and re-authenticate?"});
+        if (signOut)
+        {
+          m_traktScrobbler->ForceReAuth();
+        }
+      }
+      else if (m_traktScrobbler)
+      {
+        m_traktScrobbler->ForceReAuth();
+      }
+      break;
+    }
+    case 2: // OpenSubtitles Account
+    {
+      if (m_subtitleDownloader)
+      {
+        // Reinitialize will re-prompt for credentials
+        m_subtitleDownloader->Deinitialize();
+        m_subtitleDownloader->Initialize();
+        CGUIDialogKaiToast::QueueNotification(
+            CGUIDialogKaiToast::Info, "ModiKodi",
+            "OpenSubtitles will prompt for credentials on next play", 3000, true);
+      }
+      break;
+    }
+    case 3: // Bridge Server URL
+    {
+      std::string url = GetSettingString("bridge_url", "");
+      if (CGUIKeyboardFactory::ShowAndGetInput(
+              url, CVariant{"Bridge URL (empty = auto-detect)"}, true))
+      {
+        SetSetting("bridge_url", url);
+        CGUIDialogKaiToast::QueueNotification(
+            CGUIDialogKaiToast::Info, "ModiKodi",
+            url.empty() ? "Bridge: auto-detect" : "Bridge: " + url, 3000, true);
+      }
+      break;
+    }
+    case 4: // About
+    {
+      CGUIDialogKaiToast::QueueNotification(
+          CGUIDialogKaiToast::Info, "ModiKodi",
+          std::string("ModiKodi v") + MODIKODI_VERSION + " - External Player for Stremio",
+          5000, true);
+      break;
+    }
+  }
+}
+
 const CJNIViewInputDevice CXBMCApp::GetInputDevice(int deviceId)
 {
   CJNIInputManager inputManager(getSystemService(CJNIContext::INPUT_SERVICE));
@@ -959,6 +1467,41 @@ void CXBMCApp::ProcessSlow()
   if ((m_playback_state & PLAYBACK_STATE_PLAYING) && !m_mediaSessionUpdated &&
       m_mediaSession->isActive())
     UpdateSessionState();
+
+  // Track playback position for external player mode result
+  // Track during both PLAYING and PAUSED states (video/audio flag stays set when paused)
+  if (m_externalPlayerMode && (m_playback_state & (PLAYBACK_STATE_VIDEO | PLAYBACK_STATE_AUDIO)))
+  {
+    const auto& components = CServiceBroker::GetAppComponents();
+    const auto appPlayer = components.GetComponent<CApplicationPlayer>();
+    int64_t currentTime = appPlayer->GetTime();
+    int64_t totalTime = appPlayer->GetTotalTime();
+    // Only update if we got valid values (player may return 0 briefly during transitions)
+    if (currentTime > 0 || totalTime > 0)
+    {
+      m_lastPlaybackTimeMs = currentTime;
+      m_lastPlaybackDurationMs = totalTime;
+    }
+  }
+
+  // Trakt scrobbler: poll for device code auth
+  if (m_traktScrobbler && m_externalPlayerMode)
+    m_traktScrobbler->ProcessSlow();
+
+  // Content-ID based late resume: when content is identified after playback starts
+  if (m_externalPlayerMode && m_traktScrobbler && !m_resumeApplied)
+    OnContentIdentified();
+
+  // Settings dialog (triggered by Menu key from input thread)
+  if (m_externalPlayerMode && m_settingsRequested.exchange(false))
+    ShowSettingsDialog();
+
+  // One-time update check
+  if (m_externalPlayerMode && !m_updateChecked && GetSettingBool("auto_update_check", true))
+  {
+    m_updateChecked = true;
+    CheckForUpdate();
+  }
 }
 
 std::vector<androidPackage> CXBMCApp::GetApplications() const
@@ -1341,6 +1884,154 @@ void CXBMCApp::onNewIntent(CJNIIntent intent)
   std::string action = intent.getAction();
   CLog::Log(LOGDEBUG, "CXBMCApp::onNewIntent - Got intent. Action: {}", action);
   std::string targetFile = GetFilenameFromIntent(intent);
+
+  // Parse and strip ModiKodi Bridge metadata from URL (_mk_imdb, _mk_type, _mk_s, _mk_e)
+  // These are appended by the ModiKodi Bridge Stremio addon for content identification.
+  std::string mkImdbId;
+  int mkSeason = -1;
+  int mkEpisode = -1;
+  if (!targetFile.empty())
+  {
+    auto extractParam = [](const std::string& url, const std::string& key) -> std::string {
+      std::string search = key + "=";
+      auto pos = url.find(search);
+      if (pos == std::string::npos)
+        return "";
+      auto start = pos + search.size();
+      auto end = url.find('&', start);
+      return url.substr(start, end == std::string::npos ? std::string::npos : end - start);
+    };
+
+    mkImdbId = extractParam(targetFile, "_mk_imdb");
+    std::string mkS = extractParam(targetFile, "_mk_s");
+    std::string mkE = extractParam(targetFile, "_mk_e");
+    if (!mkS.empty()) mkSeason = std::atoi(mkS.c_str());
+    if (!mkE.empty()) mkEpisode = std::atoi(mkE.c_str());
+
+    if (!mkImdbId.empty())
+    {
+      CLog::Log(LOGINFO, "CXBMCApp: ModiKodi Bridge metadata - imdb={} S{}E{}", mkImdbId, mkSeason, mkEpisode);
+      // Strip all _mk_* params from URL before passing to the player
+      std::string cleanUrl = targetFile;
+      // Remove _mk_* params (handles both ?_mk_ and &_mk_ cases)
+      while (true)
+      {
+        auto pos = cleanUrl.find("_mk_");
+        if (pos == std::string::npos)
+          break;
+        // Find the separator before this param (? or &)
+        auto sepPos = (pos > 0 && (cleanUrl[pos - 1] == '?' || cleanUrl[pos - 1] == '&'))
+                          ? pos - 1 : pos;
+        // Find the end of this param
+        auto endPos = cleanUrl.find('&', pos);
+        if (endPos == std::string::npos)
+          cleanUrl.erase(sepPos);
+        else
+          cleanUrl.erase(sepPos, endPos - sepPos);
+      }
+      // Clean up trailing ? if all params were removed
+      if (!cleanUrl.empty() && cleanUrl.back() == '?')
+        cleanUrl.pop_back();
+      targetFile = cleanUrl;
+    }
+  }
+
+  // Detect external player mode: ACTION_VIEW with a media file
+  // (ACTION_GET_CONTENT is Kodi's internal leanback navigation, not external player)
+  if (!targetFile.empty() && action == CJNIIntent::ACTION_VIEW)
+  {
+    m_externalPlayerMode = true;
+    CLog::Log(LOGINFO, "CXBMCApp: External player mode activated for: {}", targetFile);
+
+    // Create TraktScrobbler lazily if not yet initialized
+    if (!m_traktScrobbler)
+    {
+      m_traktScrobbler = std::make_unique<TraktScrobbler>();
+      m_traktScrobbler->Initialize();
+    }
+
+    // Extract content ID extras forwarded from Splash
+    std::string imdbId;
+    std::string title;
+    int year = 0;
+    int season = -1;
+    int episode = -1;
+
+    if (intent.hasExtra("imdb_id"))
+      imdbId = intent.getStringExtra("imdb_id");
+    if (intent.hasExtra("title"))
+      title = intent.getStringExtra("title");
+    if (intent.hasExtra("year"))
+      year = intent.getIntExtra("year", 0);
+    if (intent.hasExtra("season"))
+      season = intent.getIntExtra("season", -1);
+    if (intent.hasExtra("episode"))
+      episode = intent.getIntExtra("episode", -1);
+
+    // ModiKodi Bridge metadata takes priority over intent extras
+    if (!mkImdbId.empty())
+    {
+      imdbId = mkImdbId;
+      if (mkSeason >= 0) season = mkSeason;
+      if (mkEpisode >= 0) episode = mkEpisode;
+    }
+
+    // Pass content info to TraktScrobbler
+    if (m_traktScrobbler)
+    {
+      m_traktScrobbler->ClearContentInfo();
+      m_traktScrobbler->SetContentInfo(imdbId, title, year, season, episode);
+      m_traktScrobbler->SetMediaUrl(targetFile);
+    }
+
+    // Pass content info to SubtitleDownloader
+    if (!m_subtitleDownloader)
+    {
+      m_subtitleDownloader = std::make_unique<SubtitleDownloader>();
+      m_subtitleDownloader->Initialize();
+    }
+    if (m_subtitleDownloader)
+    {
+      m_subtitleDownloader->ClearContentInfo();
+      m_subtitleDownloader->SetContentInfo(imdbId, title, year, season, episode);
+    }
+
+    // Read resume position from caller intent (ms)
+    // VLC uses "extra_position" (long), MX Player/mpv use "position" (int)
+    // Stremio uses "startfrom" (milliseconds)
+    int resumePositionMs = 0;
+    if (intent.hasExtra("position"))
+      resumePositionMs = intent.getIntExtra("position", 0);
+    else if (intent.hasExtra("extra_position"))
+      resumePositionMs = intent.getIntExtra("extra_position", 0);
+
+    // Also check Stremio's "startfrom" extra
+    if (resumePositionMs <= 0 && intent.hasExtra("startfrom"))
+    {
+      int startFrom = intent.getIntExtra("startfrom", 0);
+      if (startFrom > 0)
+      {
+        // Auto-detect seconds vs milliseconds: if value < 10000 treat as seconds
+        resumePositionMs = (startFrom < 10000) ? startFrom * 1000 : startFrom;
+        CLog::Log(LOGINFO, "CXBMCApp: startfrom={} interpreted as {} ms", startFrom, resumePositionMs);
+      }
+    }
+
+    if (resumePositionMs > 0)
+      CLog::Log(LOGINFO, "CXBMCApp: Resume position from intent: {} ms", resumePositionMs);
+
+    // If we have IMDB but no intent-provided resume position, check local resume store
+    if (resumePositionMs <= 0 && !mkImdbId.empty())
+    {
+      resumePositionMs = LoadResumePosition(mkImdbId, mkSeason, mkEpisode);
+      if (resumePositionMs > 0)
+        CLog::Log(LOGINFO, "CXBMCApp: Resume from local store: {} ms", resumePositionMs);
+    }
+
+    m_resumePositionMs = resumePositionMs;
+    m_resumeApplied = (resumePositionMs > 0); // Mark applied if we got it from intent/store
+  }
+
   if (!targetFile.empty() &&
       (action == CJNIIntent::ACTION_VIEW || action == CJNIIntent::ACTION_GET_CONTENT))
   {
@@ -1379,6 +2070,12 @@ void CXBMCApp::onNewIntent(CJNIIntent intent)
       {
         *(item->GetVideoInfoTag()) = XFILE::CVideoDatabaseFile::GetVideoTag(item->GetURL());
         item->SetPath(item->GetVideoInfoTag()->m_strFileNameAndPath);
+      }
+      // Set resume position if provided by caller (in external player mode)
+      if (m_externalPlayerMode && m_resumePositionMs > 0)
+      {
+        item->SetStartOffset(static_cast<int64_t>(m_resumePositionMs));
+        CLog::Log(LOGINFO, "CXBMCApp: Setting start offset to {} ms for resume", m_resumePositionMs);
       }
       CServiceBroker::GetAppMessenger()->PostMsg(TMSG_MEDIA_PLAY, 0, 0, static_cast<void*>(item));
     }
@@ -1657,6 +2354,19 @@ void CXBMCApp::UnregisterInputDeviceEventHandler()
 
 bool CXBMCApp::onInputDeviceEvent(const AInputEvent* event)
 {
+  // Intercept Menu key in external player mode to show settings dialog
+  if (m_externalPlayerMode && AInputEvent_getType(event) == AINPUT_EVENT_TYPE_KEY)
+  {
+    int32_t keycode = AKeyEvent_getKeyCode(event);
+    int32_t action = AKeyEvent_getAction(event);
+    // AKEYCODE_MENU = 82, AKEYCODE_GUIDE = 172
+    if ((keycode == 82 || keycode == 172) && action == AKEY_EVENT_ACTION_UP)
+    {
+      m_settingsRequested = true;
+      return true;
+    }
+  }
+
   if (m_inputDeviceEventHandler != nullptr)
     return m_inputDeviceEventHandler->OnInputDeviceEvent(event);
 

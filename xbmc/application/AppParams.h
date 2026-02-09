@@ -45,6 +45,9 @@ public:
   bool IsTestMode() const { return m_testmode; }
   void SetTestMode(bool testMode) { m_testmode = testMode; }
 
+  bool IsExternalPlayerMode() const { return m_externalPlayerMode; }
+  void SetExternalPlayerMode(bool mode) { m_externalPlayerMode = mode; }
+
   const std::string& GetSettingsFile() const { return m_settingsFile; }
   void SetSettingsFile(const std::string& settingsFile) { m_settingsFile = settingsFile; }
 
@@ -87,6 +90,7 @@ private:
   bool m_startFullScreen{false};
   bool m_standAlone{false};
   bool m_testmode{false};
+  bool m_externalPlayerMode{false};
 
   std::string m_settingsFile;
   std::string m_windowing;

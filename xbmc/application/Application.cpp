@@ -665,8 +665,9 @@ bool CApplication::Initialize()
     std::vector<AddonInfoPtr> incompatibleAddons;
     event.Reset();
 
-    // Addon migration
-    if (CServiceBroker::GetAddonMgr().GetIncompatibleEnabledAddonInfos(incompatibleAddons))
+    // Addon migration (skip in external player mode for faster startup)
+    if (!CServiceBroker::GetAppParams()->IsExternalPlayerMode() &&
+        CServiceBroker::GetAddonMgr().GetIncompatibleEnabledAddonInfos(incompatibleAddons))
     {
       if (CAddonSystemSettings::GetInstance().GetAddonAutoUpdateMode() == AUTO_UPDATES_ON)
       {
@@ -780,7 +781,9 @@ bool CApplication::Initialize()
 
   if (!profileManager->UsingLoginScreen())
   {
-    UpdateLibraries();
+    // Skip library scanning in external player mode for faster startup
+    if (!CServiceBroker::GetAppParams()->IsExternalPlayerMode())
+      UpdateLibraries();
     SetLoggingIn(false);
   }
 
@@ -792,9 +795,13 @@ bool CApplication::Initialize()
   appListener->RegisterActionListener(&appPlayer->GetSeekHandler());
   appListener->RegisterActionListener(&CPlayerController::GetInstance());
 
-  CServiceBroker::GetRepositoryUpdater().Start();
-  if (!profileManager->UsingLoginScreen())
-    CServiceBroker::GetServiceAddons().Start();
+  // Skip repository updates and service addons in external player mode
+  if (!CServiceBroker::GetAppParams()->IsExternalPlayerMode())
+  {
+    CServiceBroker::GetRepositoryUpdater().Start();
+    if (!profileManager->UsingLoginScreen())
+      CServiceBroker::GetServiceAddons().Start();
+  }
 
   CLog::Log(LOGINFO, "initialize done");
 

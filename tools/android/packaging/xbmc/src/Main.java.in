@@ -39,6 +39,11 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
   private View mDecorView = null;
   private Handler handler = new Handler(Looper.myLooper());
 
+  // External player mode: when launched via ACTION_VIEW from another app
+  private boolean mExternalPlayerMode = false;
+  private long mLastPlaybackPosition = 0;  // ms
+  private long mLastPlaybackDuration = 0;  // ms
+
   private class DelayedIntent
   {
     public Intent mIntent;
@@ -118,16 +123,24 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
 
     super.onCreate(savedInstanceState);
 
+    // Detect external player mode from Splash forwarded intent
+    mExternalPlayerMode = getIntent().getBooleanExtra("external_player_mode", false);
+    if (mExternalPlayerMode) {
+      Log.d(TAG, "Main: External player mode activated");
+    }
+
     setContentView(R.layout.activity_main);
     setVolumeControlStream(AudioManager.STREAM_MUSIC);
 
     mSettingsContentObserver = new XBMCSettingsContentObserver(this, handler);
     getApplicationContext().getContentResolver().registerContentObserver(android.provider.Settings.System.CONTENT_URI, true, mSettingsContentObserver);
 
-    // Delayed Intent
+    // Delayed Intent — wait for native engine to initialize before dispatching media URL
+    // External player mode skips addon migration/library scan, so it initializes faster
     if (getIntent().getData() != null)
     {
-      mDelayedIntents.add(new DelayedIntent(new Intent(getIntent()), 5000));
+      int delay = mExternalPlayerMode ? 2000 : 5000;
+      mDelayedIntents.add(new DelayedIntent(new Intent(getIntent()), delay));
       getIntent().setData(null);
     }
 
@@ -351,5 +364,57 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
       name = res.activityInfo.packageName;
     }
     return name;
+  }
+
+  // --- External Player Mode ---
+
+  /**
+   * Called from native code when playback position updates
+   */
+  public void updatePlaybackPosition(long positionMs, long durationMs) {
+    mLastPlaybackPosition = positionMs;
+    mLastPlaybackDuration = durationMs;
+  }
+
+  /**
+   * Called from native code when external player mode should exit.
+   * Sets the result intent with VLC/MX Player compatible extras and finishes.
+   */
+  public void exitExternalPlayerMode(long positionMs, long durationMs, boolean completed) {
+    Log.d(TAG, "Main: Exiting external player mode. pos=" + positionMs + " dur=" + durationMs
+            + " completed=" + completed);
+
+    Intent result = new Intent("org.videolan.vlc.player.result");
+
+    // VLC-compatible extras (long)
+    result.putExtra("extra_position", positionMs);
+    result.putExtra("extra_duration", durationMs);
+
+    // MX Player compatible extras (int)
+    result.putExtra("position", (int) positionMs);
+    result.putExtra("duration", (int) durationMs);
+    result.putExtra("end_by", completed ? "playback_completion" : "user");
+
+    // Always return RESULT_OK with position data (VLC protocol standard).
+    // RESULT_CANCELED causes some apps (like Stremio) to discard position data.
+    // The "end_by" extra distinguishes completion vs user-stopped.
+    setResult(RESULT_OK, result);
+    finish();
+
+    // Kill the process after a short delay so setResult() is delivered first.
+    // Kodi's native engine (XBMC_Run thread, m_firstrun state) cannot be cleanly
+    // restarted within the same process — stale native state causes black screen
+    // on re-launch and prevents normal launcher starts after external player exit.
+    handler.postDelayed(new Runnable() {
+      @Override
+      public void run() {
+        Log.d(TAG, "Main: Killing process after external player exit");
+        android.os.Process.killProcess(android.os.Process.myPid());
+      }
+    }, 500);
+  }
+
+  public boolean isExternalPlayerMode() {
+    return mExternalPlayerMode;
   }
 }

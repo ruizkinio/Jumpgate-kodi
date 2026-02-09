@@ -17,6 +17,7 @@
 #include "JNIXBMCMediaSession.h"
 #include "interfaces/IAnnouncer.h"
 #include "platform/xbmc.h"
+#include "utils/Variant.h"
 #include "threads/Event.h"
 #include "utils/Geometry.h"
 
@@ -40,6 +41,8 @@ class CVariant;
 class IInputDeviceCallbacks;
 class IInputDeviceEventHandler;
 class CVideoSyncAndroid;
+class TraktScrobbler;
+class SubtitleDownloader;
 
 typedef struct _JNIEnv JNIEnv;
 
@@ -181,6 +184,31 @@ public:
   void OnPlayBackPaused();
   void OnPlayBackStopped();
 
+  // External player mode
+  bool IsExternalPlayerMode() const { return m_externalPlayerMode; }
+  void SetExternalPlayerMode(bool mode) { m_externalPlayerMode = mode; }
+  void ExitExternalPlayerMode(bool completed);
+
+  // Version
+  static constexpr const char* MODIKODI_VERSION = "3.0.0";
+
+  // Resume store (content-ID based cross-source resume)
+  void SaveResumePosition();
+  int LoadResumePosition(const std::string& imdbId, int season, int episode);
+  void OnContentIdentified();
+
+  // Settings
+  void LoadSettings();
+  void SaveSettings();
+  void ShowSettingsDialog();
+  std::string GetSettingString(const std::string& key, const std::string& defaultVal = "") const;
+  bool GetSettingBool(const std::string& key, bool defaultVal = true) const;
+  void SetSetting(const std::string& key, const std::string& value);
+  void SetSetting(const std::string& key, bool value);
+
+  // Auto-update
+  void CheckForUpdate();
+
   // Info callback
   void UpdateSessionMetadata();
   void UpdateSessionState();
@@ -274,6 +302,29 @@ private:
   uint32_t m_playback_state{0};
   int64_t m_frameTimeNanos{0};
   float m_refreshRate{0.0f};
+
+  // External player mode state
+  bool m_externalPlayerMode{false};
+  int64_t m_lastPlaybackTimeMs{0};
+  int64_t m_lastPlaybackDurationMs{0};
+  int m_resumePositionMs{0};
+  bool m_resumeApplied{false}; // Prevents double-seek from content-ID resume
+
+  // Resume store file
+  static constexpr const char* RESUME_STORE_FILE = "special://profile/modikodi_resume.json";
+
+  // Settings
+  static constexpr const char* SETTINGS_FILE = "special://profile/modikodi_settings.json";
+  CVariant m_settings;
+  mutable CCriticalSection m_settingsMutex;
+  std::atomic<bool> m_settingsRequested{false};
+  bool m_updateChecked{false};
+
+  // Trakt scrobbler (external player mode only)
+  std::unique_ptr<TraktScrobbler> m_traktScrobbler;
+
+  // Subtitle downloader (external player mode only)
+  std::unique_ptr<SubtitleDownloader> m_subtitleDownloader;
 
 public:
   // CJNISurfaceHolderCallback interface

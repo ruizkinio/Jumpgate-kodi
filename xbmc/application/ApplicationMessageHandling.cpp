@@ -653,6 +653,11 @@ bool CApplicationMessageHandling::OnMessage(const CGUIMessage& message)
       CServiceBroker::GetXBPython().OnPlayBackStopped();
 #endif
 
+#ifdef TARGET_ANDROID
+      if (CXBMCApp::Get().IsExternalPlayerMode())
+        CXBMCApp::Get().ExitExternalPlayerMode(false); // user stopped
+#endif
+
       playCountIncrementedHandler.HandlePlaycountIncremented();
       return true;
     }
@@ -695,7 +700,15 @@ bool CApplicationMessageHandling::OnMessage(const CGUIMessage& message)
       if (!isEpgPlaylistItem)
       {
         if (!CServiceBroker::GetPlaylistPlayer().PlayNext(1, true))
+        {
           m_app.GetComponent<CApplicationPlayer>()->ClosePlayer();
+
+#ifdef TARGET_ANDROID
+          // External player mode: exit after playback completed with no next item
+          if (CXBMCApp::Get().IsExternalPlayerMode())
+            CXBMCApp::Get().ExitExternalPlayerMode(true); // completed
+#endif
+        }
 
         m_app.PlaybackCleanup();
       }
