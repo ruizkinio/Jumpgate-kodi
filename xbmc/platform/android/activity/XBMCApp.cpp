@@ -74,6 +74,7 @@
 #include <mutex>
 #include <sstream>
 #include <stdlib.h>
+#include <thread>
 #include <string.h>
 #include <time.h>
 
@@ -1885,6 +1886,87 @@ void CXBMCApp::OnWakeup()
     auto& components = CServiceBroker::GetAppComponents();
     const auto appPower = components.GetComponent<CApplicationPowerHandling>();
     appPower->WakeUpScreenSaverAndDPMS();
+  }
+}
+
+// --- Static helper for rapid content switching (F-007) ---
+// Takes all parameters by value so it can be called from a detached thread
+// with zero references to any object instance.
+static void SaveResumeForContent(const std::string& imdbId, int season, int episode,
+                                 int64_t posMs, int64_t durMs,
+                                 const std::string& bridgeUrl)
+{
+  if (imdbId.empty() || posMs <= 0)
+    return;
+
+  std::string key = imdbId;
+  if (season >= 0 && episode >= 0)
+    key += ":" + std::to_string(season) + ":" + std::to_string(episode);
+
+  bool completed = (durMs > 0 && posMs > 0 &&
+                    static_cast<float>(posMs) / static_cast<float>(durMs) > 0.9f);
+
+  // Load existing resume store
+  std::string storePath = CSpecialProtocol::TranslatePath("special://profile/modikodi_resume.json");
+  CVariant store(CVariant::VariantTypeObject);
+
+  XFILE::CFile file;
+  std::vector<uint8_t> buffer;
+  if (file.LoadFile(storePath, buffer) > 0)
+  {
+    std::string json(buffer.begin(), buffer.end());
+    CJSONVariantParser::Parse(json, store);
+  }
+
+  if (completed)
+  {
+    if (store.isMember(key))
+      store.erase(key);
+    CLog::Log(LOGINFO, "SaveResumeForContent: Cleared {} (completed)", key);
+  }
+  else
+  {
+    CVariant entry(CVariant::VariantTypeObject);
+    entry["position"] = posMs;
+    entry["duration"] = durMs;
+    entry["timestamp"] = static_cast<int64_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+    store[key] = entry;
+    CLog::Log(LOGINFO, "SaveResumeForContent: Saved {} - pos={} dur={}", key, posMs, durMs);
+  }
+
+  // Write back
+  std::string json;
+  if (CJSONVariantWriter::Write(store, json, true))
+  {
+    XFILE::CFile outFile;
+    if (outFile.OpenForWrite(storePath, true))
+    {
+      outFile.Write(json.c_str(), json.size());
+      outFile.Close();
+    }
+  }
+
+  // POST to Bridge /resume (best-effort)
+  if (!bridgeUrl.empty())
+  {
+    XFILE::CCurlFile curl;
+    curl.SetRequestHeader("Content-Type", "application/json");
+    curl.SetTimeout(2);
+
+    CVariant body(CVariant::VariantTypeObject);
+    body["imdb"] = imdbId;
+    body["season"] = (season >= 0) ? std::to_string(season) : "";
+    body["episode"] = (episode >= 0) ? std::to_string(episode) : "";
+    body["position"] = posMs;
+    body["duration"] = durMs;
+
+    std::string bodyJson;
+    CJSONVariantWriter::Write(body, bodyJson, true);
+    std::string response;
+    curl.Post(bridgeUrl + "/resume", bodyJson, response);
+    // Ignore errors -- Bridge may not be running
   }
 }
 

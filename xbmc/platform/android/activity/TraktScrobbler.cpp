@@ -479,6 +479,24 @@ bool TraktScrobbler::IsContentIdentified() const
   return m_contentIdentified;
 }
 
+std::string TraktScrobbler::GetAccessToken() const
+{
+  std::unique_lock lock(m_critSection);
+  return m_accessToken;
+}
+
+std::string TraktScrobbler::GetTraktSlug() const
+{
+  std::unique_lock lock(m_critSection);
+  return m_traktSlug;
+}
+
+bool TraktScrobbler::IsScrobbleActive() const
+{
+  std::unique_lock lock(m_critSection);
+  return m_scrobbleActive;
+}
+
 void TraktScrobbler::ForceReAuth()
 {
   std::unique_lock lock(m_critSection);

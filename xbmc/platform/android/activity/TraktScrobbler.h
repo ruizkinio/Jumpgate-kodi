@@ -48,6 +48,12 @@ public:
   int GetEpisode() const;
   bool IsContentIdentified() const;
 
+  // Getters for rapid-switch fire-and-forget ScrobbleStop (F-007)
+  // The detached thread must capture ALL state by value -- zero references to this
+  std::string GetAccessToken() const;
+  std::string GetTraktSlug() const;
+  bool IsScrobbleActive() const;
+
   // Re-authentication
   void ForceReAuth();
   bool IsAuthenticatedPublic() const;
