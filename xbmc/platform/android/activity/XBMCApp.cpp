@@ -1047,14 +1047,64 @@ void CXBMCApp::ExitExternalPlayerMode(bool completed)
   // Save resume position before exiting
   SaveResumePosition();
 
-  m_externalPlayerMode.store(false, std::memory_order_relaxed); // prevent re-entry
+  bool wasStandalone = m_wasStandalone.load(std::memory_order_relaxed);
 
-  // Call Java-side exitExternalPlayerMode to setResult() and finish()
-  call_method<void>(m_context,
-                    "exitExternalPlayerMode", "(JJZ)V",
-                    static_cast<jlong>(posMs),
-                    static_cast<jlong>(durMs),
-                    static_cast<jboolean>(completed));
+  if (wasStandalone)
+  {
+    CLog::Log(LOGINFO, "CXBMCApp: Returning to standalone mode (warm transition)");
+
+    // Call Java-side with wasStandalone=true so it does NOT kill the process
+    call_method<void>(m_context,
+                      "exitExternalPlayerMode", "(JJZZ)V",
+                      static_cast<jlong>(posMs),
+                      static_cast<jlong>(durMs),
+                      static_cast<jboolean>(completed),
+                      static_cast<jboolean>(true));
+
+    // Clean up C++ side external player state
+    ReturnToStandaloneMode();
+  }
+  else
+  {
+    m_externalPlayerMode.store(false, std::memory_order_relaxed); // prevent re-entry
+
+    // Call Java-side with wasStandalone=false (cold launch: finish + killProcess)
+    call_method<void>(m_context,
+                      "exitExternalPlayerMode", "(JJZZ)V",
+                      static_cast<jlong>(posMs),
+                      static_cast<jlong>(durMs),
+                      static_cast<jboolean>(completed),
+                      static_cast<jboolean>(false));
+  }
+}
+
+void CXBMCApp::ReturnToStandaloneMode()
+{
+  CLog::Log(LOGINFO, "CXBMCApp: Returning to standalone mode");
+
+  // Deinitialize and destroy TraktScrobbler so it doesn't fire during standalone playback
+  if (m_traktScrobbler)
+  {
+    m_traktScrobbler->Deinitialize();
+    m_traktScrobbler.reset();
+  }
+
+  // Deinitialize and destroy SubtitleDownloader
+  if (m_subtitleDownloader)
+  {
+    m_subtitleDownloader->Deinitialize();
+    m_subtitleDownloader.reset();
+  }
+
+  // Reset external player state
+  m_externalPlayerMode.store(false, std::memory_order_relaxed);
+  m_resumePositionMs.store(0, std::memory_order_relaxed);
+  m_resumeApplied.store(false, std::memory_order_relaxed);
+  m_lastPlaybackTimeMs.store(0, std::memory_order_relaxed);
+  m_lastPlaybackDurationMs.store(0, std::memory_order_relaxed);
+  m_wasStandalone.store(false, std::memory_order_relaxed);
+
+  CLog::Log(LOGINFO, "CXBMCApp: Returned to standalone mode, TraktScrobbler and SubtitleDownloader deinitialized");
 }
 
 void CXBMCApp::SaveResumePosition()
@@ -2080,8 +2130,11 @@ void CXBMCApp::onNewIntent(CJNIIntent intent)
   // (ACTION_GET_CONTENT is Kodi's internal leanback navigation, not external player)
   if (!targetFile.empty() && action == CJNIIntent::ACTION_VIEW)
   {
+    // onNewIntent only fires when the activity is already alive (singleTop).
+    // This means we are transitioning from standalone to external player mode.
+    m_wasStandalone.store(true, std::memory_order_relaxed);
     m_externalPlayerMode.store(true, std::memory_order_relaxed);
-    CLog::Log(LOGINFO, "CXBMCApp: External player mode activated for: {}", targetFile);
+    CLog::Log(LOGINFO, "CXBMCApp: External player mode activated (warm transition) for: {}", targetFile);
 
     // Create TraktScrobbler lazily if not yet initialized
     if (!m_traktScrobbler)

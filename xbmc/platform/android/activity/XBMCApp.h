@@ -188,6 +188,7 @@ public:
   bool IsExternalPlayerMode() const { return m_externalPlayerMode.load(std::memory_order_relaxed); }
   void SetExternalPlayerMode(bool mode) { m_externalPlayerMode.store(mode, std::memory_order_relaxed); }
   void ExitExternalPlayerMode(bool completed);
+  void ReturnToStandaloneMode();
 
   // Version
   static constexpr const char* MODIKODI_VERSION = "3.0.0";
@@ -305,6 +306,7 @@ private:
 
   // External player mode state (atomic: written on JNI thread, read on Kodi Main thread)
   std::atomic<bool> m_externalPlayerMode{false};
+  std::atomic<bool> m_wasStandalone{false}; // true when entered ext player mode from standalone
   std::atomic<int64_t> m_lastPlaybackTimeMs{0};     // F-003: atomic prevents torn reads on ARM32
   std::atomic<int64_t> m_lastPlaybackDurationMs{0};  // F-003: atomic prevents torn reads on ARM32
   std::atomic<int> m_resumePositionMs{0};

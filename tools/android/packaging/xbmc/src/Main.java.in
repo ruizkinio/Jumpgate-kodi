@@ -44,6 +44,12 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
   private long mLastPlaybackPosition = 0;  // ms
   private long mLastPlaybackDuration = 0;  // ms
 
+  // Tracks whether we entered external player mode from an already-running standalone Kodi.
+  // When true, exitExternalPlayerMode returns to standalone instead of killing the process.
+  private boolean mWasStandalone = false;
+  // Pending flag for delayed intents: set to true so when delayed intent fires, mWasStandalone is set.
+  private boolean mPendingWasStandalone = false;
+
   private class DelayedIntent
   {
     public Intent mIntent;
@@ -210,15 +216,31 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
   protected void onNewIntent(Intent intent)
   {
     super.onNewIntent(intent);
+
+    // If we receive an ACTION_VIEW while already running, we're transitioning from
+    // standalone to external player mode. Track this so we return to standalone after playback.
+    boolean isActionView = intent.getData() != null
+            && Intent.ACTION_VIEW.equals(intent.getAction());
+
     // Delay until after Resume
     if (mPaused)
     {
       Log.d(TAG, "Main: onNewIntent (delayed)");
+      if (isActionView)
+      {
+        mPendingWasStandalone = true;
+      }
       mDelayedIntents.add(new DelayedIntent(new Intent(intent), 500));
     }
     else
     {
       Log.d(TAG, "Main: onNewIntent (immediate)");
+      if (isActionView)
+      {
+        mWasStandalone = true;
+        mExternalPlayerMode = true;
+        Log.d(TAG, "Main: Warm transition to external player mode (standalone was running)");
+      }
       _onNewIntent(intent);
     }
   }
@@ -261,6 +283,14 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
     }
 
     // New intent ?
+    // If we had a pending warm-transition flag from onNewIntent, apply it now
+    if (mPendingWasStandalone)
+    {
+      mWasStandalone = true;
+      mExternalPlayerMode = true;
+      mPendingWasStandalone = false;
+      Log.d(TAG, "Main: Warm transition to external player mode (delayed, standalone was running)");
+    }
     for (final DelayedIntent delayedIntent : mDelayedIntents)
     {
       handler.postDelayed(new Runnable()
@@ -378,11 +408,16 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
 
   /**
    * Called from native code when external player mode should exit.
-   * Sets the result intent with VLC/MX Player compatible extras and finishes.
+   * Sets the result intent with VLC/MX Player compatible extras.
+   *
+   * @param wasStandalone if true, returns to standalone Kodi instead of killing the process.
+   *                      This is set when external player was launched from an already-running
+   *                      standalone Kodi instance (warm-transition via onNewIntent).
    */
-  public void exitExternalPlayerMode(long positionMs, long durationMs, boolean completed) {
+  public void exitExternalPlayerMode(long positionMs, long durationMs, boolean completed,
+                                     boolean wasStandalone) {
     Log.d(TAG, "Main: Exiting external player mode. pos=" + positionMs + " dur=" + durationMs
-            + " completed=" + completed);
+            + " completed=" + completed + " wasStandalone=" + wasStandalone);
 
     Intent result = new Intent("org.videolan.vlc.player.result");
 
@@ -399,19 +434,31 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
     // RESULT_CANCELED causes some apps (like Stremio) to discard position data.
     // The "end_by" extra distinguishes completion vs user-stopped.
     setResult(RESULT_OK, result);
-    finish();
 
-    // Kill the process after a short delay so setResult() is delivered first.
-    // Kodi's native engine (XBMC_Run thread, m_firstrun state) cannot be cleanly
-    // restarted within the same process — stale native state causes black screen
-    // on re-launch and prevents normal launcher starts after external player exit.
-    handler.postDelayed(new Runnable() {
-      @Override
-      public void run() {
-        Log.d(TAG, "Main: Killing process after external player exit");
-        android.os.Process.killProcess(android.os.Process.myPid());
-      }
-    }, 500);
+    if (wasStandalone || mWasStandalone) {
+      // Warm-transition: return to standalone Kodi.
+      // setResult() delivers to the Splash instance waiting via startActivityForResult.
+      // Do NOT finish Main (it stays alive as standalone Kodi).
+      // Do NOT kill the process (native engine keeps running).
+      mExternalPlayerMode = false;
+      mWasStandalone = false;
+      Log.d(TAG, "Main: Returning to standalone mode after external player");
+    } else {
+      // Cold launch from Stremio: finish and kill as before.
+      finish();
+
+      // Kill the process after a short delay so setResult() is delivered first.
+      // Kodi's native engine (XBMC_Run thread, m_firstrun state) cannot be cleanly
+      // restarted within the same process -- stale native state causes black screen
+      // on re-launch and prevents normal launcher starts after external player exit.
+      handler.postDelayed(new Runnable() {
+        @Override
+        public void run() {
+          Log.d(TAG, "Main: Killing process after external player exit");
+          android.os.Process.killProcess(android.os.Process.myPid());
+        }
+      }, 500);
+    }
   }
 
   public boolean isExternalPlayerMode() {
