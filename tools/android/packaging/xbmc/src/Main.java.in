@@ -50,6 +50,9 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
   // Pending flag for delayed intents: set to true so when delayed intent fires, mWasStandalone is set.
   private boolean mPendingWasStandalone = false;
 
+  // Loading overlay: black screen with spinner shown during external player initialization
+  private View mLoadingOverlay = null;
+
   private class DelayedIntent
   {
     public Intent mIntent;
@@ -183,6 +186,13 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
     mMainView.setElevation(1);  // Always on Top
     videoLayout.addView(mMainView, layoutParams);
 
+    // Loading overlay for external player mode (black + spinner)
+    mLoadingOverlay = findViewById(R.id.loadingOverlay);
+    if (mExternalPlayerMode && mLoadingOverlay != null) {
+      mLoadingOverlay.setVisibility(View.VISIBLE);
+      Log.d(TAG, "Main: Loading overlay shown (cold external player launch)");
+    }
+
     if (Build.VERSION.SDK_INT < 30)
     {
       mDecorView.setOnSystemUiVisibilityChangeListener(new View.OnSystemUiVisibilityChangeListener()
@@ -221,6 +231,13 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
     // standalone to external player mode. Track this so we return to standalone after playback.
     boolean isActionView = intent.getData() != null
             && Intent.ACTION_VIEW.equals(intent.getAction());
+
+    // Show loading overlay for external player transitions
+    if (isActionView && mLoadingOverlay != null)
+    {
+      mLoadingOverlay.setVisibility(View.VISIBLE);
+      Log.d(TAG, "Main: Loading overlay shown (warm transition)");
+    }
 
     // Delay until after Resume
     if (mPaused)
@@ -442,6 +459,8 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
       // Do NOT kill the process (native engine keeps running).
       mExternalPlayerMode = false;
       mWasStandalone = false;
+      // Hide loading overlay so Kodi home screen is visible again
+      hideLoadingOverlay();
       Log.d(TAG, "Main: Returning to standalone mode after external player");
     } else {
       // Cold launch from Stremio: finish and kill as before.
@@ -459,6 +478,19 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
         }
       }, 500);
     }
+  }
+
+  /**
+   * Called from native code when playback actually starts.
+   * Hides the loading overlay to reveal the video surface.
+   */
+  public void hideLoadingOverlay() {
+    runOnUiThread(() -> {
+      if (mLoadingOverlay != null) {
+        mLoadingOverlay.setVisibility(View.GONE);
+        Log.d(TAG, "Main: Loading overlay hidden (playback started)");
+      }
+    });
   }
 
   public boolean isExternalPlayerMode() {

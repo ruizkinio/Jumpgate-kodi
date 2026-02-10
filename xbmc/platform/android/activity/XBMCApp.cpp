@@ -998,6 +998,13 @@ void CXBMCApp::OnPlayBackStarted()
   CAndroidKey::SetHandleMediaKeys(false);
 
   RequestVisibleBehind(true);
+
+  // Hide loading overlay when playback actually starts (external player mode)
+  if (m_externalPlayerMode.load(std::memory_order_relaxed))
+  {
+    call_method<void>(m_context, "hideLoadingOverlay", "()V");
+    CLog::Log(LOGINFO, "CXBMCApp: Hiding loading overlay (playback started)");
+  }
 }
 
 void CXBMCApp::OnPlayBackPaused()

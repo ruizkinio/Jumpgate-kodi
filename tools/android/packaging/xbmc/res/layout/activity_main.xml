@@ -3,5 +3,23 @@
   android:layout_width="match_parent"
   android:layout_height="match_parent"
   android:background="@android:color/black">
+
+  <!-- Loading overlay: shown during external player mode while Kodi initializes.
+       Hidden by default (gone) so standalone Kodi is unaffected.
+       Elevation 10dp ensures it renders above XBMCMainView (elevation 1). -->
+  <FrameLayout
+      android:id="@+id/loadingOverlay"
+      android:layout_width="match_parent"
+      android:layout_height="match_parent"
+      android:background="@android:color/black"
+      android:visibility="gone"
+      android:elevation="10dp">
+      <ProgressBar
+          android:layout_width="wrap_content"
+          android:layout_height="wrap_content"
+          android:layout_gravity="center"
+          android:indeterminate="true" />
+  </FrameLayout>
+
 </RelativeLayout>
 
