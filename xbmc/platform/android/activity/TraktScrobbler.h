@@ -1,5 +1,5 @@
 /*
- *  Copyright (C) 2024 Team ModiKodi
+ *  Copyright (C) 2024 Team Jumpgate
  *  SPDX-License-Identifier: GPL-2.0-or-later
  *  See LICENSES/README.md for more information.
  */
@@ -43,6 +43,8 @@ public:
   // Content ID getters (for resume store integration)
   std::string GetImdbId() const;
   std::string GetTitle() const;
+  std::string GetEpisodeTitle() const;
+  std::string GetLogoUrl() const;
   int GetYear() const;
   int GetSeason() const;
   int GetEpisode() const;
@@ -75,6 +77,10 @@ private:
   bool IsAuthenticated() const;
   bool LoadTokens();
   bool SaveTokens();
+  bool FetchAccessTokenFromBridge();
+  bool IsConfiguredBridgeUrl(const std::string& bridgeUrl) const;
+  std::string NormalizeBridgeUrl(const std::string& url) const;
+  std::string BuildBridgeEndpoint(const std::string& bridgeUrl, const std::string& endpoint) const;
   bool RefreshAccessToken();
   void StartDeviceCodeAuth();
   void PollForToken();
@@ -88,7 +94,9 @@ private:
 
   // Content identification
   bool IdentifyContent();
+  bool HydrateFromTraktPublic(const std::string& id, int season, int episode, const std::string& mediaUrlSnapshot);
   bool QueryBridgeServer();
+  bool FetchLogoFromBridge(const std::string& imdbId, const std::string& mediaUrlSnapshot);
   bool SearchTrakt(const std::string& query);
   bool ParseImdbFromUrl(const std::string& url);
   std::string ExtractTitleFromUrl(const std::string& url);
@@ -118,6 +126,7 @@ private:
   // State
   bool m_initialized{false};
   bool m_scrobbleActive{false};
+  bool m_scrobblePaused{false};
 
   // Auth tokens
   std::string m_accessToken;
@@ -132,6 +141,9 @@ private:
   std::string m_imdbId;
   std::string m_traktSlug;
   std::string m_title;
+  std::string m_episodeTitle;
+  std::string m_logoUrl;
+  std::string m_logoFetchedForImdb;
   int m_year{0};
   int m_season{-1};
   int m_episode{-1};
@@ -155,15 +167,21 @@ private:
   // Deferred content identification retry
   int64_t m_playbackStartTime{0};
   bool m_identifyFailed{false};
-  static constexpr int IDENTIFY_RETRY_SEC = 15;
+  bool m_bridgeDetected{false}; // Deferred bridge URL detection (curl unsafe during early init)
+  int64_t m_lastConfiguredTokenFetchTime{0};
+  static constexpr int IDENTIFY_RETRY_SEC = 25;
+
+  // Public metadata hydration throttle (Trakt public endpoints)
+  int64_t m_lastPublicHydrateAttemptTime{0};
+  std::string m_lastPublicHydrateKey;
 
   // Trakt API constants
   static constexpr const char* TRAKT_API_URL = "https://api.trakt.tv";
   static constexpr const char* TRAKT_CLIENT_ID = "d4161a7a106424551add171e5470112e4afdaf2438e6ef2fe0548edc75924868";
   static constexpr const char* TRAKT_CLIENT_SECRET = "b5fcd7cb5d9bb963784d11bbf8535bc0d25d46225016191eb48e50792d2155c0";
 
-  // ModiKodi Bridge server URLs
-  static constexpr const char* BRIDGE_CLOUD_URL = "https://modikodi.fly.dev";
+  // Jumpgate Bridge server URLs
+  static constexpr const char* BRIDGE_CLOUD_URL = "https://jumpgate-bridge.fly.dev";
   static constexpr const char* BRIDGE_LOCAL_URL = "http://127.0.0.1:7515";
 
   mutable CCriticalSection m_critSection;

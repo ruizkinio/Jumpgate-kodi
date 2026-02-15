@@ -1,5 +1,5 @@
 /*
- *  Copyright (C) 2024 Team ModiKodi
+ *  Copyright (C) 2024 Team Jumpgate
  *  SPDX-License-Identifier: GPL-2.0-or-later
  *  See LICENSES/README.md for more information.
  */

@@ -1,5 +1,5 @@
 /*
- *  Copyright (C) 2024 Team ModiKodi
+ *  Copyright (C) 2024 Team Jumpgate
  *  SPDX-License-Identifier: GPL-2.0-or-later
  *  See LICENSES/README.md for more information.
  */
@@ -1012,7 +1012,7 @@ bool SubtitleDownloader::OSGetWithCredentials(const std::string& endpoint,
   XFILE::CCurlFile curl;
   curl.SetRequestHeader("Content-Type", "application/json");
   curl.SetRequestHeader("Api-Key", apiKey);
-  curl.SetRequestHeader("User-Agent", "ModiKodi v1.0");
+  curl.SetRequestHeader("User-Agent", "Jumpgate v1.0");
   if (!jwtToken.empty())
     curl.SetRequestHeader("Authorization", "Bearer " + jwtToken);
   curl.SetTimeout(10);
@@ -1043,7 +1043,7 @@ bool SubtitleDownloader::OSPostWithCredentials(const std::string& endpoint,
   XFILE::CCurlFile curl;
   curl.SetRequestHeader("Content-Type", "application/json");
   curl.SetRequestHeader("Api-Key", apiKey);
-  curl.SetRequestHeader("User-Agent", "ModiKodi v1.0");
+  curl.SetRequestHeader("User-Agent", "Jumpgate v1.0");
   if (!jwtToken.empty())
     curl.SetRequestHeader("Authorization", "Bearer " + jwtToken);
   curl.SetTimeout(10);

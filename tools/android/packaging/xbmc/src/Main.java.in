@@ -4,27 +4,50 @@ import @APP_PACKAGE@.channels.util.TvUtil;
 
 import static android.content.pm.PackageManager.FEATURE_LEANBACK;
 
+import android.animation.ObjectAnimator;
+import android.animation.ValueAnimator;
 import android.app.NativeActivity;
 import android.content.Intent;
 import android.content.pm.ResolveInfo;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Rect;
+import android.graphics.drawable.GradientDrawable;
 import android.hardware.input.InputManager;
 import android.media.AudioManager;
+import android.net.Uri;
 import android.os.Build;
 import android.os.Build.VERSION_CODES;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.text.TextUtils;
 import android.util.Log;
+import android.util.TypedValue;
+import android.graphics.Color;
+import android.graphics.PixelFormat;
 import android.view.Choreographer;
+import android.view.Gravity;
 import android.view.View;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
+import android.view.WindowManager;
+import android.widget.FrameLayout;
+import android.widget.ImageView;
+import android.widget.LinearLayout;
 import android.widget.RelativeLayout;
+import android.widget.TextView;
+import android.view.animation.LinearInterpolator;
 
+import java.io.InputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.Locale;
 import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public class Main extends NativeActivity implements Choreographer.FrameCallback
 {
@@ -50,8 +73,24 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
   // Pending flag for delayed intents: set to true so when delayed intent fires, mWasStandalone is set.
   private boolean mPendingWasStandalone = false;
 
-  // Loading overlay: black screen with spinner shown during external player initialization
+  // Loading overlay: WindowManager overlay (separate window layer above SurfaceView)
   private View mLoadingOverlay = null;
+  private WindowManager mWindowManager = null;
+  private View mOverlayGateRing = null;
+  private View mOverlayGatePulse = null;
+  private View mOverlayProgressFill = null;
+  private TextView mOverlayStatusText = null;
+  private TextView mOverlayPercentText = null;
+  private TextView mOverlayTitleText = null;
+  private TextView mOverlayMetaText = null;
+  private ImageView mOverlayLogoView = null;
+  private String mOverlayLogoUrl = "";
+  private int mOverlayLogoRequestId = 0;
+  private Runnable mOverlayProgressRunnable = null;
+  private ObjectAnimator mOverlayRotationAnimator = null;
+  private ValueAnimator mOverlayPulseAnimator = null;
+  private long mOverlayShownAtMs = 0L;
+  private int mOverlayProgress = 0;
 
   private class DelayedIntent
   {
@@ -128,14 +167,21 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
   @Override
   public void onCreate(Bundle savedInstanceState)
   {
+    // Detect external player mode BEFORE native engine starts so we can
+    // show the loading overlay before Kodi's native init renders anything
+    mExternalPlayerMode = getIntent().getBooleanExtra("external_player_mode", false);
+    if (mExternalPlayerMode) {
+      Log.d(TAG, "Main: External player mode activated");
+    }
+
     System.loadLibrary("@APP_NAME_LC@");
 
     super.onCreate(savedInstanceState);
 
-    // Detect external player mode from Splash forwarded intent
-    mExternalPlayerMode = getIntent().getBooleanExtra("external_player_mode", false);
+    // Show loading overlay immediately — before any views or native rendering.
+    // Must be after super.onCreate() (window token needed) but before SurfaceView setup.
     if (mExternalPlayerMode) {
-      Log.d(TAG, "Main: External player mode activated");
+      showLoadingOverlay(getIntent());
     }
 
     setContentView(R.layout.activity_main);
@@ -176,7 +222,11 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
     manager.registerInputDeviceListener(mInputDeviceListener, handler);
 
     mDecorView = getWindow().getDecorView();
-    mDecorView.setBackground(null);
+    // In external player mode, keep black background so native init isn't visible
+    // behind the loading overlay. Normal mode clears background for Kodi's own rendering.
+    if (!mExternalPlayerMode) {
+      mDecorView.setBackground(null);
+    }
     getWindow().takeSurface(null);
     setContentView(R.layout.activity_main);
     RelativeLayout videoLayout = findViewById(R.id.VideoLayout);
@@ -185,13 +235,6 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
     RelativeLayout.LayoutParams layoutParams = new RelativeLayout.LayoutParams(RelativeLayout.LayoutParams.MATCH_PARENT, RelativeLayout.LayoutParams.MATCH_PARENT);
     mMainView.setElevation(1);  // Always on Top
     videoLayout.addView(mMainView, layoutParams);
-
-    // Loading overlay for external player mode (black + spinner)
-    mLoadingOverlay = findViewById(R.id.loadingOverlay);
-    if (mExternalPlayerMode && mLoadingOverlay != null) {
-      mLoadingOverlay.setVisibility(View.VISIBLE);
-      Log.d(TAG, "Main: Loading overlay shown (cold external player launch)");
-    }
 
     if (Build.VERSION.SDK_INT < 30)
     {
@@ -233,9 +276,9 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
             && Intent.ACTION_VIEW.equals(intent.getAction());
 
     // Show loading overlay for external player transitions
-    if (isActionView && mLoadingOverlay != null)
+    if (isActionView)
     {
-      mLoadingOverlay.setVisibility(View.VISIBLE);
+      showLoadingOverlay(intent);
       Log.d(TAG, "Main: Loading overlay shown (warm transition)");
     }
 
@@ -421,6 +464,27 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
   public void updatePlaybackPosition(long positionMs, long durationMs) {
     mLastPlaybackPosition = positionMs;
     mLastPlaybackDuration = durationMs;
+
+    if (mLoadingOverlay == null) {
+      return;
+    }
+
+    runOnUiThread(() -> {
+      if (mLoadingOverlay == null) {
+        return;
+      }
+
+      if (durationMs > 0 && mOverlayProgress < 88) {
+        setLoadingOverlayProgress(88);
+      }
+
+      if (positionMs > 0) {
+        setLoadingOverlayStatus("Jumpgate lock acquired. Rendering first frames...");
+        setLoadingOverlayProgress(Math.max(mOverlayProgress, 96));
+      } else if (durationMs > 0) {
+        setLoadingOverlayStatus("Manifest decoded. Priming video pipeline...");
+      }
+    });
   }
 
   /**
@@ -481,16 +545,871 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
   }
 
   /**
+   * Shows a cinematic Jumpgate loading overlay above the SurfaceView.
+   * Uses WindowManager so it stays above XBMCMainView's Surface layer.
+   */
+  private void showLoadingOverlay(Intent sourceIntent) {
+    if (mLoadingOverlay != null) {
+      updateLoadingOverlayMetadata(sourceIntent);
+      setLoadingOverlayStatus("Re-linking jumpgate route...");
+      setLoadingOverlayProgress(Math.max(mOverlayProgress, 12));
+      return;
+    }
+
+    mWindowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
+
+    FrameLayout overlay = new FrameLayout(this);
+    overlay.setBackgroundColor(Color.BLACK);
+
+    View backdrop = new View(this);
+    GradientDrawable backdropGradient = new GradientDrawable(
+        GradientDrawable.Orientation.TOP_BOTTOM,
+        new int[] {
+            Color.parseColor("#0B2B63"),
+            Color.parseColor("#071A3E"),
+            Color.parseColor("#040A1A")
+        });
+    backdrop.setBackground(backdropGradient);
+    backdrop.setAlpha(0.98f);
+    overlay.addView(backdrop, new FrameLayout.LayoutParams(
+        FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+
+    View haze = new View(this);
+    GradientDrawable hazeGradient = new GradientDrawable(
+        GradientDrawable.Orientation.TL_BR,
+        new int[] {
+            Color.parseColor("#0047B5FF"),
+            Color.parseColor("#332D86FF"),
+            Color.parseColor("#00168BE8")
+        });
+    haze.setBackground(hazeGradient);
+    haze.setAlpha(0.40f);
+    overlay.addView(haze, new FrameLayout.LayoutParams(
+        FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+
+    FrameLayout gateContainer = new FrameLayout(this);
+    FrameLayout.LayoutParams gateContainerParams = new FrameLayout.LayoutParams(dp(132), dp(132));
+    gateContainerParams.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
+    gateContainerParams.topMargin = dp(88);
+    overlay.addView(gateContainer, gateContainerParams);
+
+    View gateRing = new View(this);
+    GradientDrawable gateRingDrawable = new GradientDrawable();
+    gateRingDrawable.setShape(GradientDrawable.OVAL);
+    gateRingDrawable.setColor(Color.TRANSPARENT);
+    // Kodi-ish blue accent for the jumpgate ring.
+    gateRingDrawable.setStroke(dp(3), Color.parseColor("#C217B2E7"));
+    gateRing.setBackground(gateRingDrawable);
+    gateContainer.addView(gateRing, new FrameLayout.LayoutParams(
+        FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+    mOverlayGateRing = gateRing;
+
+    View gatePulse = new View(this);
+    GradientDrawable gatePulseDrawable = new GradientDrawable();
+    gatePulseDrawable.setShape(GradientDrawable.OVAL);
+    gatePulseDrawable.setColor(Color.TRANSPARENT);
+    gatePulseDrawable.setStroke(dp(2), Color.parseColor("#8A17B2E7"));
+    gatePulse.setBackground(gatePulseDrawable);
+    gatePulse.setScaleX(0.86f);
+    gatePulse.setScaleY(0.86f);
+    gateContainer.addView(gatePulse, new FrameLayout.LayoutParams(
+        FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+    mOverlayGatePulse = gatePulse;
+
+    LinearLayout content = new LinearLayout(this);
+    content.setOrientation(LinearLayout.VERTICAL);
+    content.setGravity(Gravity.CENTER_HORIZONTAL);
+    FrameLayout.LayoutParams contentParams = new FrameLayout.LayoutParams(
+        FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT);
+    contentParams.gravity = Gravity.TOP;
+    contentParams.topMargin = dp(248);
+    contentParams.leftMargin = dp(24);
+    contentParams.rightMargin = dp(24);
+    overlay.addView(content, contentParams);
+
+    TextView badge = new TextView(this);
+    badge.setText("JUMPGATE BRIDGE");
+    badge.setTextColor(Color.parseColor("#BED6FF"));
+    badge.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
+    badge.setLetterSpacing(0.28f);
+    badge.setAllCaps(true);
+    badge.setGravity(Gravity.CENTER);
+    content.addView(badge);
+
+    ImageView logoView = new ImageView(this);
+    logoView.setAdjustViewBounds(true);
+    logoView.setScaleType(ImageView.ScaleType.FIT_CENTER);
+    logoView.setVisibility(View.GONE);
+    LinearLayout.LayoutParams logoParams = new LinearLayout.LayoutParams(
+        LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+    logoParams.topMargin = dp(14);
+    logoView.setMaxHeight(dp(74));
+    content.addView(logoView, logoParams);
+    mOverlayLogoView = logoView;
+
+    TextView title = new TextView(this);
+    title.setTextColor(Color.WHITE);
+    // Slightly smaller to avoid oversized token-like or proxy-derived titles.
+    title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
+    title.setTypeface(title.getTypeface(), android.graphics.Typeface.BOLD);
+    title.setGravity(Gravity.CENTER);
+    title.setMaxLines(2);
+    title.setEllipsize(TextUtils.TruncateAt.END);
+    LinearLayout.LayoutParams titleParams = new LinearLayout.LayoutParams(
+        LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+    titleParams.topMargin = dp(12);
+    content.addView(title, titleParams);
+    mOverlayTitleText = title;
+
+    TextView meta = new TextView(this);
+    meta.setTextColor(Color.parseColor("#C2D9FF"));
+    meta.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+    meta.setGravity(Gravity.CENTER);
+    meta.setAllCaps(true);
+    LinearLayout.LayoutParams metaParams = new LinearLayout.LayoutParams(
+        LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+    metaParams.topMargin = dp(6);
+    content.addView(meta, metaParams);
+    mOverlayMetaText = meta;
+
+    TextView status = new TextView(this);
+    status.setTextColor(Color.parseColor("#E2EEFF"));
+    status.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+    status.setGravity(Gravity.CENTER);
+    status.setMaxLines(2);
+    status.setEllipsize(TextUtils.TruncateAt.END);
+    LinearLayout.LayoutParams statusParams = new LinearLayout.LayoutParams(
+        LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+    statusParams.topMargin = dp(22);
+    content.addView(status, statusParams);
+    mOverlayStatusText = status;
+
+    FrameLayout progressTrack = new FrameLayout(this);
+    GradientDrawable progressTrackDrawable = new GradientDrawable();
+    progressTrackDrawable.setShape(GradientDrawable.RECTANGLE);
+    progressTrackDrawable.setCornerRadius(dp(8));
+    progressTrackDrawable.setColor(Color.parseColor("#243D66"));
+    progressTrackDrawable.setStroke(dp(1), Color.parseColor("#5D83B8"));
+    progressTrack.setBackground(progressTrackDrawable);
+    LinearLayout.LayoutParams progressTrackParams = new LinearLayout.LayoutParams(
+        LinearLayout.LayoutParams.MATCH_PARENT, dp(16));
+    progressTrackParams.topMargin = dp(20);
+    progressTrackParams.leftMargin = dp(18);
+    progressTrackParams.rightMargin = dp(18);
+    content.addView(progressTrack, progressTrackParams);
+
+    View progressFill = new View(this);
+    GradientDrawable progressFillDrawable = new GradientDrawable(
+        GradientDrawable.Orientation.LEFT_RIGHT,
+        new int[] {
+            Color.parseColor("#1FD2FF"),
+            Color.parseColor("#17B2E7"),
+            Color.parseColor("#1A7DD8")
+        });
+    progressFillDrawable.setCornerRadius(dp(7));
+    progressFill.setBackground(progressFillDrawable);
+    FrameLayout.LayoutParams progressFillParams = new FrameLayout.LayoutParams(
+        FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT);
+    progressTrack.addView(progressFill, progressFillParams);
+    progressFill.setPivotX(0f);
+    progressFill.setScaleX(0f);
+    mOverlayProgressFill = progressFill;
+
+    TextView percent = new TextView(this);
+    percent.setTextColor(Color.parseColor("#D6E8FF"));
+    percent.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+    percent.setGravity(Gravity.CENTER);
+    LinearLayout.LayoutParams percentParams = new LinearLayout.LayoutParams(
+        LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+    percentParams.topMargin = dp(10);
+    content.addView(percent, percentParams);
+    mOverlayPercentText = percent;
+
+    updateLoadingOverlayMetadata(sourceIntent);
+    setLoadingOverlayStatus("Opening jumpgate channel...");
+    setLoadingOverlayProgress(8);
+
+    WindowManager.LayoutParams params = new WindowManager.LayoutParams(
+        WindowManager.LayoutParams.MATCH_PARENT,
+        WindowManager.LayoutParams.MATCH_PARENT,
+        WindowManager.LayoutParams.TYPE_APPLICATION,
+        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+            | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+            | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+        PixelFormat.OPAQUE);
+
+    mWindowManager.addView(overlay, params);
+    mLoadingOverlay = overlay;
+    mOverlayShownAtMs = System.currentTimeMillis();
+    Log.d(TAG, "Main: Jumpgate loading overlay shown");
+
+    startLoadingOverlayAnimations();
+    startLoadingOverlayProgressTicker();
+
+    // Safety timeout: never permanently block the player view.
+    handler.postDelayed(() -> hideLoadingOverlay(), 30000);
+  }
+
+  /**
    * Called from native code when playback actually starts.
-   * Hides the loading overlay to reveal the video surface.
+   * Removes the WindowManager overlay to reveal the video surface.
    */
   public void hideLoadingOverlay() {
     runOnUiThread(() -> {
-      if (mLoadingOverlay != null) {
-        mLoadingOverlay.setVisibility(View.GONE);
+      if (mOverlayProgressRunnable != null) {
+        handler.removeCallbacks(mOverlayProgressRunnable);
+        mOverlayProgressRunnable = null;
+      }
+
+      if (mOverlayRotationAnimator != null) {
+        mOverlayRotationAnimator.cancel();
+        mOverlayRotationAnimator = null;
+      }
+
+      if (mOverlayPulseAnimator != null) {
+        mOverlayPulseAnimator.cancel();
+        mOverlayPulseAnimator = null;
+      }
+
+      if (mLoadingOverlay != null && mWindowManager != null) {
+        mWindowManager.removeView(mLoadingOverlay);
+        mLoadingOverlay = null;
+        mOverlayGateRing = null;
+        mOverlayGatePulse = null;
+        mOverlayProgressFill = null;
+        mOverlayStatusText = null;
+        mOverlayPercentText = null;
+        mOverlayTitleText = null;
+        mOverlayMetaText = null;
+        mOverlayLogoView = null;
+        mOverlayLogoUrl = "";
+        mOverlayLogoRequestId = 0;
+        mOverlayProgress = 0;
         Log.d(TAG, "Main: Loading overlay hidden (playback started)");
       }
     });
+  }
+
+  private void startLoadingOverlayAnimations() {
+    if (mOverlayGateRing != null) {
+      mOverlayRotationAnimator = ObjectAnimator.ofFloat(mOverlayGateRing, View.ROTATION, 0f, 360f);
+      mOverlayRotationAnimator.setDuration(2600L);
+      mOverlayRotationAnimator.setInterpolator(new LinearInterpolator());
+      mOverlayRotationAnimator.setRepeatCount(ValueAnimator.INFINITE);
+      mOverlayRotationAnimator.start();
+    }
+
+    if (mOverlayGatePulse != null) {
+      mOverlayPulseAnimator = ValueAnimator.ofFloat(0.86f, 1.12f);
+      mOverlayPulseAnimator.setDuration(1250L);
+      mOverlayPulseAnimator.setRepeatMode(ValueAnimator.REVERSE);
+      mOverlayPulseAnimator.setRepeatCount(ValueAnimator.INFINITE);
+      mOverlayPulseAnimator.addUpdateListener(animator -> {
+        if (mOverlayGatePulse == null) {
+          return;
+        }
+        float scale = (float) animator.getAnimatedValue();
+        mOverlayGatePulse.setScaleX(scale);
+        mOverlayGatePulse.setScaleY(scale);
+        mOverlayGatePulse.setAlpha(0.30f + ((scale - 0.86f) / 0.26f) * 0.45f);
+      });
+      mOverlayPulseAnimator.start();
+    }
+  }
+
+  private void startLoadingOverlayProgressTicker() {
+    if (mOverlayProgressRunnable != null) {
+      handler.removeCallbacks(mOverlayProgressRunnable);
+    }
+
+    mOverlayProgressRunnable = new Runnable() {
+      @Override
+      public void run() {
+        if (mLoadingOverlay == null) {
+          return;
+        }
+
+        long elapsedMs = System.currentTimeMillis() - mOverlayShownAtMs;
+        int targetProgress;
+        String status;
+
+        if (elapsedMs < 1200L) {
+          targetProgress = 14;
+          status = "Opening jumpgate channel...";
+        } else if (elapsedMs < 2600L) {
+          targetProgress = 30;
+          status = "Negotiating source tunnel...";
+        } else if (elapsedMs < 4500L) {
+          targetProgress = 48;
+          status = "Locking codecs and container map...";
+        } else if (elapsedMs < 7000L) {
+          targetProgress = 66;
+          status = "Syncing bridge metadata and resume markers...";
+        } else if (elapsedMs < 10000L) {
+          targetProgress = 78;
+          status = "Spooling first packets...";
+        } else if (elapsedMs < 15000L) {
+          targetProgress = 87;
+          status = "Buffering first video frame...";
+        } else {
+          targetProgress = 92;
+          status = "Waiting for decoder warm-up...";
+        }
+
+        if (mLastPlaybackDuration > 0) {
+          targetProgress = Math.max(targetProgress, 88);
+          status = "Manifest decoded. Priming video pipeline...";
+        }
+        if (mLastPlaybackPosition > 0) {
+          targetProgress = Math.max(targetProgress, 96);
+          status = "Jumpgate lock acquired. Rendering first frames...";
+        }
+
+        setLoadingOverlayStatus(status);
+        if (targetProgress > mOverlayProgress) {
+          setLoadingOverlayProgress(Math.min(97, targetProgress));
+        }
+
+        handler.postDelayed(this, 300L);
+      }
+    };
+
+    handler.post(mOverlayProgressRunnable);
+  }
+
+  private void setLoadingOverlayStatus(String status) {
+    if (mOverlayStatusText != null) {
+      mOverlayStatusText.setText(status);
+    }
+  }
+
+  private void setLoadingOverlayProgress(int progress) {
+    int safeProgress = Math.max(0, Math.min(progress, 100));
+    mOverlayProgress = safeProgress;
+
+    if (mOverlayProgressFill != null) {
+      mOverlayProgressFill.setScaleX(safeProgress / 100f);
+    }
+
+    if (mOverlayPercentText != null) {
+      mOverlayPercentText.setText(String.format(Locale.US, "%d%%", safeProgress));
+    }
+  }
+
+  private void updateLoadingOverlayMetadata(Intent intent) {
+    if (mOverlayTitleText != null) {
+      String derivedTitle = deriveOverlayTitle(intent);
+      mOverlayTitleText.setText(derivedTitle);
+      Log.d(TAG, "Main: Jumpgate overlay title: " + derivedTitle);
+    }
+    if (mOverlayMetaText != null) {
+      mOverlayMetaText.setText(deriveOverlayMeta(intent));
+    }
+  }
+
+  private String deriveOverlayTitle(Intent intent) {
+    String title = getExtraString(intent, "_mk_title");
+    if (TextUtils.isEmpty(title)) {
+      title = getExtraString(intent, Intent.EXTRA_TITLE);
+    }
+    if (TextUtils.isEmpty(title)) {
+      title = getExtraString(intent, "title");
+    }
+    if (TextUtils.isEmpty(title)) {
+      title = extractTitleFromUri(intent != null ? intent.getData() : null);
+    }
+
+    if (TextUtils.isEmpty(title)) {
+      title = "Identifying...";
+    }
+    return title;
+  }
+
+  /**
+   * Called from native code when content identification completes (or improves).
+   * Updates overlay title/meta without relying on intent token-derived strings.
+   */
+  public void updateLoadingOverlayContentInfo(final String title, final String meta, final String logoUrl) {
+    if (mLoadingOverlay == null) {
+      return;
+    }
+
+    runOnUiThread(() -> {
+      if (mLoadingOverlay == null) {
+        return;
+      }
+
+      String safeTitle = title != null ? title.trim() : "";
+      if (TextUtils.isEmpty(safeTitle) || isLikelyOpaqueTokenTitle(safeTitle)) {
+        safeTitle = "Identifying...";
+      }
+
+      if (mOverlayTitleText != null) {
+        mOverlayTitleText.setText(safeTitle);
+        mOverlayTitleText.setVisibility(View.VISIBLE);
+      }
+
+      String safeMeta = meta != null ? meta.trim() : "";
+      if (!TextUtils.isEmpty(safeMeta) && !isLikelyOpaqueTokenTitle(safeMeta) && mOverlayMetaText != null) {
+        mOverlayMetaText.setText(safeMeta);
+      }
+
+      final boolean isEpisode = isEpisodeMeta(safeMeta);
+      loadOverlayLogo(logoUrl, isEpisode);
+    });
+  }
+
+  private boolean isEpisodeMeta(String meta) {
+    if (TextUtils.isEmpty(meta)) {
+      return false;
+    }
+    return meta.matches("(?i).*\\bS\\d{1,2}E\\d{1,2}\\b.*");
+  }
+
+  private boolean isAllowedLogoUrl(String rawUrl) {
+    if (TextUtils.isEmpty(rawUrl)) {
+      return false;
+    }
+    try {
+      Uri u = Uri.parse(rawUrl);
+      String scheme = u.getScheme();
+      String host = u.getHost();
+      return "https".equalsIgnoreCase(scheme) && host != null && host.equalsIgnoreCase("image.tmdb.org");
+    } catch (Exception _e) {
+      return false;
+    }
+  }
+
+  private void clearOverlayLogo(boolean isEpisode) {
+    if (mOverlayLogoView != null) {
+      mOverlayLogoView.setImageDrawable(null);
+      mOverlayLogoView.setVisibility(View.GONE);
+    }
+    mOverlayLogoUrl = "";
+
+    // For movies, the logo replaces the title. If logo is gone, ensure title is visible again.
+    if (!isEpisode && mOverlayTitleText != null) {
+      mOverlayTitleText.setVisibility(View.VISIBLE);
+    }
+  }
+
+  private void loadOverlayLogo(String rawUrl, boolean isEpisode) {
+    if (mOverlayLogoView == null) {
+      return;
+    }
+
+    String url = rawUrl != null ? rawUrl.trim() : "";
+    if (TextUtils.isEmpty(url) || !isAllowedLogoUrl(url)) {
+      clearOverlayLogo(isEpisode);
+      return;
+    }
+
+    if (url.equals(mOverlayLogoUrl)) {
+      return;
+    }
+
+    mOverlayLogoUrl = url;
+    mOverlayLogoRequestId++;
+    final int reqId = mOverlayLogoRequestId;
+
+    // Hide until actually loaded (prevents showing broken/empty placeholder).
+    mOverlayLogoView.setVisibility(View.GONE);
+
+    new Thread(() -> {
+      Bitmap bmp = null;
+      HttpURLConnection conn = null;
+      InputStream in = null;
+      try {
+        conn = (HttpURLConnection) new URL(url).openConnection();
+        conn.setConnectTimeout(2000);
+        conn.setReadTimeout(3000);
+        conn.setInstanceFollowRedirects(true);
+        conn.setRequestProperty("User-Agent", "Jumpgate");
+
+        in = conn.getInputStream();
+        bmp = BitmapFactory.decodeStream(in);
+      } catch (Exception _e) {
+        bmp = null;
+      } finally {
+        try { if (in != null) in.close(); } catch (Exception _e) {}
+        if (conn != null) conn.disconnect();
+      }
+
+      final Bitmap finalBmp = bmp;
+      runOnUiThread(() -> {
+        if (mLoadingOverlay == null) {
+          return;
+        }
+        if (reqId != mOverlayLogoRequestId) {
+          return;
+        }
+        if (mOverlayLogoView == null) {
+          return;
+        }
+
+        if (finalBmp != null) {
+          mOverlayLogoView.setImageBitmap(finalBmp);
+          mOverlayLogoView.setVisibility(View.VISIBLE);
+          if (!isEpisode && mOverlayTitleText != null) {
+            mOverlayTitleText.setVisibility(View.GONE);
+          }
+        } else {
+          clearOverlayLogo(isEpisode);
+        }
+      });
+    }).start();
+  }
+
+  private String deriveOverlayMeta(Intent intent) {
+    int season = intent != null ? intent.getIntExtra("_mk_s", -1) : -1;
+    int episode = intent != null ? intent.getIntExtra("_mk_e", -1) : -1;
+
+    StringBuilder meta = new StringBuilder();
+    if (season > 0 && episode > 0) {
+      meta.append(String.format(Locale.US, "S%02dE%02d", season, episode));
+    }
+
+    String quality = extractQualityHint(deriveOverlayTitle(intent));
+    if (!TextUtils.isEmpty(quality)) {
+      if (meta.length() > 0) {
+        meta.append("  -  ");
+      }
+      meta.append(quality);
+    }
+
+    if (meta.length() > 0) {
+      meta.append("  -  ");
+    }
+    meta.append("EXTERNAL STREAM");
+
+    return meta.toString();
+  }
+
+  private String getExtraString(Intent intent, String key) {
+    if (intent == null || TextUtils.isEmpty(key) || intent.getExtras() == null) {
+      return "";
+    }
+
+    String value = intent.getExtras().getString(key, "");
+    return value != null ? value.trim() : "";
+  }
+
+  private String extractTitleFromUri(Uri uri) {
+    if (uri == null) {
+      return "";
+    }
+
+    // Best-case query hints from some proxies/debrid endpoints.
+    String[] candidateParams = new String[] {"_mk_title", "title", "filename", "file", "name", "dn"};
+    try {
+      for (String key : candidateParams) {
+        String value = uri.getQueryParameter(key);
+        String cleaned = sanitizeTitleCandidate(value);
+        if (!TextUtils.isEmpty(cleaned)) {
+          return cleaned;
+        }
+      }
+    } catch (UnsupportedOperationException e) {
+      // Opaque URIs don't support query parameters. Fall through to path parsing.
+    } catch (Exception e) {
+      // Defensive: title extraction must never crash the player.
+      Log.w(TAG, "Main: Failed to extract title from URI query params: " + uri, e);
+    }
+
+    // debridmediamanager.com URLs are frequently opaque token paths; avoid displaying those.
+    String host = uri.getHost();
+    if (!TextUtils.isEmpty(host) && host.toLowerCase(Locale.US).contains("debridmediamanager")) {
+      return "";
+    }
+
+    String bestCandidate = "";
+    int bestScore = -1;
+    String path = uri.getPath();
+    if (!TextUtils.isEmpty(path)) {
+      String[] segments = path.split("/");
+      for (String segment : segments) {
+        String candidate = sanitizeTitleCandidate(segment);
+        int score = scoreTitleCandidate(candidate);
+        if (score > bestScore) {
+          bestScore = score;
+          bestCandidate = candidate;
+        }
+      }
+    }
+
+    if (!TextUtils.isEmpty(bestCandidate)) {
+      return bestCandidate;
+    }
+
+    return sanitizeTitleCandidate(uri.toString());
+  }
+
+  private int scoreTitleCandidate(String candidate) {
+    if (TextUtils.isEmpty(candidate)) {
+      return -1;
+    }
+
+    int letters = 0;
+    for (int i = 0; i < candidate.length(); i++) {
+      if (Character.isLetter(candidate.charAt(i))) {
+        letters++;
+      }
+    }
+
+    // Strongly prefer human-readable title-like strings.
+    int score = letters + (candidate.contains(" ") ? 6 : 0) - Math.max(0, candidate.length() - 64);
+    if (candidate.equalsIgnoreCase("jumpgate stream")) {
+      score -= 100;
+    }
+    return score;
+  }
+
+  private String sanitizeTitleCandidate(String rawCandidate) {
+    if (TextUtils.isEmpty(rawCandidate)) {
+      return "";
+    }
+
+    // Fast reject common token-like inputs (UUIDs, long opaque ids).
+    String raw = rawCandidate.trim();
+    if (raw.matches("(?i)^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$")) {
+      return "";
+    }
+    if (raw.length() >= 28 && raw.matches("^[A-Za-z0-9_-]+$") && !raw.contains(".")) {
+      return "";
+    }
+
+    String decoded;
+    try {
+      decoded = Uri.decode(rawCandidate);
+    } catch (Exception e) {
+      decoded = rawCandidate;
+    }
+    int queryIdx = decoded.indexOf('?');
+    if (queryIdx >= 0) {
+      decoded = decoded.substring(0, queryIdx);
+    }
+    int hashIdx = decoded.indexOf('#');
+    if (hashIdx >= 0) {
+      decoded = decoded.substring(0, hashIdx);
+    }
+    int slashIdx = decoded.lastIndexOf('/');
+    if (slashIdx >= 0 && slashIdx + 1 < decoded.length()) {
+      decoded = decoded.substring(slashIdx + 1);
+    }
+
+    if (decoded.toLowerCase(Locale.US).startsWith("_token_")) {
+      return "";
+    }
+
+    decoded = decoded.replaceAll("(?i)\\.(mkv|mp4|avi|mov|wmv|webm|ts|m3u8|mpd)$", "");
+    decoded = decoded.replaceAll("\\[[^\\]]*\\]|\\([^\\)]*\\)|\\{[^\\}]*\\}", " ");
+    decoded = decoded.replaceAll("[._]+", " ");
+    decoded = decoded.replaceAll("\\s+", " ").trim();
+
+    if (TextUtils.isEmpty(decoded)) {
+      return "";
+    }
+
+    Matcher yearMatch = Pattern.compile("\\b(19|20)\\d{2}\\b").matcher(decoded);
+    if (yearMatch.find() && yearMatch.start() > 2) {
+      decoded = decoded.substring(0, yearMatch.start()).trim();
+    }
+
+    Matcher seasonEpisodeMatch = Pattern.compile("(?i)\\bS\\d{1,2}E\\d{1,2}\\b").matcher(decoded);
+    if (seasonEpisodeMatch.find() && seasonEpisodeMatch.start() > 2) {
+      decoded = decoded.substring(0, seasonEpisodeMatch.start()).trim();
+    }
+
+    String[] parts = decoded.split("\\s+");
+    StringBuilder clean = new StringBuilder();
+    for (String part : parts) {
+      String token = part.replaceAll("^[^A-Za-z0-9]+|[^A-Za-z0-9]+$", "");
+      if (TextUtils.isEmpty(token)) {
+        continue;
+      }
+
+      if (isLikelyReleaseToken(token)) {
+        continue;
+      }
+
+      if (token.length() == 1 && Character.isLetter(token.charAt(0))) {
+        continue;
+      }
+
+      if (clean.length() > 0) {
+        clean.append(" ");
+      }
+      clean.append(token);
+    }
+
+    String pretty = clean.length() > 0 ? clean.toString() : decoded;
+    pretty = toTitleCase(pretty);
+
+    if (isLikelyOpaqueTokenTitle(pretty)) {
+      return "";
+    }
+
+    if (pretty.length() > 72) {
+      pretty = pretty.substring(0, 72).trim() + "...";
+    }
+
+    return pretty;
+  }
+
+  private boolean isLikelyOpaqueTokenTitle(String value) {
+    if (TextUtils.isEmpty(value)) {
+      return false;
+    }
+
+    String s = value.trim();
+    if (s.length() < 18) {
+      return false;
+    }
+
+    // Opaque tokens are typically long, space-less, and digit-heavy.
+    if (!s.contains(" ")) {
+      int letters = 0;
+      int digits = 0;
+      int vowels = 0;
+      for (int i = 0; i < s.length(); i++) {
+        char c = s.charAt(i);
+        if (Character.isLetter(c)) {
+          letters++;
+          char lc = Character.toLowerCase(c);
+          if (lc == 'a' || lc == 'e' || lc == 'i' || lc == 'o' || lc == 'u') {
+            vowels++;
+          }
+        } else if (Character.isDigit(c)) {
+          digits++;
+        }
+      }
+
+      if (s.length() >= 24) {
+        if (s.matches("(?i)^[0-9a-f]{24,}$")) {
+          return true;
+        }
+        float digitRatio = (float) digits / (float) s.length();
+        if (digitRatio >= 0.35f) {
+          return true;
+        }
+        if (letters > 0) {
+          float vowelRatio = (float) vowels / (float) letters;
+          if (vowelRatio < 0.18f) {
+            return true;
+          }
+        }
+      }
+    }
+
+    return false;
+  }
+
+  private String extractQualityHint(String title) {
+    if (TextUtils.isEmpty(title)) {
+      return "";
+    }
+
+    String lower = title.toLowerCase(Locale.US);
+    if (lower.contains("2160") || lower.contains("4k")) {
+      return "2160P";
+    }
+    if (lower.contains("1080")) {
+      return "1080P";
+    }
+    if (lower.contains("720")) {
+      return "720P";
+    }
+    if (lower.contains("hevc") || lower.contains("x265")) {
+      return "HEVC";
+    }
+    if (lower.contains("h264") || lower.contains("x264")) {
+      return "H264";
+    }
+    return "";
+  }
+
+  private boolean isLikelyReleaseToken(String token) {
+    String lower = token.toLowerCase(Locale.US);
+
+    if (lower.matches("^(19|20)\\d{2}$")
+        || lower.matches("^\\d{3,4}p$")
+        || lower.matches("^x\\d{3}$")
+        || lower.matches("^h\\d{3}$")
+        || lower.matches("^\\d{1,2}bit$")
+        || lower.matches("^ddp?\\d?(\\.\\d)?$")
+        || lower.matches("^dts(hd|ma)?$")
+        || lower.matches("^ac3|eac3|aac\\d?$")) {
+      return true;
+    }
+
+    switch (lower) {
+      case "bluray":
+      case "brrip":
+      case "bdrip":
+      case "web":
+      case "webrip":
+      case "webdl":
+      case "web-dl":
+      case "hdrip":
+      case "dvdrip":
+      case "rip":
+      case "proper":
+      case "repack":
+      case "remux":
+      case "hevc":
+      case "x264":
+      case "x265":
+      case "h264":
+      case "h265":
+      case "hdr":
+      case "sdr":
+      case "dv":
+      case "atvp":
+      case "atv":
+      case "ntb":
+      case "tgx":
+      case "amzn":
+      case "nf":
+      case "hmax":
+      case "uhd":
+      case "hd":
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  private String toTitleCase(String value) {
+    if (TextUtils.isEmpty(value)) {
+      return "";
+    }
+
+    String[] words = value.toLowerCase(Locale.US).split("\\s+");
+    StringBuilder out = new StringBuilder();
+    for (int i = 0; i < words.length; i++) {
+      String word = words[i];
+      if (word.isEmpty()) {
+        continue;
+      }
+
+      String finalWord;
+      if (word.length() <= 2 && i > 0) {
+        // Keep small joiner words lowercase unless they're the first token.
+        finalWord = word;
+      } else {
+        finalWord = Character.toUpperCase(word.charAt(0)) + word.substring(1);
+      }
+
+      if (out.length() > 0) {
+        out.append(" ");
+      }
+      out.append(finalWord);
+    }
+    return out.toString().trim();
+  }
+
+  private int dp(int value) {
+    return Math.round(value * getResources().getDisplayMetrics().density);
   }
 
   public boolean isExternalPlayerMode() {

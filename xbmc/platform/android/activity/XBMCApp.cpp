@@ -8,7 +8,7 @@
 
 #include "XBMCApp.h"
 
-#include "ModiKodiThresholds.h"
+#include "JumpgateThresholds.h"
 #include "SubtitleDownloader.h"
 #include "TraktScrobbler.h"
 
@@ -73,6 +73,7 @@
 
 #include <memory>
 #include <mutex>
+#include <cstdio>
 #include <sstream>
 #include <stdlib.h>
 #include <thread>
@@ -137,6 +138,64 @@ using namespace std::chrono_literals;
 static void SaveResumeForContent(const std::string& imdbId, int season, int episode,
                                  int64_t posMs, int64_t durMs,
                                  const std::string& bridgeUrl);
+
+static bool IsAndroidEmulatorDevice()
+{
+  if (CJNISystemProperties::get("ro.kernel.qemu", "") == "1")
+    return true;
+
+  const std::string hardware = StringUtils::ToLower(CJNISystemProperties::get("ro.hardware", ""));
+  const std::string model = StringUtils::ToLower(CJNISystemProperties::get("ro.product.model", ""));
+  const std::string brand = StringUtils::ToLower(CJNISystemProperties::get("ro.product.brand", ""));
+
+  return hardware.find("ranchu") != std::string::npos ||
+         hardware.find("goldfish") != std::string::npos ||
+         model.find("sdk_gphone") != std::string::npos ||
+         model.find("emulator") != std::string::npos ||
+         brand.find("generic") != std::string::npos;
+}
+
+static void ApplyEmulatorPlaybackSafetyOverrides()
+{
+  if (!IsAndroidEmulatorDevice())
+    return;
+
+  auto settingsComponent = CServiceBroker::GetSettingsComponent();
+  if (!settingsComponent)
+    return;
+
+  auto settings = settingsComponent->GetSettings();
+  if (!settings)
+    return;
+
+  bool changed = false;
+  if (settings->GetBool(CSettings::SETTING_VIDEOPLAYER_USEMEDIACODEC))
+  {
+    settings->SetBool(CSettings::SETTING_VIDEOPLAYER_USEMEDIACODEC, false);
+    changed = true;
+  }
+
+  if (settings->GetBool(CSettings::SETTING_VIDEOPLAYER_USEMEDIACODECSURFACE))
+  {
+    settings->SetBool(CSettings::SETTING_VIDEOPLAYER_USEMEDIACODECSURFACE, false);
+    changed = true;
+  }
+
+  if (settings->GetBool(CSettings::SETTING_AUDIOOUTPUT_PASSTHROUGH))
+  {
+    settings->SetBool(CSettings::SETTING_AUDIOOUTPUT_PASSTHROUGH, false);
+    changed = true;
+  }
+
+  if (changed)
+  {
+    CLog::Log(
+        LOGWARNING,
+        "CXBMCApp: Emulator detected (hardware={}, model={}) - forced software decode and disabled "
+        "audio passthrough for playback stability",
+        CJNISystemProperties::get("ro.hardware", ""), CJNISystemProperties::get("ro.product.model", ""));
+  }
+}
 
 std::shared_ptr<CNativeWindow> CNativeWindow::CreateFromSurface(CJNISurfaceHolder holder)
 {
@@ -443,7 +502,7 @@ void CXBMCApp::onDestroy()
       {
         // Empty bridgeUrl skips the Bridge POST (SaveResumeForContent supports this)
         SaveResumeForContent(imdb, season, episode, posMs, durMs, "");
-        android_printf("ModiKodi: onDestroy safety-net resume saved for %s pos=%lld dur=%lld",
+        android_printf("Jumpgate: onDestroy safety-net resume saved for %s pos=%lld dur=%lld",
                        imdb.c_str(), (long long)posMs, (long long)durMs);
       }
     }
@@ -547,6 +606,7 @@ void CXBMCApp::Initialize()
   if (m_externalPlayerMode.load(std::memory_order_relaxed))
   {
     LoadSettings();
+    ApplyEmulatorPlaybackSafetyOverrides();
 
     m_traktScrobbler = std::make_unique<TraktScrobbler>();
     m_traktScrobbler->Initialize();
@@ -999,11 +1059,14 @@ void CXBMCApp::OnPlayBackStarted()
 
   RequestVisibleBehind(true);
 
-  // Hide loading overlay when playback actually starts (external player mode)
+  // Reset overlay flag so ProcessSlow hides the overlay at the right time —
+  // when currentTime > 0 (actual frame decoding started, not just file opened).
+  // Do NOT call hideLoadingOverlay here: this callback fires when the player
+  // opens the file, well before any frames are decoded/displayed on screen.
   if (m_externalPlayerMode.load(std::memory_order_relaxed))
   {
-    call_method<void>(m_context, "hideLoadingOverlay", "()V");
-    CLog::Log(LOGINFO, "CXBMCApp: Hiding loading overlay (playback started)");
+    m_overlayHidden = false;
+    CLog::Log(LOGINFO, "CXBMCApp: Playback started — overlay will hide when frames render");
   }
 }
 
@@ -1139,7 +1202,7 @@ void CXBMCApp::SaveResumePosition()
 
   // Determine if playback completed (>90%)
   bool completed = (durMs > 0 && posMs > 0 &&
-                    static_cast<float>(posMs) / static_cast<float>(durMs) > ModiKodi::RESUME_CLEAR_RATIO);
+                    static_cast<float>(posMs) / static_cast<float>(durMs) > Jumpgate::RESUME_CLEAR_RATIO);
 
   // Load existing resume store
   std::string storePath = CSpecialProtocol::TranslatePath(RESUME_STORE_FILE);
@@ -1257,7 +1320,7 @@ int CXBMCApp::LoadResumePosition(const std::string& imdbId, int season, int epis
     return 0;
 
   // If position is > 95% of duration, content was watched — start over
-  if (dur > 0 && static_cast<float>(pos) / static_cast<float>(dur) > ModiKodi::RESUME_DISCARD_RATIO)
+  if (dur > 0 && static_cast<float>(pos) / static_cast<float>(dur) > Jumpgate::RESUME_DISCARD_RATIO)
     return 0;
 
   return static_cast<int>(pos);
@@ -1277,6 +1340,9 @@ void CXBMCApp::OnContentIdentified()
   int season = m_traktScrobbler->GetSeason();
   int episode = m_traktScrobbler->GetEpisode();
 
+  // Update Java-side Jumpgate overlay with identified content info (title + meta).
+  UpdateLoadingOverlayContentInfo(true);
+
   // Show content identification toast
   std::string toastMsg;
   if (!title.empty())
@@ -1294,7 +1360,7 @@ void CXBMCApp::OnContentIdentified()
       toastMsg += " S" + std::to_string(season) + "E" + std::to_string(episode);
   }
   CGUIDialogKaiToast::QueueNotification(
-      CGUIDialogKaiToast::Info, "ModiKodi", "Identified: " + toastMsg, 5000, true);
+      CGUIDialogKaiToast::Info, "Jumpgate", "Identified: " + toastMsg, 5000, true);
 
   // Check resume position: Bridge → local store → Trakt sync
   int savedPos = m_traktScrobbler->GetBridgeResumePosition();
@@ -1313,7 +1379,7 @@ void CXBMCApp::OnContentIdentified()
       appPlayer->SeekTime(savedPos);
       CLog::Log(LOGINFO, "CXBMCApp: Late resume to {} ms (content identified after playback start)", savedPos);
       CGUIDialogKaiToast::QueueNotification(
-          CGUIDialogKaiToast::Info, "ModiKodi", "Resuming playback", 3000, true);
+          CGUIDialogKaiToast::Info, "Jumpgate", "Resuming playback", 3000, true);
     }
   }
 
@@ -1328,6 +1394,62 @@ void CXBMCApp::OnContentIdentified()
     m_subtitleDownloader->SetContentInfo(imdb, title, year, season, episode);
     m_subtitleDownloader->TriggerSearch();
   }
+}
+
+void CXBMCApp::UpdateLoadingOverlayContentInfo(bool force)
+{
+  if (!m_traktScrobbler)
+    return;
+
+  std::string imdb = m_traktScrobbler->GetImdbId();
+  std::string showOrMovieTitle = m_traktScrobbler->GetTitle();
+  std::string episodeTitle = m_traktScrobbler->GetEpisodeTitle();
+  std::string logoUrl = m_traktScrobbler->GetLogoUrl();
+  int year = m_traktScrobbler->GetYear();
+  int season = m_traktScrobbler->GetSeason();
+  int episode = m_traktScrobbler->GetEpisode();
+
+  const bool isEpisode = (season >= 0 && episode >= 0);
+
+  std::string title;
+  std::string meta;
+
+  if (isEpisode)
+  {
+    // Title: episode title, Meta: show title • SxxEyy
+    title = !episodeTitle.empty() ? episodeTitle : (!showOrMovieTitle.empty() ? showOrMovieTitle : imdb);
+
+    char seBuf[16];
+    std::snprintf(seBuf, sizeof(seBuf), "S%02dE%02d", season, episode);
+
+    meta = showOrMovieTitle;
+    if (!meta.empty())
+      meta += " - ";
+    meta += seBuf;
+  }
+  else
+  {
+    title = !showOrMovieTitle.empty() ? showOrMovieTitle : imdb;
+    meta = "MOVIE";
+    if (year > 0)
+      meta += " - " + std::to_string(year);
+  }
+
+  if (title.empty())
+    title = "Identifying...";
+
+  if (!force && title == m_lastOverlayTitle && meta == m_lastOverlayMeta && logoUrl == m_lastOverlayLogoUrl)
+    return;
+
+  m_lastOverlayTitle = title;
+  m_lastOverlayMeta = meta;
+  m_lastOverlayLogoUrl = logoUrl;
+
+  call_method<void>(m_context, "updateLoadingOverlayContentInfo",
+                    "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+                    jcast<jhstring>(title),
+                    jcast<jhstring>(meta),
+                    jcast<jhstring>(logoUrl));
 }
 
 // --- Settings ---
@@ -1446,7 +1568,7 @@ void CXBMCApp::CheckForUpdate()
 
   // Parse local version
   int localMajor = 0, localMinor = 0, localPatch = 0;
-  sscanf(MODIKODI_VERSION, "%d.%d.%d", &localMajor, &localMinor, &localPatch);
+  sscanf(JUMPGATE_VERSION, "%d.%d.%d", &localMajor, &localMinor, &localPatch);
 
   bool isNewer = (remoteMajor > localMajor) ||
                  (remoteMajor == localMajor && remoteMinor > localMinor) ||
@@ -1454,14 +1576,14 @@ void CXBMCApp::CheckForUpdate()
 
   if (isNewer)
   {
-    CLog::Log(LOGINFO, "CXBMCApp: Update available: {} -> {}", MODIKODI_VERSION, remoteVersion);
+    CLog::Log(LOGINFO, "CXBMCApp: Update available: {} -> {}", JUMPGATE_VERSION, remoteVersion);
     CGUIDialogKaiToast::QueueNotification(
-        CGUIDialogKaiToast::Info, "ModiKodi",
+        CGUIDialogKaiToast::Info, "Jumpgate",
         "Update available: v" + remoteVersion, 7000, true);
   }
   else
   {
-    CLog::Log(LOGDEBUG, "CXBMCApp: Version up to date ({})", MODIKODI_VERSION);
+    CLog::Log(LOGDEBUG, "CXBMCApp: Version up to date ({})", JUMPGATE_VERSION);
   }
 }
 
@@ -1475,7 +1597,7 @@ void CXBMCApp::ShowSettingsDialog()
     return;
 
   dialog->Reset();
-  dialog->SetHeading(CVariant{"ModiKodi Settings"});
+  dialog->SetHeading(CVariant{"Jumpgate Settings"});
 
   // Menu items
   dialog->Add("Subtitle Languages (" + GetSettingString("subtitle_languages", "en") + ")");
@@ -1485,7 +1607,7 @@ void CXBMCApp::ShowSettingsDialog()
                    : " (Not connected)"));
   dialog->Add("OpenSubtitles Account");
   dialog->Add("Bridge Server URL");
-  dialog->Add("About ModiKodi");
+  dialog->Add("About Jumpgate");
 
   dialog->Open();
 
@@ -1506,7 +1628,7 @@ void CXBMCApp::ShowSettingsDialog()
           langs = "en";
         SetSetting("subtitle_languages", langs);
         CGUIDialogKaiToast::QueueNotification(
-            CGUIDialogKaiToast::Info, "ModiKodi",
+            CGUIDialogKaiToast::Info, "Jumpgate",
             "Subtitle languages: " + langs, 3000, true);
       }
       break;
@@ -1537,7 +1659,7 @@ void CXBMCApp::ShowSettingsDialog()
         m_subtitleDownloader->Deinitialize();
         m_subtitleDownloader->Initialize();
         CGUIDialogKaiToast::QueueNotification(
-            CGUIDialogKaiToast::Info, "ModiKodi",
+            CGUIDialogKaiToast::Info, "Jumpgate",
             "OpenSubtitles will prompt for credentials on next play", 3000, true);
       }
       break;
@@ -1550,7 +1672,7 @@ void CXBMCApp::ShowSettingsDialog()
       {
         SetSetting("bridge_url", url);
         CGUIDialogKaiToast::QueueNotification(
-            CGUIDialogKaiToast::Info, "ModiKodi",
+            CGUIDialogKaiToast::Info, "Jumpgate",
             url.empty() ? "Bridge: auto-detect" : "Bridge: " + url, 3000, true);
       }
       break;
@@ -1558,8 +1680,8 @@ void CXBMCApp::ShowSettingsDialog()
     case 4: // About
     {
       CGUIDialogKaiToast::QueueNotification(
-          CGUIDialogKaiToast::Info, "ModiKodi",
-          std::string("ModiKodi v") + MODIKODI_VERSION + " - External Player for Stremio",
+          CGUIDialogKaiToast::Info, "Jumpgate",
+          std::string("Jumpgate v") + JUMPGATE_VERSION + " - External Player for Stremio",
           5000, true);
       break;
     }
@@ -1598,11 +1720,35 @@ void CXBMCApp::ProcessSlow()
       m_lastPlaybackTimeMs.store(currentTime, std::memory_order_relaxed);
       m_lastPlaybackDurationMs.store(totalTime, std::memory_order_relaxed);
     }
+
+    // Feed Java-side Jumpgate overlay with real parser/clock signals so the
+    // loading progress/status can reflect actual stream readiness.
+    if (!m_overlayHidden)
+      call_method<void>(m_context, "updatePlaybackPosition", "(JJ)V", currentTime, totalTime);
+
+    // Hide loading overlay once the player clock is actually advancing.
+    // Separate from position tracking: totalTime > 0 fires too early (file header parsed,
+    // no frames decoded yet). currentTime > 0 means actual decoding/playback is happening
+    // and video frames are being rendered on the SurfaceView.
+    if (!m_overlayHidden && currentTime > 0)
+    {
+      call_method<void>(m_context, "hideLoadingOverlay", "()V");
+      m_overlayHidden = true;
+      CLog::Log(LOGINFO, "CXBMCApp: Loading overlay hidden (currentTime={}ms)", currentTime);
+    }
   }
 
   // Trakt scrobbler: poll for device code auth
   if (m_traktScrobbler && m_externalPlayerMode.load(std::memory_order_relaxed))
     m_traktScrobbler->ProcessSlow();
+
+  // Update Jumpgate overlay content info as soon as identification/hydration becomes available.
+  // Safe even if the overlay isn't currently shown (Java side will no-op).
+  if (m_externalPlayerMode.load(std::memory_order_relaxed) && !m_overlayHidden && m_traktScrobbler &&
+      m_traktScrobbler->IsContentIdentified())
+  {
+    UpdateLoadingOverlayContentInfo(false);
+  }
 
   // Content-ID based late resume: when content is identified after playback starts
   if (m_externalPlayerMode.load(std::memory_order_relaxed) && m_traktScrobbler && !m_resumeApplied.load(std::memory_order_relaxed))
@@ -2004,10 +2150,10 @@ static void SaveResumeForContent(const std::string& imdbId, int season, int epis
     key += ":" + std::to_string(season) + ":" + std::to_string(episode);
 
   bool completed = (durMs > 0 && posMs > 0 &&
-                    static_cast<float>(posMs) / static_cast<float>(durMs) > ModiKodi::RESUME_CLEAR_RATIO);
+                    static_cast<float>(posMs) / static_cast<float>(durMs) > Jumpgate::RESUME_CLEAR_RATIO);
 
   // Load existing resume store
-  std::string storePath = CSpecialProtocol::TranslatePath("special://profile/modikodi_resume.json");
+  std::string storePath = CSpecialProtocol::TranslatePath("special://profile/jumpgate_resume.json");
   CVariant store(CVariant::VariantTypeObject);
 
   XFILE::CFile file;
@@ -2082,8 +2228,8 @@ void CXBMCApp::onNewIntent(CJNIIntent intent)
   CLog::Log(LOGDEBUG, "CXBMCApp::onNewIntent - Got intent. Action: {}", action);
   std::string targetFile = GetFilenameFromIntent(intent);
 
-  // Parse and strip ModiKodi Bridge metadata from URL (_mk_imdb, _mk_type, _mk_s, _mk_e)
-  // These are appended by the ModiKodi Bridge Stremio addon for content identification.
+  // Parse and strip Jumpgate Bridge metadata from URL (_mk_imdb, _mk_type, _mk_s, _mk_e)
+  // These are appended by the Jumpgate Bridge Stremio addon for content identification.
   std::string mkImdbId;
   int mkSeason = -1;
   int mkEpisode = -1;
@@ -2107,7 +2253,7 @@ void CXBMCApp::onNewIntent(CJNIIntent intent)
 
     if (!mkImdbId.empty())
     {
-      CLog::Log(LOGINFO, "CXBMCApp: ModiKodi Bridge metadata - imdb={} S{}E{}", mkImdbId, mkSeason, mkEpisode);
+      CLog::Log(LOGINFO, "CXBMCApp: Jumpgate Bridge metadata - imdb={} S{}E{}", mkImdbId, mkSeason, mkEpisode);
       // Strip all _mk_* params from URL before passing to the player
       std::string cleanUrl = targetFile;
       // Remove _mk_* params (handles both ?_mk_ and &_mk_ cases)
@@ -2137,11 +2283,21 @@ void CXBMCApp::onNewIntent(CJNIIntent intent)
   // (ACTION_GET_CONTENT is Kodi's internal leanback navigation, not external player)
   if (!targetFile.empty() && action == CJNIIntent::ACTION_VIEW)
   {
-    // onNewIntent only fires when the activity is already alive (singleTop).
-    // This means we are transitioning from standalone to external player mode.
-    m_wasStandalone.store(true, std::memory_order_relaxed);
+    // Only mark wasStandalone if we were NOT already in external player mode.
+    // On cold launch from Stremio, m_externalPlayerMode is already true (set in onStart
+    // via Java's isExternalPlayerMode()). On a genuine warm transition from standalone
+    // Kodi, m_externalPlayerMode is false (reset by ReturnToStandaloneMode).
+    bool wasColdLaunch = m_externalPlayerMode.load(std::memory_order_relaxed);
+    if (!wasColdLaunch)
+    {
+      m_wasStandalone.store(true, std::memory_order_relaxed);
+      CLog::Log(LOGINFO, "CXBMCApp: External player mode activated (warm transition) for: {}", targetFile);
+    }
+    else
+    {
+      CLog::Log(LOGINFO, "CXBMCApp: External player mode activated (cold launch) for: {}", targetFile);
+    }
     m_externalPlayerMode.store(true, std::memory_order_relaxed);
-    CLog::Log(LOGINFO, "CXBMCApp: External player mode activated (warm transition) for: {}", targetFile);
 
     // Create TraktScrobbler lazily if not yet initialized
     if (!m_traktScrobbler)
@@ -2168,7 +2324,7 @@ void CXBMCApp::onNewIntent(CJNIIntent intent)
     if (intent.hasExtra("episode"))
       episode = intent.getIntExtra("episode", -1);
 
-    // ModiKodi Bridge metadata takes priority over intent extras
+    // Jumpgate Bridge metadata takes priority over intent extras
     if (!mkImdbId.empty())
     {
       imdbId = mkImdbId;

@@ -1,12 +1,12 @@
 /*
- *  Copyright (C) 2024 Team ModiKodi
+ *  Copyright (C) 2024 Team Jumpgate
  *  SPDX-License-Identifier: GPL-2.0-or-later
  *  See LICENSES/README.md for more information.
  */
 
 #pragma once
 
-namespace ModiKodi
+namespace Jumpgate
 {
 // ============================================================================
 // Completion Thresholds
@@ -38,4 +38,4 @@ constexpr float TRAKT_HISTORY_SYNC_PCT = 80.0f;   // percentage (0-100 scale)
 constexpr float RESUME_CLEAR_RATIO = 0.9f;         // ratio (0.0-1.0 scale)
 constexpr float RESUME_DISCARD_RATIO = 0.95f;      // ratio (0.0-1.0 scale)
 
-} // namespace ModiKodi
+} // namespace Jumpgate

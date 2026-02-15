@@ -97,7 +97,7 @@
         <activity
             android:name=".Main"
             android:configChanges="orientation|keyboard|keyboardHidden|navigation|touchscreen|screenLayout|screenSize|colorMode"
-            android:finishOnTaskLaunch="true"
+            android:finishOnTaskLaunch="false"
             android:launchMode="singleTop"
             android:exported="true"
             android:screenOrientation="sensorLandscape"

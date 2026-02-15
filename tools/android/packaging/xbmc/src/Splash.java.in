@@ -23,6 +23,7 @@ import android.os.Message;
 import android.provider.Settings;
 import android.text.Html;
 import android.text.method.LinkMovementMethod;
+import android.graphics.Color;
 import android.util.Log;
 import android.view.View;
 import android.widget.ProgressBar;
@@ -631,7 +632,9 @@ public class Splash extends Activity
             && intent.getData() != null;
 
     intent.setClass(this, @APP_PACKAGE@.Main.class);
-    intent.addFlags(Intent.FLAG_ACTIVITY_PREVIOUS_IS_TOP);
+    // Replace all flags — don't carry forward launcher's FLAG_ACTIVITY_RESET_TASK_IF_NEEDED
+    // which causes the task to be disrupted during Splash→Main transition on phone launchers
+    intent.setFlags(Intent.FLAG_ACTIVITY_PREVIOUS_IS_TOP);
     if (isExternalPlayer) {
       intent.putExtra("external_player_mode", true);
       // Forward content ID extras if present (for Trakt scrobbling)
@@ -668,10 +671,27 @@ public class Splash extends Activity
   @Override
   public void onCreate(Bundle savedInstanceState)
   {
+    // For external player mode, black out Splash so the user doesn't see
+    // "Starting Kodi..." text or the splash layout during initialization.
+    // This runs before super.onCreate() to catch Android's preview window too.
+    boolean isExternalPlayer = Intent.ACTION_VIEW.equals(getIntent().getAction())
+            && getIntent().getData() != null;
+    if (isExternalPlayer) {
+      getWindow().getDecorView().setBackgroundColor(Color.BLACK);
+    }
+
     super.onCreate(savedInstanceState);
 
     // Be sure properties are initialized for native
     XBMCProperties.initialize(getApplicationContext());
+
+    // In external player mode, ensure a content view is attached before any early
+    // return/startXBMC path to reduce risk of ANR during rapid activity chaining.
+    if (isExternalPlayer) {
+      View blank = new View(this);
+      blank.setBackgroundColor(Color.BLACK);
+      setContentView(blank);
+    }
 
     if (Main.isActivityRunning()) {
       Log.d(TAG, "@APP_NAME@ already running; just activate it");
@@ -718,6 +738,12 @@ public class Splash extends Activity
     mProgress = findViewById(R.id.progressBar1);
     mProgress.setVisibility(View.INVISIBLE);
     mTextView = findViewById(R.id.textView1);
+
+    // In external player mode, hide splash text/progress — user sees black until Main's overlay
+    if (isExternalPlayer) {
+      mTextView.setVisibility(View.GONE);
+      mProgress.setVisibility(View.GONE);
+    }
 
     if (mState == InError || mState == CheckingPermissionsInfo)
     {

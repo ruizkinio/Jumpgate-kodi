@@ -1,12 +1,12 @@
 /*
- *  Copyright (C) 2024 Team ModiKodi
+ *  Copyright (C) 2024 Team Jumpgate
  *  SPDX-License-Identifier: GPL-2.0-or-later
  *  See LICENSES/README.md for more information.
  */
 
 #include "TraktScrobbler.h"
 
-#include "ModiKodiThresholds.h"
+#include "JumpgateThresholds.h"
 #include "ServiceBroker.h"
 #include "application/ApplicationComponents.h"
 #include "application/ApplicationPlayer.h"
@@ -61,16 +61,17 @@ void TraktScrobbler::Initialize()
   LoadTokens();
   m_bridgeUrl = BRIDGE_CLOUD_URL;
 
-  // DetectBridgeUrl does HTTP (2s timeout) but only runs once at startup.
-  // Release lock for the probe since it's network I/O.
-  std::string bridgeUrl = m_bridgeUrl;
-  lock.unlock();
-  DetectBridgeUrl();
-  lock.lock();
-
+  // Register announcer and mark initialized BEFORE releasing lock.
   CServiceBroker::GetAnnouncementManager()->AddAnnouncer(this, ANNOUNCEMENT::Player);
   m_initialized = true;
-  CLog::Log(LOGINFO, "TraktScrobbler: Initialized (bridge={})", m_bridgeUrl);
+  // Bridge detection deferred to first ProcessSlow call.
+  // CCurlFile crashes (SIGABRT) when called from onNewIntent during early init because
+  // Kodi's native subsystems (including curl) aren't fully initialized yet.
+  // ProcessSlow runs on the Kodi main thread after full initialization.
+  m_bridgeDetected = false;
+  lock.unlock();
+
+  CLog::Log(LOGINFO, "TraktScrobbler: Initialized (bridge detection deferred to ProcessSlow)");
 }
 
 void TraktScrobbler::Deinitialize()
@@ -143,6 +144,8 @@ void TraktScrobbler::Announce(AnnouncementFlag flag,
 
   if (message == "OnPlay" || message == "OnResume")
   {
+    m_scrobblePaused = false;
+
     // --- Content identification (may require HTTP) ---
     if (!m_contentIdentified)
     {
@@ -173,13 +176,45 @@ void TraktScrobbler::Announce(AnnouncementFlag flag,
       }
     }
 
+    // --- Configured Bridge token fetch (profile-scoped Bridge URLs) ---
+    // For configured mode, refresh access token from Bridge on each play/resume.
+    // This prevents profile cross-over when multiple configured URLs are used
+    // on the same device/session.
+    bool configuredBridge = IsConfiguredBridgeUrl(m_bridgeUrl);
+    if (configuredBridge)
+    {
+      std::string urlSnapshot = m_mediaUrl;
+      lock.unlock();
+      bool fetched = FetchAccessTokenFromBridge();
+      lock.lock();
+
+      if (m_mediaUrl != urlSnapshot)
+      {
+        CLog::Log(LOGINFO, "TraktScrobbler: Discarding stale Bridge token fetch (content changed)");
+        return;
+      }
+
+      if (fetched)
+      {
+        CLog::Log(LOGINFO, "TraktScrobbler: Using configured Trakt token from Bridge");
+      }
+      else
+      {
+        // Do not fall back to a previously cached token from another profile.
+        // In configured mode, failing closed is safer than cross-profile scrobbling.
+        m_accessToken.clear();
+        m_refreshToken.clear();
+        m_tokenExpiry = 0;
+        CLog::Log(LOGWARNING, "TraktScrobbler: Configured Bridge token fetch failed, skipping scrobble auth for this playback");
+        return;
+      }
+    }
+
     // --- Authentication (may require HTTP for token refresh or device code) ---
     if (!IsAuthenticated())
     {
       if (!m_refreshToken.empty())
       {
-        // Copy state for refresh
-        std::string refreshToken = m_refreshToken;
         std::string urlSnapshot = m_mediaUrl;
 
         lock.unlock();
@@ -251,6 +286,7 @@ void TraktScrobbler::Announce(AnnouncementFlag flag,
       if (ok)
       {
         m_scrobbleActive = true;
+        m_scrobblePaused = false;
         m_lastScrobbleUpdateTime = GetCurrentTimeSec();
         CLog::Log(LOGINFO, "TraktScrobbler: Scrobble started at {:.1f}%", progress);
       }
@@ -263,6 +299,7 @@ void TraktScrobbler::Announce(AnnouncementFlag flag,
       float progress = GetPlaybackProgress();
       std::string scrobbleJson = BuildScrobbleJson(progress);
       std::string accessToken = m_accessToken;
+      m_scrobblePaused = true;
 
       // Fire-and-forget pause: no state update needed after
       lock.unlock();
@@ -287,11 +324,12 @@ void TraktScrobbler::Announce(AnnouncementFlag flag,
 
       // Build watch history JSON under lock (reads content fields)
       std::string historyJson;
-      bool shouldSyncHistory = (progress > ModiKodi::TRAKT_HISTORY_SYNC_PCT && wasIdentified);
+      bool shouldSyncHistory = (progress > Jumpgate::TRAKT_HISTORY_SYNC_PCT && wasIdentified);
       if (shouldSyncHistory)
         historyJson = BuildSyncHistoryJson();
 
       m_scrobbleActive = false; // Set before unlock -- stop is final
+      m_scrobblePaused = false;
 
       lock.unlock();
 
@@ -321,6 +359,17 @@ void TraktScrobbler::Announce(AnnouncementFlag flag,
 void TraktScrobbler::ProcessSlow()
 {
   std::unique_lock lock(m_critSection);
+
+  // Deferred bridge URL detection (curl isn't safe during early onNewIntent init)
+  if (!m_bridgeDetected)
+  {
+    m_bridgeDetected = true;
+    lock.unlock();
+    DetectBridgeUrl();
+    lock.lock();
+    std::string bridgeUrlSnapshot = m_bridgeUrl;
+    CLog::Log(LOGINFO, "TraktScrobbler: Bridge detection complete (bridge={})", bridgeUrlSnapshot);
+  }
 
   // --- Auth polling section ---
   if (m_authInProgress)
@@ -401,8 +450,64 @@ void TraktScrobbler::ProcessSlow()
     }
   }
 
+  // --- Public metadata hydration (best-effort, no auth required) ---
+  // If we already have an IMDB id but lack a human title (common for Bridge/URL-identification),
+  // hydrate title/year and for episodes also fetch episode title.
+  if (m_contentIdentified && !m_imdbId.empty())
+  {
+    bool isEpisode = (m_season >= 0 && m_episode >= 0);
+    bool needHydrate = m_title.empty() || (isEpisode && m_episodeTitle.empty()) || (m_year == 0);
+    if (needHydrate)
+    {
+      int64_t now = GetCurrentTimeSec();
+      std::string key =
+          m_imdbId + ":" + std::to_string(m_season) + ":" + std::to_string(m_episode);
+
+      if (key != m_lastPublicHydrateKey || (now - m_lastPublicHydrateAttemptTime) >= 20)
+      {
+        std::string urlSnapshot = m_mediaUrl;
+        std::string idSnapshot = m_imdbId;
+        int seasonSnapshot = m_season;
+        int episodeSnapshot = m_episode;
+
+        m_lastPublicHydrateAttemptTime = now;
+        m_lastPublicHydrateKey = key;
+
+        lock.unlock();
+        HydrateFromTraktPublic(idSnapshot, seasonSnapshot, episodeSnapshot, urlSnapshot);
+        lock.lock();
+      }
+    }
+  }
+
+  // --- Configured-mode token refresh ---
+  // Configured profiles are bridge-owned; refresh via Bridge token endpoint instead
+  // of starting device auth when token expires mid-session.
+  if (m_scrobbleActive && !m_scrobblePaused && m_contentIdentified && !IsAuthenticated())
+  {
+    bool configuredBridge = IsConfiguredBridgeUrl(m_bridgeUrl);
+    int64_t now = GetCurrentTimeSec();
+    if (configuredBridge && !m_authInProgress && (now - m_lastConfiguredTokenFetchTime) >= SCROBBLE_UPDATE_INTERVAL_SEC)
+    {
+      std::string urlSnapshot = m_mediaUrl;
+      m_lastConfiguredTokenFetchTime = now;
+      lock.unlock();
+      bool fetched = FetchAccessTokenFromBridge();
+      lock.lock();
+
+      if (m_mediaUrl != urlSnapshot)
+      {
+        CLog::Log(LOGINFO, "TraktScrobbler: Discarding stale configured token refresh (content changed)");
+        return;
+      }
+
+      if (fetched)
+        CLog::Log(LOGINFO, "TraktScrobbler: Refreshed configured Trakt token from Bridge");
+    }
+  }
+
   // --- Periodic scrobble progress update ---
-  if (m_scrobbleActive && m_contentIdentified && IsAuthenticated())
+  if (m_scrobbleActive && !m_scrobblePaused && m_contentIdentified && IsAuthenticated())
   {
     int64_t now = GetCurrentTimeSec();
     if ((now - m_lastScrobbleUpdateTime) >= SCROBBLE_UPDATE_INTERVAL_SEC)
@@ -446,10 +551,15 @@ void TraktScrobbler::SetContentInfo(const std::string& imdbId,
   std::unique_lock lock(m_critSection);
   m_imdbId = imdbId;
   m_title = title;
+  m_episodeTitle.clear();
+  m_logoUrl.clear();
+  m_logoFetchedForImdb.clear();
   m_year = year;
   m_season = season;
   m_episode = episode;
   m_contentIdentified = !imdbId.empty() || !title.empty();
+  m_lastPublicHydrateAttemptTime = 0;
+  m_lastPublicHydrateKey.clear();
 
   if (m_contentIdentified)
   {
@@ -471,17 +581,23 @@ void TraktScrobbler::ClearContentInfo()
   m_imdbId.clear();
   m_traktSlug.clear();
   m_title.clear();
+  m_episodeTitle.clear();
+  m_logoUrl.clear();
+  m_logoFetchedForImdb.clear();
   m_year = 0;
   m_season = -1;
   m_episode = -1;
   m_contentIdentified = false;
   m_scrobbleActive = false;
+  m_scrobblePaused = false;
   m_mediaUrl.clear();
   m_resolvedUrl.clear();
   m_lastScrobbleUpdateTime = 0;
   m_playbackStartTime = 0;
   m_identifyFailed = false;
   m_bridgeResumePositionMs.store(0, std::memory_order_relaxed);
+  m_lastPublicHydrateAttemptTime = 0;
+  m_lastPublicHydrateKey.clear();
 }
 
 std::string TraktScrobbler::GetImdbId() const
@@ -494,6 +610,18 @@ std::string TraktScrobbler::GetTitle() const
 {
   std::unique_lock lock(m_critSection);
   return m_title;
+}
+
+std::string TraktScrobbler::GetEpisodeTitle() const
+{
+  std::unique_lock lock(m_critSection);
+  return m_episodeTitle;
+}
+
+std::string TraktScrobbler::GetLogoUrl() const
+{
+  std::unique_lock lock(m_critSection);
+  return m_logoUrl;
 }
 
 int TraktScrobbler::GetYear() const
@@ -575,11 +703,69 @@ std::string TraktScrobbler::GetBridgeUrl() const
 void TraktScrobbler::SetBridgeUrl(const std::string& url)
 {
   std::unique_lock lock(m_critSection);
-  if (!url.empty())
+  std::string normalized = NormalizeBridgeUrl(url);
+  if (!normalized.empty())
   {
-    m_bridgeUrl = url;
-    CLog::Log(LOGINFO, "TraktScrobbler: Bridge URL overridden to {}", url);
+    m_bridgeUrl = normalized;
+    CLog::Log(LOGINFO, "TraktScrobbler: Bridge URL overridden to {}", normalized);
   }
+}
+
+bool TraktScrobbler::IsConfiguredBridgeUrl(const std::string& bridgeUrl) const
+{
+  std::string normalized = NormalizeBridgeUrl(bridgeUrl);
+  if (normalized.empty())
+    return false;
+
+  if (normalized.find("/_c/") != std::string::npos)
+    return true;
+
+  // Legacy configured alias base: https://host/<config>
+  static const std::regex aliasPattern("^https?://[^/]+/[A-Za-z0-9_-]{24,}$", std::regex::icase);
+  return std::regex_match(normalized, aliasPattern);
+}
+
+std::string TraktScrobbler::NormalizeBridgeUrl(const std::string& url) const
+{
+  std::string normalized = url;
+  StringUtils::Trim(normalized);
+  if (normalized.empty())
+    return normalized;
+
+  if (StringUtils::StartsWithNoCase(normalized, "stremio://"))
+    normalized = "https://" + normalized.substr(10);
+
+  size_t cut = normalized.find_first_of("?#");
+  if (cut != std::string::npos)
+    normalized = normalized.substr(0, cut);
+
+  while (normalized.size() > 1 && normalized.back() == '/')
+    normalized.pop_back();
+
+  const std::string manifestSuffix = "/manifest.json";
+  if (StringUtils::EndsWithNoCase(normalized, manifestSuffix))
+    normalized = normalized.substr(0, normalized.size() - manifestSuffix.size());
+
+  while (normalized.size() > 1 && normalized.back() == '/')
+    normalized.pop_back();
+
+  return normalized;
+}
+
+std::string TraktScrobbler::BuildBridgeEndpoint(const std::string& bridgeUrl,
+                                                const std::string& endpoint) const
+{
+  std::string base = NormalizeBridgeUrl(bridgeUrl);
+  if (base.empty())
+    return "";
+
+  if (endpoint.empty())
+    return base;
+
+  if (endpoint.front() == '/')
+    return base + endpoint;
+
+  return base + "/" + endpoint;
 }
 
 // --- Auth ---
@@ -678,6 +864,49 @@ bool TraktScrobbler::SaveTokens()
   }
 
   CLog::Log(LOGINFO, "TraktScrobbler: Tokens saved successfully");
+  return true;
+}
+
+bool TraktScrobbler::FetchAccessTokenFromBridge()
+{
+  std::unique_lock lock(m_critSection);
+  std::string bridgeUrl = NormalizeBridgeUrl(m_bridgeUrl);
+  lock.unlock();
+
+  if (bridgeUrl.empty())
+    return false;
+
+  XFILE::CCurlFile curl;
+  curl.SetTimeout(5);
+  std::string response;
+  std::string url = BuildBridgeEndpoint(bridgeUrl, "/auth/token");
+
+  if (!curl.Get(url, response))
+    return false;
+
+  CVariant data;
+  if (!CJSONVariantParser::Parse(response, data))
+    return false;
+
+  if (!data["ok"].asBoolean())
+    return false;
+
+  std::string accessToken = data["access_token"].asString();
+  if (accessToken.empty())
+    return false;
+
+  int64_t tokenExpiry = data["token_expiry"].asInteger(0);
+  if (tokenExpiry <= 0)
+    tokenExpiry = GetCurrentTimeSec() + 3600;
+
+  lock.lock();
+  m_accessToken = accessToken;
+  m_tokenExpiry = tokenExpiry;
+  // Configured Bridge mode owns token refresh. Do not reuse local refresh token.
+  m_refreshToken.clear();
+  m_lastConfiguredTokenFetchTime = GetCurrentTimeSec();
+  lock.unlock();
+
   return true;
 }
 
@@ -1078,14 +1307,17 @@ void TraktScrobbler::DetectBridgeUrl()
   if (curl.Get(std::string(BRIDGE_LOCAL_URL) + "/manifest.json", response))
   {
     CVariant data;
-    if (CJSONVariantParser::Parse(response, data) &&
-        data["id"].asString() == "com.modikodi.bridge")
+    if (CJSONVariantParser::Parse(response, data))
     {
-      lock.lock();
-      m_bridgeUrl = BRIDGE_LOCAL_URL;
-      lock.unlock();
-      CLog::Log(LOGINFO, "TraktScrobbler: Bridge auto-detected locally at {}", BRIDGE_LOCAL_URL);
-      return;
+      const std::string addonId = data["id"].asString();
+      if (addonId == "com.jumpgate.bridge")
+      {
+        lock.lock();
+        m_bridgeUrl = BRIDGE_LOCAL_URL;
+        lock.unlock();
+        CLog::Log(LOGINFO, "TraktScrobbler: Bridge auto-detected locally at {}", BRIDGE_LOCAL_URL);
+        return;
+      }
     }
   }
 
@@ -1111,9 +1343,11 @@ bool TraktScrobbler::QueryBridgeServer()
   if (bridgeUrl.empty())
     return false;
 
-  std::string url = bridgeUrl + "/identify";
+  std::string url = BuildBridgeEndpoint(bridgeUrl, "/identify");
+  if (url.empty())
+    return false;
 
-  // Retry up to 3 times with 2s delay -- handles race condition where ModiKodi
+  // Retry up to 3 times with 2s delay -- handles race condition where Jumpgate
   // queries /identify before Stremio's stream request arrives at Bridge
   for (int attempt = 0; attempt < 3; ++attempt)
   {
@@ -1130,7 +1364,7 @@ bool TraktScrobbler::QueryBridgeServer()
     if (!curl.Get(url, response))
     {
       CLog::Log(LOGDEBUG, "TraktScrobbler: Bridge server query failed (attempt {})", attempt + 1);
-      continue;
+      continue; // Network error — retry may help
     }
 
     CVariant data;
@@ -1138,7 +1372,14 @@ bool TraktScrobbler::QueryBridgeServer()
       continue;
 
     if (!data["found"].asBoolean())
-      continue;
+    {
+      // Bridge responded but has no mapping for this IP.
+      // Don't retry — this is a definitive answer, not a transient failure.
+      // Retrying wastes the identification time budget and prevents later layers
+      // (title extraction, Trakt search) from running.
+      CLog::Log(LOGINFO, "TraktScrobbler: Bridge returned not-found (attempt {}), moving to next layer", attempt + 1);
+      return false;
+    }
 
     std::string imdb = data["imdb"].asString();
     if (imdb.empty())
@@ -1154,6 +1395,9 @@ bool TraktScrobbler::QueryBridgeServer()
     if (!episodeStr.empty())
       episode = std::atoi(episodeStr.c_str());
 
+    // Best-effort artwork hint for overlay (TMDB clearlogo URL).
+    std::string logoUrl = data["logo"].asString();
+
     // Write results under lock
     lock.lock();
     m_imdbId = imdb;
@@ -1161,6 +1405,11 @@ bool TraktScrobbler::QueryBridgeServer()
       m_season = season;
     if (episode >= 0)
       m_episode = episode;
+    if (!logoUrl.empty())
+    {
+      m_logoUrl = logoUrl;
+      m_logoFetchedForImdb = imdb;
+    }
 
     // Capture resume data if present in Bridge response
     if (data.isMember("resume") && data["resume"].isMember("position"))
@@ -1168,7 +1417,7 @@ bool TraktScrobbler::QueryBridgeServer()
       int resumePos = static_cast<int>(data["resume"]["position"].asInteger(0));
       int resumeDur = static_cast<int>(data["resume"]["duration"].asInteger(0));
       if (resumeDur > 0 && resumePos > 0 &&
-          static_cast<float>(resumePos) / static_cast<float>(resumeDur) < ModiKodi::RESUME_DISCARD_RATIO)
+          static_cast<float>(resumePos) / static_cast<float>(resumeDur) < Jumpgate::RESUME_DISCARD_RATIO)
       {
         m_bridgeResumePositionMs.store(resumePos, std::memory_order_relaxed);
         CLog::Log(LOGINFO, "TraktScrobbler: Bridge resume data - pos={} dur={}", resumePos, resumeDur);
@@ -1183,6 +1432,56 @@ bool TraktScrobbler::QueryBridgeServer()
 
   CLog::Log(LOGDEBUG, "TraktScrobbler: Bridge server returned not found after 3 attempts");
   return false;
+}
+
+bool TraktScrobbler::FetchLogoFromBridge(const std::string& imdbId, const std::string& mediaUrlSnapshot)
+{
+  if (imdbId.empty())
+    return false;
+
+  std::unique_lock lock(m_critSection);
+  if (m_logoFetchedForImdb == imdbId)
+    return false;
+
+  // Mark as attempted to avoid hammering the Bridge if it has no TMDB key or no logo.
+  m_logoFetchedForImdb = imdbId;
+  std::string bridgeUrl = m_bridgeUrl;
+  lock.unlock();
+
+  if (bridgeUrl.empty())
+    return false;
+
+  std::string url = BuildBridgeEndpoint(bridgeUrl, "/meta/" + imdbId);
+  if (url.empty())
+    return false;
+
+  XFILE::CCurlFile curl;
+  curl.SetTimeout(3);
+  std::string response;
+
+  if (!curl.Get(url, response))
+    return false;
+
+  CVariant data;
+  if (!CJSONVariantParser::Parse(response, data))
+    return false;
+
+  std::string logoUrl = data["logo"].asString();
+  if (logoUrl.empty())
+    return false;
+
+  lock.lock();
+  if (m_mediaUrl != mediaUrlSnapshot || m_imdbId != imdbId)
+  {
+    lock.unlock();
+    return false;
+  }
+
+  m_logoUrl = logoUrl;
+  lock.unlock();
+
+  CLog::Log(LOGINFO, "TraktScrobbler: Logo URL set via Bridge meta endpoint");
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1209,6 +1508,9 @@ bool TraktScrobbler::IdentifyContent()
   if (!imdbId.empty())
   {
     CLog::Log(LOGINFO, "TraktScrobbler: Content identified via intent/Bridge params - IMDB: {}", imdbId);
+    if (title.empty() || year == 0)
+      HydrateFromTraktPublic(imdbId, season, episode, mediaUrlSnapshot);
+    FetchLogoFromBridge(imdbId, mediaUrlSnapshot);
     return true;
   }
 
@@ -1238,6 +1540,7 @@ bool TraktScrobbler::IdentifyContent()
       if (m_mediaUrl != mediaUrlSnapshot)
       {
         CLog::Log(LOGINFO, "TraktScrobbler: Discarding stale URL parse (content changed)");
+        lock.unlock();
         return false;
       }
       m_imdbId = parsedImdb;
@@ -1246,6 +1549,8 @@ bool TraktScrobbler::IdentifyContent()
       lock.unlock();
 
       CLog::Log(LOGINFO, "TraktScrobbler: Content identified via URL parsing - IMDB: {}", parsedImdb);
+      HydrateFromTraktPublic(parsedImdb, parsedSeason, parsedEpisode, mediaUrlSnapshot);
+      FetchLogoFromBridge(parsedImdb, mediaUrlSnapshot);
       return true;
     }
   }
@@ -1268,6 +1573,14 @@ bool TraktScrobbler::IdentifyContent()
     if (bridgeResult)
     {
       CLog::Log(LOGINFO, "TraktScrobbler: Content identified via Bridge server");
+      // Hydrate title/year/episode title via Trakt public endpoints now that we have IMDB.
+      lock.lock();
+      std::string curImdb = m_imdbId;
+      int curSeason = m_season;
+      int curEpisode = m_episode;
+      lock.unlock();
+      HydrateFromTraktPublic(curImdb, curSeason, curEpisode, mediaUrlSnapshot);
+      FetchLogoFromBridge(curImdb, mediaUrlSnapshot);
       return true;
     }
   }
@@ -1313,6 +1626,7 @@ bool TraktScrobbler::IdentifyContent()
     if (m_mediaUrl != mediaUrlSnapshot)
     {
       CLog::Log(LOGINFO, "TraktScrobbler: Discarding stale URL probe (content changed)");
+      lock.unlock();
       return false;
     }
     m_resolvedUrl = newResolvedUrl;
@@ -1332,11 +1646,16 @@ bool TraktScrobbler::IdentifyContent()
 
         lock.lock();
         if (m_mediaUrl != mediaUrlSnapshot)
+        {
+          lock.unlock();
           return false;
+        }
         m_imdbId = parsedImdb;
         lock.unlock();
 
         CLog::Log(LOGINFO, "TraktScrobbler: Content identified via resolved URL - IMDB: {}", parsedImdb);
+        HydrateFromTraktPublic(parsedImdb, season, episode, mediaUrlSnapshot);
+        FetchLogoFromBridge(parsedImdb, mediaUrlSnapshot);
         return true;
       }
     }
@@ -1489,6 +1808,112 @@ bool TraktScrobbler::IdentifyContent()
   CLog::Log(LOGDEBUG, "TraktScrobbler: Content not yet identified (url={}, title={})",
             mediaUrl, title);
   return false;
+}
+
+bool TraktScrobbler::HydrateFromTraktPublic(const std::string& id,
+                                            int season,
+                                            int episode,
+                                            const std::string& mediaUrlSnapshot)
+{
+  if (id.empty())
+    return false;
+
+  bool isEpisode = (season >= 0 && episode >= 0);
+
+  std::string hydratedTitle;
+  int hydratedYear = 0;
+  std::string hydratedEpisodeTitle;
+
+  // Trakt public endpoints: client-id only (no bearer token).
+  // NOTE: /shows/{id} and /movies/{id} do NOT accept IMDb ids directly. We must
+  // resolve IMDb -> slug via /search/imdb/{tt}.
+  if (isEpisode)
+  {
+    std::string searchResp;
+    std::string searchEndpoint = "/search/imdb/" + id + "?type=show";
+    if (TraktGetWithToken(searchEndpoint, searchResp, ""))
+    {
+      CVariant results;
+      if (CJSONVariantParser::Parse(searchResp, results) && results.isArray() && results.size() > 0)
+      {
+        const CVariant& showWrap = results[0]["show"];
+        hydratedTitle = showWrap["title"].asString();
+        hydratedYear = showWrap["year"].asInteger(0);
+        std::string slug = showWrap["ids"]["slug"].asString();
+
+        if (!slug.empty())
+        {
+          std::string epResp;
+          std::string epEndpoint = "/shows/" + slug + "/seasons/" + std::to_string(season) +
+                                   "/episodes/" + std::to_string(episode) + "?extended=full";
+          if (TraktGetWithToken(epEndpoint, epResp, ""))
+          {
+            CVariant ep;
+            if (CJSONVariantParser::Parse(epResp, ep))
+            {
+              hydratedEpisodeTitle = ep["title"].asString();
+            }
+          }
+        }
+      }
+    }
+  }
+  else
+  {
+    std::string searchResp;
+    std::string searchEndpoint = "/search/imdb/" + id + "?type=movie";
+    if (TraktGetWithToken(searchEndpoint, searchResp, ""))
+    {
+      CVariant results;
+      if (CJSONVariantParser::Parse(searchResp, results) && results.isArray() && results.size() > 0)
+      {
+        const CVariant& movieWrap = results[0]["movie"];
+        hydratedTitle = movieWrap["title"].asString();
+        hydratedYear = movieWrap["year"].asInteger(0);
+      }
+    }
+  }
+
+  if (hydratedTitle.empty() && hydratedYear == 0 && hydratedEpisodeTitle.empty())
+    return false;
+
+  // Write results under lock with staleness check.
+  std::unique_lock lock(m_critSection);
+  if (m_mediaUrl != mediaUrlSnapshot)
+    return false;
+  if (m_imdbId != id)
+    return false;
+
+  bool updated = false;
+  if (m_title.empty() && !hydratedTitle.empty())
+  {
+    m_title = hydratedTitle;
+    updated = true;
+  }
+  if (m_year == 0 && hydratedYear > 0)
+  {
+    m_year = hydratedYear;
+    updated = true;
+  }
+  if (isEpisode && m_episodeTitle.empty() && !hydratedEpisodeTitle.empty())
+  {
+    m_episodeTitle = hydratedEpisodeTitle;
+    updated = true;
+  }
+
+  if (updated)
+  {
+    if (isEpisode)
+    {
+      CLog::Log(LOGINFO, "TraktScrobbler: Hydrated show/episode titles via Trakt public endpoints");
+    }
+    else
+    {
+      CLog::Log(LOGINFO, "TraktScrobbler: Hydrated movie title/year via Trakt public endpoints");
+    }
+  }
+
+  return updated;
 }
 
 bool TraktScrobbler::ParseImdbFromUrl(const std::string& url)

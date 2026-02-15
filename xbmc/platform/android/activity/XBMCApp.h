@@ -191,7 +191,7 @@ public:
   void ReturnToStandaloneMode();
 
   // Version
-  static constexpr const char* MODIKODI_VERSION = "3.0.0";
+  static constexpr const char* JUMPGATE_VERSION = "3.0.0";
 
   // Resume store (content-ID based cross-source resume)
   void SaveResumePosition();
@@ -260,6 +260,7 @@ private:
   void run();
   void stop();
   void SetupEnv();
+  void UpdateLoadingOverlayContentInfo(bool force);
   static void SetDisplayModeCallback(void* modeVariant);
   static void KeepScreenOnCallback(void* onVariant);
   static void SetViewBackgroundColorCallback(void* mapVariant);
@@ -313,14 +314,18 @@ private:
   std::atomic<bool> m_resumeApplied{false}; // Prevents double-seek from content-ID resume
 
   // Resume store file
-  static constexpr const char* RESUME_STORE_FILE = "special://profile/modikodi_resume.json";
+  static constexpr const char* RESUME_STORE_FILE = "special://profile/jumpgate_resume.json";
 
   // Settings
-  static constexpr const char* SETTINGS_FILE = "special://profile/modikodi_settings.json";
+  static constexpr const char* SETTINGS_FILE = "special://profile/jumpgate_settings.json";
   CVariant m_settings;
   mutable CCriticalSection m_settingsMutex;
   std::atomic<bool> m_settingsRequested{false};
   bool m_updateChecked{false};
+  bool m_overlayHidden{false};
+  std::string m_lastOverlayTitle;
+  std::string m_lastOverlayMeta;
+  std::string m_lastOverlayLogoUrl;
 
   // Trakt scrobbler (external player mode only)
   std::unique_ptr<TraktScrobbler> m_traktScrobbler;
