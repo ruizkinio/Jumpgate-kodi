@@ -438,6 +438,7 @@ CCurlFile::CCurlFile()
   m_multisession  = true;
   m_seekable = true;
   m_connecttimeout = 0;
+  m_totaltimeout = 0;
   m_redirectlimit = 5;
   m_lowspeedtime = 0;
   m_ftppasvip = false;
@@ -665,6 +666,8 @@ void CCurlFile::SetCommonOptions(CReadState* state, bool failOnError /* = true *
 
   // set our timeouts, we abort connection after m_timeout, and reads after no data for m_timeout seconds
   g_curlInterface.easy_setopt(h, CURLOPT_CONNECTTIMEOUT, m_connecttimeout);
+  if (m_totaltimeout > 0)
+    g_curlInterface.easy_setopt(h, CURLOPT_TIMEOUT, m_totaltimeout);
 
   // We abort in case we transfer less than 1byte/second
   g_curlInterface.easy_setopt(h, CURLOPT_LOW_SPEED_LIMIT, 1);

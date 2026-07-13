@@ -86,6 +86,9 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
 
   // External player mode: when launched via ACTION_VIEW from another app
   private boolean mExternalPlayerMode = false;
+  private long mExternalPlaybackGeneration = 0;
+  private final ExternalPlayerResultCoordinator.Producer mExternalResultProducer =
+      new ExternalPlayerResultCoordinator.Producer();
   private long mLastPlaybackPosition = 0;  // ms
   private long mLastPlaybackDuration = 0;  // ms
   private static final long EXTERNAL_BACK_LONG_PRESS_MS = 700L;
@@ -145,22 +148,26 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
   native void _onVisibleBehindCanceled();
   native void _requestOpenSettings();
 
-  private Runnable leanbackUpdateRunnable = new Runnable()
-  {
-    @Override
-    public void run()
-    {
-      Log.d(TAG, "Main: Updating recommendations");
-      new Thread()
-      {
-        public void run()
-        {
-          mJsonRPC.updateLeanback(Main.this);
+  private static void normalizeLongExtraAsString(Intent intent, String name) {
+    if (intent == null || !intent.hasExtra(name) || intent.getExtras() == null) return;
+    Object value = intent.getExtras().get(name);
+    if (value instanceof Long) intent.putExtra(name, Long.toString((Long) value));
+  }
+
+  private Runnable leanbackUpdateRunnable =
+      new Runnable() {
+        @Override
+        public void run() {
+          Log.d(TAG, "Main: Updating recommendations");
+          new Thread() {
+            public void run() {
+              mJsonRPC.updateLeanback(Main.this);
+            }
+          }.start();
+          handler.postDelayed(
+              this, XBMCProperties.getIntProperty("xbmc.leanbackrefresh", 60 * 60) * 1000L);
         }
-      }.start();
-      handler.postDelayed(this, XBMCProperties.getIntProperty("xbmc.leanbackrefresh", 60 * 60) * 1000L);
-    }
-  };
+      };
 
   public Main()
   {
@@ -192,6 +199,12 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
   @Override
   public void onCreate(Bundle savedInstanceState)
   {
+    normalizeLongExtraAsString(getIntent(), "extra_position");
+    normalizeLongExtraAsString(getIntent(), "position");
+    normalizeLongExtraAsString(getIntent(), "startfrom");
+    if (getIntent().getData() != null && Intent.ACTION_VIEW.equals(getIntent().getAction()))
+      getIntent().putExtra("jumpgate_launched_at_ms", Long.toString(System.currentTimeMillis()));
+
     // Detect external player mode BEFORE native engine starts so we can
     // show the loading overlay before Kodi's native init renders anything
     mExternalPlayerMode = getIntent().getBooleanExtra("external_player_mode", false);
@@ -295,10 +308,23 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
   {
     super.onNewIntent(intent);
 
+    normalizeLongExtraAsString(intent, "extra_position");
+    normalizeLongExtraAsString(intent, "position");
+    normalizeLongExtraAsString(intent, "startfrom");
+
+    if (intent.getData() != null && Intent.ACTION_VIEW.equals(intent.getAction()))
+      intent.putExtra("jumpgate_launched_at_ms", Long.toString(System.currentTimeMillis()));
+
     // If we receive an ACTION_VIEW while already running, we're transitioning from
     // standalone to external player mode. Track this so we return to standalone after playback.
     boolean isActionView = intent.getData() != null
             && Intent.ACTION_VIEW.equals(intent.getAction());
+    String externalRequestId =
+        intent.getStringExtra(ExternalPlayerResultCoordinator.EXTRA_REQUEST_ID);
+    if (isActionView && mExternalResultProducer.ownsRequest(externalRequestId)) {
+      Log.w(TAG, "Main: Ignoring duplicate external playback request " + externalRequestId);
+      return;
+    }
     boolean wasAlreadyExternal = mExternalPlayerMode;
 
     // Show loading overlay for external player transitions
@@ -485,8 +511,15 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
     manager.unregisterInputDeviceListener(mInputDeviceListener);
 
     getApplicationContext().getContentResolver().unregisterContentObserver(mSettingsContentObserver);
+    if (MainActivity == this)
+    {
+      MainActivity = null;
+      mActivityRunning = false;
+      Intent wakeup = new Intent(ExternalPlayerResultCoordinator.ACTION_MAIN_DESTROYED);
+      wakeup.setPackage(getPackageName());
+      getApplicationContext().sendBroadcast(wakeup);
+    }
     super.onDestroy();
-    mActivityRunning = false;
   }
 
   public static boolean isActivityRunning() {
@@ -538,6 +571,69 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
 
   // --- External Player Mode ---
 
+  public synchronized void beginExternalPlayerMode(
+      long generation, String requestId, boolean wasStandalone) {
+    if (!mExternalResultProducer.begin(generation, requestId)) {
+      return;
+    }
+
+    ExternalPlayerResultCoordinator.Owner owner =
+        ExternalPlayerResultStore.bindActive(this, requestId, generation);
+    if (owner == null) {
+      Log.e(
+          TAG,
+          "Main: External playback has no forwarded result owner for generation " + generation);
+      mExternalResultProducer.cancelOwner(generation, requestId);
+    } else if (owner.wasCanceled()) {
+      mExternalResultProducer.cancelOwner(generation, requestId);
+    }
+
+    mExternalPlaybackGeneration = generation;
+    mExternalPlayerMode = true;
+    mWasStandalone = wasStandalone;
+  }
+
+  public synchronized void supersedeExternalPlayerResult(long generation, String requestId) {
+    ExternalPlayerResultCoordinator.Terminal terminal =
+        mExternalResultProducer.supersede(generation, requestId);
+    if (terminal == null) {
+      Log.d(TAG, "Main: Ignoring stale external player supersession " + generation);
+      return;
+    }
+
+    if (mExternalResultProducer.isOwnerCanceled(generation, requestId)) {
+      ExternalPlayerResultStore.clear(this, requestId, generation);
+    } else if (!ExternalPlayerResultStore.publish(this, terminal)) {
+      Log.e(TAG, "Main: Could not persist superseded external player result");
+    }
+  }
+
+  public synchronized void rejectExternalPlayerResult(long generation, String requestId) {
+    ExternalPlayerResultCoordinator.Owner owner =
+        ExternalPlayerResultStore.bind(this, requestId, generation);
+    if (owner == null) {
+      Log.e(TAG, "Main: Rejected playback has no exact result owner " + generation);
+      return;
+    }
+    if (owner.wasCanceled()) {
+      ExternalPlayerResultStore.clear(this, requestId, generation);
+      return;
+    }
+
+    ExternalPlayerResultCoordinator.Terminal terminal;
+    try {
+      terminal =
+          new ExternalPlayerResultCoordinator.Terminal(requestId, generation, 0, 0, false, false);
+    } catch (IllegalArgumentException e) {
+      Log.e(TAG, "Main: Ignoring invalid rejected external player result", e);
+      return;
+    }
+
+    if (!ExternalPlayerResultStore.publish(this, terminal)) {
+      Log.e(TAG, "Main: Could not persist rejected external player result");
+    }
+  }
+
   /**
    * Called from native code when playback position updates
    */
@@ -568,63 +664,131 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
   }
 
   /**
-   * Called from native code when external player mode should exit.
-   * Sets the result intent with VLC/MX Player compatible extras.
+   * Called from native code when external player mode should exit. Sets the result intent with
+   * VLC/MX Player compatible extras.
    *
-   * @param wasStandalone if true, returns to standalone Kodi instead of killing the process.
-   *                      This is set when external player was launched from an already-running
-   *                      standalone Kodi instance (warm-transition via onNewIntent).
+   * @param generation exact native playback generation owning this result.
+   * @param requestId exact result-owner activity request bound to {@code generation}.
+   * @param wasStandalone if true, returns to standalone Kodi instead of killing the process. This
+   *     is set when external player was launched from an already-running standalone Kodi instance
+   *     (warm-transition via onNewIntent).
    */
-  public void exitExternalPlayerMode(long positionMs, long durationMs, boolean completed,
-                                     boolean wasStandalone) {
-    Log.d(TAG, "Main: Exiting external player mode. pos=" + positionMs + " dur=" + durationMs
-            + " completed=" + completed + " wasStandalone=" + wasStandalone);
+  public synchronized void exitExternalPlayerMode(
+      long generation,
+      String requestId,
+      long positionMs,
+      long durationMs,
+      boolean completed,
+      boolean wasStandalone) {
+    if (generation != mExternalPlaybackGeneration) {
+      Log.d(TAG, "Main: Ignoring stale external player result generation " + generation);
+      return;
+    }
 
-    Intent result = new Intent("org.videolan.vlc.player.result");
+    ExternalPlayerResultCoordinator.Terminal terminal =
+        mExternalResultProducer.finish(
+            generation, requestId, positionMs, durationMs, completed, !wasStandalone);
+    if (terminal == null) {
+      Log.d(TAG, "Main: Ignoring stale external player result generation " + generation);
+      return;
+    }
 
-    // VLC-compatible extras (long)
-    result.putExtra("extra_position", positionMs);
-    result.putExtra("extra_duration", durationMs);
+    Log.d(
+        TAG,
+        "Main: Exiting external player mode. pos="
+            + positionMs
+            + " dur="
+            + durationMs
+            + " completed="
+            + completed
+            + " wasStandalone="
+            + wasStandalone);
 
-    // MX Player compatible extras (int)
-    result.putExtra("position", (int) positionMs);
-    result.putExtra("duration", (int) durationMs);
-    result.putExtra("end_by", completed ? "playback_completion" : "user");
-
-    // Distinguish stream-open failures from real playback stops.
-    // If playback never started (no position/duration and not completed),
-    // return RESULT_CANCELED so caller can avoid treating it as successful playback.
-    boolean failedToStart = !completed && positionMs <= 0 && durationMs <= 0;
-    result.putExtra("jumpgate_failed_to_start", failedToStart);
-    int resultCode = failedToStart ? RESULT_CANCELED : RESULT_OK;
-    setResult(resultCode, result);
+    boolean ownerCanceled = mExternalResultProducer.isOwnerCanceled(generation, requestId);
+    boolean canceledExitAcknowledged = false;
+    if (ownerCanceled) {
+      if (wasStandalone) {
+        ExternalPlayerResultStore.clear(this, requestId, generation);
+      } else {
+        canceledExitAcknowledged =
+            ExternalPlayerResultStore.acknowledgeCanceledExit(this, requestId, generation);
+        if (!canceledExitAcknowledged)
+          Log.e(TAG, "Main: Could not persist canceled external-player process exit");
+      }
+    } else if (!ExternalPlayerResultStore.publish(this, terminal)) {
+      Log.e(TAG, "Main: Could not persist external player result " + generation);
+    }
 
     if (wasStandalone) {
       // Warm-transition: return to standalone Kodi.
-      // setResult() delivers to the Splash instance waiting via startActivityForResult.
       // Do NOT finish Main (it stays alive as standalone Kodi).
       // Do NOT kill the process (native engine keeps running).
       mExternalPlayerMode = false;
+      mExternalPlaybackGeneration = 0;
+      mExternalResultProducer.clear(generation, requestId);
       mWasStandalone = false;
       // Hide loading overlay so Kodi home screen is visible again
       hideLoadingOverlay();
       Log.d(TAG, "Main: Returning to standalone mode after external player");
     } else {
-      // Cold launch from Stremio: finish and kill as before.
+      // The result-owner activity acknowledges only after it has set its caller result and
+      // requested finish. Until that exact acknowledgement, keep the process alive so recreation
+      // can consume the durable terminal.
+      mExternalPlayerMode = false;
       finish();
-
-      // Kill the process after a short delay so setResult() is delivered first.
-      // Kodi's native engine (XBMC_Run thread, m_firstrun state) cannot be cleanly
-      // restarted within the same process -- stale native state causes black screen
-      // on re-launch and prevents normal launcher starts after external player exit.
-      handler.postDelayed(new Runnable() {
-        @Override
-        public void run() {
-          Log.d(TAG, "Main: Killing process after external player exit");
-          android.os.Process.killProcess(android.os.Process.myPid());
-        }
-      }, 500);
+      if (ownerCanceled && canceledExitAcknowledged)
+        scheduleExternalPlayerProcessExit(generation, requestId);
     }
+  }
+
+  public static boolean acknowledgeExternalPlayerResult(long generation, String requestId) {
+    Main activity = MainActivity;
+    return activity != null
+        && activity.acknowledgeExternalPlayerResultInternal(generation, requestId);
+  }
+
+  private synchronized boolean acknowledgeExternalPlayerResultInternal(
+      long generation, String requestId) {
+    if (mExternalPlayerMode || !mExternalResultProducer.acknowledgeExit(generation, requestId))
+      return false;
+
+    return scheduleExternalPlayerProcessExit(generation, requestId);
+  }
+
+  public static boolean cancelExternalPlayerResult(long generation, String requestId) {
+    Main activity = MainActivity;
+    return activity != null && activity.cancelExternalPlayerResultInternal(generation, requestId);
+  }
+
+  private synchronized boolean cancelExternalPlayerResultInternal(
+      long generation, String requestId) {
+    return mExternalResultProducer.cancelOwner(generation, requestId);
+  }
+
+  private boolean scheduleExternalPlayerProcessExit(long generation, String requestId) {
+    if (!mExternalResultProducer.claimProcessExit(generation, requestId)) return false;
+
+    final long acknowledgedGeneration = generation;
+    final String acknowledgedRequestId = requestId;
+    return handler.post(
+        () -> {
+          synchronized (Main.this) {
+            if (!mExternalResultProducer.shouldExitProcess(
+                    acknowledgedGeneration, acknowledgedRequestId)
+                || mExternalPlayerMode) {
+              Log.d(TAG, "Main: Skipping stale external player process exit");
+              return;
+            }
+          }
+          ExternalPlayerResultStore.executeAcknowledgedProcessExit(
+              Main.this,
+              acknowledgedRequestId,
+              acknowledgedGeneration,
+              () -> {
+                Log.d(TAG, "Main: Killing process after acknowledged external player result");
+                android.os.Process.killProcess(android.os.Process.myPid());
+              });
+        });
   }
 
   /**
@@ -1064,7 +1228,9 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
       Uri u = Uri.parse(rawUrl);
       String scheme = u.getScheme();
       String host = u.getHost();
-      return "https".equalsIgnoreCase(scheme) && host != null && host.equalsIgnoreCase("image.tmdb.org");
+      return "https".equalsIgnoreCase(scheme)
+          && host != null
+          && host.equalsIgnoreCase("image.tmdb.org");
     } catch (Exception _e) {
       return false;
     }
@@ -1386,7 +1552,8 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
     }
 
     // Best-case query hints from some proxies/debrid endpoints.
-    String[] candidateParams = new String[] {"_mk_title", "title", "filename", "file", "name", "dn"};
+    String[] candidateParams =
+        new String[] {"_mk_title", "title", "filename", "file", "name", "dn"};
     try {
       for (String key : candidateParams) {
         String value = uri.getQueryParameter(key);

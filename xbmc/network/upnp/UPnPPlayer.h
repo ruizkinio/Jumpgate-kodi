@@ -15,6 +15,7 @@
 #include "utils/logtypes.h"
 
 #include <memory>
+#include <mutex>
 #include <string>
 
 class PLT_MediaController;
@@ -64,11 +65,18 @@ private:
   void Process() override;
   void OnExit() override;
 
+  bool StopRemotePlayback();
+  bool VerifyRemotePlaybackStopped();
+  void SetCallbackFile(const CFileItem& file);
+  bool HasCallbackFile() const;
+  std::unique_ptr<CFileItem> TakeCallbackFile();
+
   PLT_MediaController* m_control = nullptr;
   std::unique_ptr<CUPnPPlayerController> m_delegate;
   std::string m_current_uri;
   std::string m_current_meta;
-  bool m_started = false;
+  mutable std::mutex m_callbackFileMutex;
+  std::unique_ptr<CFileItem> m_callbackFileItem;
   bool m_stopremote = false;
   bool m_hasVideo{false};
   bool m_hasAudio{false};

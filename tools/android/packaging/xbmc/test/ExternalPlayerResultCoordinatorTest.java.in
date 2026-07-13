@@ -1,0 +1,457 @@
+package @APP_PACKAGE@;
+
+import java.util.ArrayDeque;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+
+public final class ExternalPlayerResultCoordinatorTest {
+  private static final String OLD_REQUEST_ID = "11111111-1111-4111-8111-111111111111";
+  private static final String NEW_REQUEST_ID = "22222222-2222-4222-8222-222222222222";
+  private static final String THIRD_REQUEST_ID = "33333333-3333-4333-8333-333333333333";
+
+  private ExternalPlayerResultCoordinatorTest() {}
+
+  private static final class DeterministicQueue {
+    private final ArrayDeque<Runnable> mTasks = new ArrayDeque<>();
+
+    synchronized void post(Runnable task) {
+      mTasks.addLast(task);
+    }
+
+    void runNext() {
+      Runnable task;
+      synchronized (this) {
+        task = mTasks.removeFirst();
+      }
+      task.run();
+    }
+
+    synchronized int size() {
+      return mTasks.size();
+    }
+  }
+
+  private static final class FakeHost implements ExternalPlayerActivity.Host {
+    boolean persistSucceeds = true;
+    boolean startSucceeds = true;
+    ExternalPlayerResultCoordinator.Owner persistedOwner;
+    ExternalPlayerResultCoordinator.Terminal deliveredTerminal;
+    String forwardedRequestId;
+    String clearedRequestId;
+    long clearedGeneration;
+    String canceledRequestId;
+    long canceledGeneration;
+    int persistCalls;
+    int startCalls;
+    int setTerminalResultCalls;
+    int setCanceledResultCalls;
+    int finishCalls;
+    int clearExactCalls;
+    int clearUnboundCalls;
+    int cancelNativeCalls;
+    int acknowledgeCalls;
+    int processExitCalls;
+    boolean mainCallbackAvailable = true;
+    ExternalPlayerResultCoordinator.ProcessExitState processExitState;
+    DeterministicQueue processExitQueue;
+
+    @Override
+    public synchronized boolean persist(ExternalPlayerResultCoordinator.Owner owner) {
+      ++persistCalls;
+      if (!persistSucceeds) return false;
+      persistedOwner = owner.copy();
+      return true;
+    }
+
+    @Override
+    public synchronized boolean startMain(String requestId) {
+      ++startCalls;
+      forwardedRequestId = requestId;
+      return startSucceeds;
+    }
+
+    @Override
+    public synchronized void setTerminalResult(ExternalPlayerResultCoordinator.Terminal terminal) {
+      ++setTerminalResultCalls;
+      deliveredTerminal = terminal;
+    }
+
+    @Override
+    public synchronized void setCanceledResult() {
+      ++setCanceledResultCalls;
+    }
+
+    @Override
+    public synchronized void finishOwner() {
+      ++finishCalls;
+    }
+
+    @Override
+    public synchronized void clearExact(String requestId, long generation) {
+      ++clearExactCalls;
+      clearedRequestId = requestId;
+      clearedGeneration = generation;
+      if (processExitState != null) processExitState.clear(generation, requestId);
+    }
+
+    @Override
+    public synchronized void clearUnbound(String requestId) {
+      ++clearUnboundCalls;
+      clearedRequestId = requestId;
+    }
+
+    @Override
+    public synchronized void cancelNative(String requestId, long generation) {
+      ++cancelNativeCalls;
+      canceledRequestId = requestId;
+      canceledGeneration = generation;
+    }
+
+    @Override
+    public synchronized boolean acknowledge(ExternalPlayerResultCoordinator.Terminal terminal) {
+      ++acknowledgeCalls;
+      if (processExitState == null) return true;
+      if (!processExitState.acknowledge(terminal.generation, terminal.requestId)) return false;
+
+      if (mainCallbackAvailable) postProcessExit(terminal);
+      postProcessExit(terminal);
+      return true;
+    }
+
+    private void postProcessExit(ExternalPlayerResultCoordinator.Terminal terminal) {
+      if (processExitQueue == null)
+        throw new AssertionError("process-exit queue must be configured");
+      processExitQueue.post(
+          () -> {
+            if (!processExitState.claim(terminal.generation, terminal.requestId)) return;
+            synchronized (FakeHost.this) {
+              ++processExitCalls;
+            }
+          });
+    }
+  }
+
+  private static ExternalPlayerResultCoordinator.Owner freshOwner(String requestId) {
+    return new ExternalPlayerResultCoordinator.Owner(requestId, false, 0, false, false);
+  }
+
+  private static void require(boolean condition, String message) {
+    if (!condition) throw new AssertionError(message);
+  }
+
+  private static void recreationPreservesForwardingAndExactBinding() {
+    FakeHost host = new FakeHost();
+    ExternalPlayerActivity.Controller first =
+        new ExternalPlayerActivity.Controller(host, freshOwner(OLD_REQUEST_ID));
+    require(first.forwardOnce(), "initial launch forwards");
+    require(host.startCalls == 1, "one Main launch");
+    require(host.persistedOwner.wasLaunchForwarded(), "forwarded state durable before launch");
+
+    ExternalPlayerActivity.Controller beforeBinding =
+        new ExternalPlayerActivity.Controller(host, host.persistedOwner.copy());
+    require(!beforeBinding.forwardOnce(), "recreation never re-forwards an admitted launch");
+    require(host.startCalls == 1, "Main liveness cannot trigger duplicate forwarding");
+    require(beforeBinding.bindGeneration(7), "native generation binds exact owner");
+
+    ExternalPlayerActivity.Controller afterBinding =
+        new ExternalPlayerActivity.Controller(host, host.persistedOwner.copy());
+    require(afterBinding.owner().expectedGeneration() == 7, "generation survives recreation");
+    require(
+        !afterBinding.deliver(
+            new ExternalPlayerResultCoordinator.Terminal(OLD_REQUEST_ID, 6, 10, 100, false, false)),
+        "stale generation rejected");
+    require(
+        !afterBinding.deliver(
+            new ExternalPlayerResultCoordinator.Terminal(NEW_REQUEST_ID, 7, 10, 100, false, false)),
+        "wrong request rejected");
+
+    ExternalPlayerResultCoordinator.Terminal terminal =
+        new ExternalPlayerResultCoordinator.Terminal(OLD_REQUEST_ID, 7, 50, 100, false, true);
+    require(afterBinding.deliver(terminal), "exact terminal delivered");
+    require(!afterBinding.deliver(terminal), "terminal delivered once");
+    require(host.setTerminalResultCalls == 1, "setResult once");
+    require(host.finishCalls == 1, "finish once");
+    require(host.clearExactCalls == 0, "acknowledged cold state retained for recovery");
+    require(host.acknowledgeCalls == 1, "process exit acknowledged once");
+    require(host.persistedOwner.wasCompleted(), "completed owner remains durable");
+  }
+
+  private static void processDeathRotatesOwnerWithoutStaleReplay() {
+    FakeHost host = new FakeHost();
+    host.processExitState = new ExternalPlayerResultCoordinator.ProcessExitState();
+    require(host.processExitState.activate(10, OLD_REQUEST_ID), "old process authority active");
+    ExternalPlayerActivity.Controller controller =
+        new ExternalPlayerActivity.Controller(host, freshOwner(OLD_REQUEST_ID));
+    require(controller.forwardOnce(), "old process launch");
+    require(controller.bindGeneration(10), "old process binding");
+    require(controller.recoverAfterProcessDeath(NEW_REQUEST_ID), "dead process recovery forwards");
+    require(host.clearExactCalls == 1, "stale exact owner cleared");
+    require(host.clearedGeneration == 10, "stale generation cleared exactly");
+    require(!host.processExitState.isActive(), "recovery invalidates stale process authority");
+    require(host.startCalls == 2, "replacement launch forwarded once");
+    require(NEW_REQUEST_ID.equals(host.forwardedRequestId), "replacement gets fresh request");
+    require(controller.owner().expectedGeneration() == 0, "replacement starts unbound");
+    require(
+        !controller.deliver(
+            new ExternalPlayerResultCoordinator.Terminal(OLD_REQUEST_ID, 10, 30, 100, false, true)),
+        "dead-process terminal cannot cross owner");
+    require(controller.bindGeneration(11), "replacement receives new generation");
+    require(host.processExitState.activate(11, NEW_REQUEST_ID), "replacement authority active");
+    require(host.processExitState.requestExit(11, NEW_REQUEST_ID), "replacement exit requested");
+    host.processExitQueue = new DeterministicQueue();
+    require(
+        controller.deliver(
+            new ExternalPlayerResultCoordinator.Terminal(NEW_REQUEST_ID, 11, 40, 100, true, true)),
+        "replacement exact result delivered");
+  }
+
+  private static void forwardingFailureCanRetrySafely() {
+    FakeHost host = new FakeHost();
+    ExternalPlayerActivity.Controller controller =
+        new ExternalPlayerActivity.Controller(host, freshOwner(OLD_REQUEST_ID));
+    host.persistSucceeds = false;
+    require(!controller.forwardOnce(), "launch blocked when durable write fails");
+    require(host.startCalls == 0, "Main not launched without durable forwarding marker");
+
+    host.persistSucceeds = true;
+    host.startSucceeds = false;
+    require(!controller.forwardOnce(), "failed Main launch rolls back forwarding");
+    require(!controller.owner().wasLaunchForwarded(), "failed launch remains retryable");
+
+    host.startSucceeds = true;
+    require(controller.forwardOnce(), "retry forwards once");
+    require(controller.owner().wasLaunchForwarded(), "retry durable forwarding state");
+  }
+
+  private static void cancellationUsesExactGeneration() {
+    FakeHost unforwardedHost = new FakeHost();
+    ExternalPlayerActivity.Controller unforwarded =
+        new ExternalPlayerActivity.Controller(unforwardedHost, freshOwner(OLD_REQUEST_ID));
+    require(unforwarded.cancelForCaller(), "pre-forward cancellation");
+    require(unforwardedHost.setCanceledResultCalls == 1, "caller canceled once");
+    require(unforwardedHost.finishCalls == 1, "pre-forward owner finished once");
+    require(unforwardedHost.clearUnboundCalls == 1, "unadmitted owner safely cleared");
+    require(unforwardedHost.cancelNativeCalls == 0, "no generation canceled before admission");
+
+    FakeHost pendingHost = new FakeHost();
+    ExternalPlayerActivity.Controller pending =
+        new ExternalPlayerActivity.Controller(pendingHost, freshOwner(NEW_REQUEST_ID));
+    require(pending.forwardOnce(), "pending launch forwarded");
+    require(pending.cancelForCaller(), "forwarded-unbound caller canceled");
+    require(pendingHost.clearUnboundCalls == 0, "pending cancellation stays durable for binding");
+    ExternalPlayerResultCoordinator.Owner pendingRecord = pendingHost.persistedOwner.copy();
+    require(pendingRecord.bind(20, NEW_REQUEST_ID), "canceled request can bind exact admission");
+    require(pendingRecord.wasCanceled(), "pending cancellation remains attached to binding");
+
+    FakeHost boundHost = new FakeHost();
+    ExternalPlayerActivity.Controller bound =
+        new ExternalPlayerActivity.Controller(boundHost, freshOwner(THIRD_REQUEST_ID));
+    require(bound.forwardOnce(), "bound launch forwarded");
+    require(bound.bindGeneration(21), "bound launch generation");
+    require(bound.cancelForCaller(), "bound owner canceled");
+    require(boundHost.cancelNativeCalls == 1, "native cancellation once");
+    require(THIRD_REQUEST_ID.equals(boundHost.canceledRequestId), "native request exact");
+    require(boundHost.canceledGeneration == 21, "native generation exact");
+    require(!bound.cancelForCaller(), "duplicate cancellation rejected");
+  }
+
+  private static void overlappingLaunchesStayIsolated() {
+    ExternalPlayerResultCoordinator.Producer producer =
+        new ExternalPlayerResultCoordinator.Producer();
+    require(producer.begin(30, OLD_REQUEST_ID), "old generation admitted");
+    require(producer.ownsRequest(OLD_REQUEST_ID), "active request deduplicated before JNI");
+    require(!producer.ownsRequest(NEW_REQUEST_ID), "new request remains admissible");
+    ExternalPlayerResultCoordinator.Terminal superseded = producer.supersede(30, OLD_REQUEST_ID);
+    require(superseded != null && superseded.failedToStart(), "old generation superseded");
+    require(producer.begin(31, NEW_REQUEST_ID), "replacement generation admitted");
+    require(
+        producer.finish(30, OLD_REQUEST_ID, 10, 100, false, true) == null,
+        "old native terminal rejected");
+
+    FakeHost oldHost = new FakeHost();
+    ExternalPlayerResultCoordinator.Owner oldOwner =
+        new ExternalPlayerResultCoordinator.Owner(OLD_REQUEST_ID, true, 30, false, false);
+    ExternalPlayerActivity.Controller oldController =
+        new ExternalPlayerActivity.Controller(oldHost, oldOwner);
+    FakeHost newHost = new FakeHost();
+    ExternalPlayerResultCoordinator.Owner newOwner =
+        new ExternalPlayerResultCoordinator.Owner(NEW_REQUEST_ID, true, 31, false, false);
+    ExternalPlayerActivity.Controller newController =
+        new ExternalPlayerActivity.Controller(newHost, newOwner);
+    require(oldController.deliver(superseded), "old owner gets old supersession");
+    require(!newController.deliver(superseded), "replacement rejects old supersession");
+    require(
+        newController.deliver(producer.finish(31, NEW_REQUEST_ID, 80, 100, true, false)),
+        "replacement gets replacement terminal");
+  }
+
+  private static void coldExitRequiresExactAcknowledgement() {
+    ExternalPlayerResultCoordinator.Producer producer =
+        new ExternalPlayerResultCoordinator.Producer();
+    require(producer.begin(40, OLD_REQUEST_ID), "cold begin");
+    require(producer.finish(40, OLD_REQUEST_ID, 40, 100, false, true) != null, "cold terminal");
+    require(!producer.claimProcessExit(40, OLD_REQUEST_ID), "no exit before acknowledgement");
+    require(!producer.acknowledgeExit(40, NEW_REQUEST_ID), "wrong owner acknowledgement");
+    require(!producer.acknowledgeExit(41, OLD_REQUEST_ID), "wrong generation acknowledgement");
+    require(producer.acknowledgeExit(40, OLD_REQUEST_ID), "exact acknowledgement");
+    require(producer.claimProcessExit(40, OLD_REQUEST_ID), "single process-exit task claimed");
+    require(!producer.claimProcessExit(40, OLD_REQUEST_ID), "no process-exit task loop");
+    require(producer.shouldExitProcess(40, OLD_REQUEST_ID), "exact cold exit armed");
+  }
+
+  private static void mainDestroyedBeforeOwnerCallbackUsesDurableFallback() {
+    ExternalPlayerResultCoordinator.ProcessExitState mainState =
+        new ExternalPlayerResultCoordinator.ProcessExitState();
+    require(mainState.activate(41, OLD_REQUEST_ID), "destroyed Main activated exact pair");
+    require(mainState.requestExit(41, OLD_REQUEST_ID), "destroyed Main persisted cold exit");
+
+    FakeHost recoveredHost = new FakeHost();
+    recoveredHost.processExitState = mainState.copy();
+    recoveredHost.processExitQueue = new DeterministicQueue();
+    recoveredHost.mainCallbackAvailable = false;
+    ExternalPlayerActivity.Controller recoveredOwner =
+        new ExternalPlayerActivity.Controller(
+            recoveredHost,
+            new ExternalPlayerResultCoordinator.Owner(OLD_REQUEST_ID, true, 41, false, false));
+    ExternalPlayerResultCoordinator.Terminal terminal =
+        new ExternalPlayerResultCoordinator.Terminal(OLD_REQUEST_ID, 41, 25, 100, false, true);
+
+    require(recoveredOwner.deliver(terminal), "owner callback survives destroyed Main");
+    require(recoveredHost.acknowledgeCalls == 1, "durable acknowledgement recorded once");
+    require(recoveredHost.processExitQueue.size() == 1, "activity fallback posted without Main");
+    require(recoveredHost.processExitCalls == 0, "fallback waits for delivery callback boundary");
+    recoveredHost.processExitQueue.runNext();
+    require(recoveredHost.processExitCalls == 1, "fallback terminates the orphaned process");
+    require(
+        recoveredHost.processExitState.isClaimed(41, OLD_REQUEST_ID),
+        "durable exact pair owns process exit");
+  }
+
+  private static void staleAcknowledgementIsRejected() {
+    ExternalPlayerResultCoordinator.ProcessExitState processExit =
+        new ExternalPlayerResultCoordinator.ProcessExitState();
+    require(processExit.activate(42, OLD_REQUEST_ID), "old exit pair active");
+    require(processExit.requestExit(42, OLD_REQUEST_ID), "old exit requested");
+    require(processExit.activate(43, NEW_REQUEST_ID), "newer exit pair active");
+    require(processExit.requestExit(43, NEW_REQUEST_ID), "newer exit requested");
+
+    require(!processExit.acknowledge(42, OLD_REQUEST_ID), "stale pair cannot acknowledge");
+    require(!processExit.acknowledge(43, OLD_REQUEST_ID), "wrong request cannot acknowledge");
+    require(!processExit.acknowledge(42, NEW_REQUEST_ID), "wrong generation cannot acknowledge");
+    require(processExit.acknowledge(43, NEW_REQUEST_ID), "exact newer pair acknowledges");
+    require(!processExit.acknowledge(43, NEW_REQUEST_ID), "acknowledgement is one-shot");
+  }
+
+  private static void newerGenerationIsolatesQueuedExit() {
+    ExternalPlayerResultCoordinator.ProcessExitState processExit =
+        new ExternalPlayerResultCoordinator.ProcessExitState();
+    DeterministicQueue queue = new DeterministicQueue();
+    AtomicInteger processExits = new AtomicInteger();
+    require(processExit.activate(44, OLD_REQUEST_ID), "queued old exit active");
+    require(processExit.requestExit(44, OLD_REQUEST_ID), "queued old exit requested");
+    require(processExit.acknowledge(44, OLD_REQUEST_ID), "queued old exit acknowledged");
+    queue.post(
+        () -> {
+          if (processExit.claim(44, OLD_REQUEST_ID)) processExits.incrementAndGet();
+        });
+
+    require(processExit.activate(45, NEW_REQUEST_ID), "newer playback replaces exit authority");
+    require(processExit.requestExit(45, NEW_REQUEST_ID), "newer playback requests its own exit");
+    require(processExit.acknowledge(45, NEW_REQUEST_ID), "newer playback acknowledges exactly");
+    queue.runNext();
+    require(processExits.get() == 0, "queued stale exit cannot kill newer playback");
+    require(processExit.claim(45, NEW_REQUEST_ID), "newer exact pair remains claimable");
+    require(!processExit.claim(45, NEW_REQUEST_ID), "newer process exit claims once");
+  }
+
+  private static void duplicateTerminalRaceIsOneShot() throws Exception {
+    for (int iteration = 0; iteration < 500; ++iteration) {
+      FakeHost host = new FakeHost();
+      ExternalPlayerActivity.Controller controller =
+          new ExternalPlayerActivity.Controller(
+              host,
+              new ExternalPlayerResultCoordinator.Owner(THIRD_REQUEST_ID, true, 46, false, false));
+      ExternalPlayerResultCoordinator.Terminal terminal =
+          new ExternalPlayerResultCoordinator.Terminal(THIRD_REQUEST_ID, 46, 90, 100, true, false);
+      CountDownLatch ready = new CountDownLatch(2);
+      CountDownLatch start = new CountDownLatch(1);
+      CountDownLatch done = new CountDownLatch(2);
+      AtomicInteger deliveries = new AtomicInteger();
+      AtomicReference<Throwable> failure = new AtomicReference<>();
+      Runnable delivery =
+          () -> {
+            try {
+              ready.countDown();
+              if (!start.await(5, TimeUnit.SECONDS))
+                throw new AssertionError("duplicate terminal start timeout");
+              if (controller.deliver(terminal)) deliveries.incrementAndGet();
+            } catch (Throwable throwable) {
+              failure.compareAndSet(null, throwable);
+            } finally {
+              done.countDown();
+            }
+          };
+      new Thread(delivery, "external-result-duplicate-a").start();
+      new Thread(delivery, "external-result-duplicate-b").start();
+      require(ready.await(5, TimeUnit.SECONDS), "duplicate terminal workers ready");
+      start.countDown();
+      require(done.await(5, TimeUnit.SECONDS), "duplicate terminal workers completed");
+      if (failure.get() != null)
+        throw new AssertionError("duplicate terminal worker failed", failure.get());
+      require(deliveries.get() == 1, "duplicate terminal race has one winner");
+      require(host.setTerminalResultCalls == 1, "duplicate race sets caller result once");
+      require(host.finishCalls == 1, "duplicate race finishes owner once");
+      require(host.clearExactCalls == 1, "duplicate race clears durable terminal once");
+    }
+  }
+
+  private static void admissionRaceRejectsStaleTerminal() throws Exception {
+    for (int iteration = 0; iteration < 1000; ++iteration) {
+      ExternalPlayerResultCoordinator.Producer producer =
+          new ExternalPlayerResultCoordinator.Producer();
+      require(producer.begin(50, OLD_REQUEST_ID), "race old begin");
+      CountDownLatch replacementAdmitted = new CountDownLatch(1);
+      AtomicInteger staleClaims = new AtomicInteger();
+      AtomicReference<Throwable> failure = new AtomicReference<>();
+      Thread staleTerminal =
+          new Thread(
+              () -> {
+                try {
+                  if (!replacementAdmitted.await(5, TimeUnit.SECONDS))
+                    throw new AssertionError("race admission timeout");
+                  if (producer.finish(50, OLD_REQUEST_ID, 10, 100, false, true) != null)
+                    staleClaims.incrementAndGet();
+                } catch (Throwable throwable) {
+                  failure.set(throwable);
+                }
+              },
+              "external-result-stale-terminal");
+      staleTerminal.start();
+      require(producer.begin(51, NEW_REQUEST_ID), "race replacement begin");
+      replacementAdmitted.countDown();
+      staleTerminal.join(TimeUnit.SECONDS.toMillis(5));
+      require(!staleTerminal.isAlive(), "race worker completed");
+      if (failure.get() != null) throw new AssertionError("race worker failed", failure.get());
+      require(staleClaims.get() == 0, "stale generation never claimed");
+    }
+  }
+
+  public static void main(String[] args) throws Exception {
+    for (int i = 0; i < 5000; ++i) {
+      recreationPreservesForwardingAndExactBinding();
+      processDeathRotatesOwnerWithoutStaleReplay();
+      forwardingFailureCanRetrySafely();
+      cancellationUsesExactGeneration();
+      overlappingLaunchesStayIsolated();
+      coldExitRequiresExactAcknowledgement();
+      mainDestroyedBeforeOwnerCallbackUsesDurableFallback();
+      staleAcknowledgementIsRejected();
+      newerGenerationIsolatesQueuedExit();
+    }
+    admissionRaceRejectsStaleTerminal();
+    duplicateTerminalRaceIsOneShot();
+    System.out.println("ExternalPlayerResultCoordinatorTest: PASS");
+  }
+}

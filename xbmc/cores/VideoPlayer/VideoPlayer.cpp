@@ -2759,11 +2759,11 @@ void CVideoPlayer::OnExit()
   bool close = m_bCloseRequest;
   m_outboundEvents->Submit([=]() {
     if (close)
-      cb->OnPlayBackStopped();
+      cb->OnPlayBackStoppedWithItem(fileItem);
     else if (error)
-      cb->OnPlayBackError();
+      cb->OnPlayBackErrorWithItem(fileItem);
     else
-      cb->OnPlayBackEnded();
+      cb->OnPlayBackEndedWithItem(fileItem);
   });
 }
 

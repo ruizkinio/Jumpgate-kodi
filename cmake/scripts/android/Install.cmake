@@ -37,6 +37,9 @@ set(package_files strings.xml
                   build.gradle
                   src/Splash.java
                   src/Main.java
+                  src/ExternalPlayerActivity.java
+                  src/ExternalPlayerResultCoordinator.java
+                  src/ExternalPlayerResultStore.java
                   src/JumpgateCredentialStore.java
                   src/XBMCBroadcastReceiver.java
                   src/XBMCInputDeviceListener.java
@@ -79,7 +82,12 @@ set(package_files strings.xml
                   src/content/XBMCMediaContentProvider.java
                   src/content/XBMCContentProvider.java
                   src/util/Storage.java
+                  test/ExternalPlayerResultCoordinatorTest.java
+                  test-support/Splash.java
+                  test-support/Main.java
                   )
+file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/tools/android/packaging/xbmc/test
+                    ${CMAKE_BINARY_DIR}/tools/android/packaging/xbmc/test-support)
 foreach(file IN LISTS package_files)
   configure_file(${CMAKE_SOURCE_DIR}/tools/android/packaging/xbmc/${file}.in
                  ${CMAKE_BINARY_DIR}/tools/android/packaging/xbmc/${file} @ONLY)

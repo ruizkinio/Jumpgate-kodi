@@ -13,6 +13,7 @@
 #include "UPnP.h"
 #include "UPnPInternal.h"
 #include "cores/DataCacheCore.h"
+#include "cores/PlayerOpenPublication.h"
 #include "dialogs/GUIDialogBusy.h"
 #include "input/actions/Action.h"
 #include "input/actions/ActionIDs.h"
@@ -29,6 +30,7 @@
 #include "video/VideoThumbLoader.h"
 
 #include <mutex>
+#include <utility>
 
 #include <Platinum/Source/Devices/MediaRenderer/PltMediaController.h>
 #include <Platinum/Source/Devices/MediaServer/PltDidl.h>
@@ -115,7 +117,7 @@ public:
   {
     std::unique_lock lock(m_section);
 
-    if (NPT_FAILED(res))
+    if (NPT_FAILED(res) || info == nullptr)
     {
       m_logger->error("OnGetTransportInfoResult failed");
       m_trainfo.cur_speed = "0";
@@ -380,29 +382,45 @@ bool CUPnPPlayer::OpenFile(const CFileItem& file, const CPlayerOptions& options)
   else
     NPT_CHECK_LABEL_SEVERE(PlayFile(file, options, timeout), failed);
 
+  if (!KODI::PLAYER::PrepareOpenAndPublishStarted(
+          file, !file.GetPath().empty(),
+          [&]
+          {
+            const bool started = NPT_SUCCEEDED(m_control->GetPositionInfo(
+                m_delegate->m_device, m_delegate->m_instance, m_delegate.get()));
+            if (!started)
+              m_logger->warning("OpenFile({}): failed to request initial position info",
+                                file.GetPath());
+            return started;
+          },
+          [&]
+          {
+            const bool started = NPT_SUCCEEDED(m_control->GetMediaInfo(
+                m_delegate->m_device, m_delegate->m_instance, m_delegate.get()));
+            if (!started)
+              m_logger->warning("OpenFile({}): failed to request initial media info",
+                                file.GetPath());
+            return started;
+          },
+          [&] { return StopRemotePlayback(); }, [&] { return VerifyRemotePlaybackStopped(); },
+          [&](const CFileItem& callbackFile)
+          {
+            m_stopremote = true;
+            SetCallbackFile(callbackFile);
+
+            if (VIDEO::IsVideo(callbackFile))
+              m_hasVideo = true;
+            else if (MUSIC::IsAudio(callbackFile))
+              m_hasAudio = true;
+          },
+          [&](const CFileItem& callbackFile) { m_callback.OnPlayBackStarted(callbackFile); },
+          [&](const CFileItem& callbackFile) { m_callback.OnAVStarted(callbackFile); }))
+  {
+    goto failed;
+  }
+
   if (!IsRunning())
     Create();
-
-  m_stopremote = true;
-  m_started = true;
-
-  if (VIDEO::IsVideo(file))
-  {
-    m_hasVideo = true;
-  }
-  else if (MUSIC::IsAudio(file))
-  {
-    m_hasAudio = true;
-  }
-
-  m_callback.OnPlayBackStarted(file);
-  m_callback.OnAVStarted(file);
-  NPT_CHECK_LABEL_SEVERE(
-      m_control->GetPositionInfo(m_delegate->m_device, m_delegate->m_instance, m_delegate.get()),
-      failed);
-  NPT_CHECK_LABEL_SEVERE(
-      m_control->GetMediaInfo(m_delegate->m_device, m_delegate->m_instance, m_delegate.get()),
-      failed);
 
   m_updateTimer.Set(0ms);
 
@@ -410,6 +428,66 @@ bool CUPnPPlayer::OpenFile(const CFileItem& file, const CPlayerOptions& options)
 failed:
   m_logger->error("OpenFile({}) failed to open file", file.GetPath());
   return false;
+}
+
+bool CUPnPPlayer::StopRemotePlayback()
+{
+  if (m_control == nullptr || !m_delegate)
+  {
+    m_logger->error("OpenFile rollback could not access the remote renderer");
+    return false;
+  }
+
+  m_delegate->m_resevent.Reset();
+  m_delegate->m_resstatus = NPT_FAILURE;
+  if (NPT_FAILED(m_control->Stop(m_delegate->m_device, m_delegate->m_instance, m_delegate.get())))
+  {
+    m_logger->error("OpenFile rollback failed to issue Stop");
+    return false;
+  }
+  if (!m_delegate->m_resevent.Wait(10s))
+  {
+    m_logger->error("OpenFile rollback timed out waiting for Stop");
+    return false;
+  }
+  if (NPT_FAILED(m_delegate->m_resstatus))
+  {
+    m_logger->error("OpenFile rollback received a failed Stop response");
+    return false;
+  }
+  return true;
+}
+
+bool CUPnPPlayer::VerifyRemotePlaybackStopped()
+{
+  if (m_control == nullptr || !m_delegate)
+  {
+    m_logger->error("OpenFile rollback could not verify the remote renderer");
+    return false;
+  }
+
+  m_delegate->m_traevnt.Reset();
+  if (NPT_FAILED(m_control->GetTransportInfo(m_delegate->m_device, m_delegate->m_instance,
+                                             m_delegate.get())))
+  {
+    m_logger->error("OpenFile rollback failed to request transport state");
+    return false;
+  }
+  if (!m_delegate->m_traevnt.Wait(10s))
+  {
+    m_logger->error("OpenFile rollback timed out waiting for transport state");
+    return false;
+  }
+
+  const NPT_String transportState = m_delegate->GetTransportState();
+  const NPT_String transportStatus = m_delegate->GetTransportStatus();
+  const bool stopped = transportState == "STOPPED" || transportState == "NO_MEDIA_PRESENT";
+  if (!stopped || transportStatus == "ERROR_OCCURED")
+  {
+    m_logger->error("OpenFile rollback could not verify a stopped remote renderer");
+    return false;
+  }
+  return true;
 }
 
 bool CUPnPPlayer::QueueNextFile(const CFileItem& file)
@@ -459,11 +537,8 @@ bool CUPnPPlayer::CloseFile(bool reopen)
     NPT_CHECK_LABEL(m_delegate->m_resstatus, failed);
   }
 
-  if (m_started)
-  {
-    m_started = false;
-    m_callback.OnPlayBackStopped();
-  }
+  if (auto callbackFile = TakeCallbackFile())
+    m_callback.OnPlayBackStoppedWithItem(*callbackFile);
   StopThread(true);
   CServiceBroker::GetDataCacheCore().Reset();
   return true;
@@ -536,7 +611,7 @@ void CUPnPPlayer::Process()
     NPT_CHECK_POINTER_LABEL_SEVERE(m_delegate, failed);
     m_delegate->UpdatePositionInfo();
 
-    if (m_started)
+    if (HasCallbackFile())
     {
       // Update player times
       CDataCacheCore& dataCacheCore = CDataCacheCore::GetInstance();
@@ -561,8 +636,8 @@ void CUPnPPlayer::Process()
       if (m_delegate->GetTransportState() == "STOPPED")
       {
         m_logger->info("Transport state flagged as STOPPED. Triggering OnPlayBackEnded.");
-        m_started = false;
-        m_callback.OnPlayBackEnded();
+        if (auto callbackFile = TakeCallbackFile())
+          m_callback.OnPlayBackEndedWithItem(*callbackFile);
       }
     }
   }
@@ -654,10 +729,26 @@ failed:
 
 void CUPnPPlayer::OnExit()
 {
-  if (m_started)
-  {
-    m_callback.OnPlayBackEnded();
-  }
+  if (auto callbackFile = TakeCallbackFile())
+    m_callback.OnPlayBackEndedWithItem(*callbackFile);
+}
+
+void CUPnPPlayer::SetCallbackFile(const CFileItem& file)
+{
+  std::lock_guard<std::mutex> lock(m_callbackFileMutex);
+  m_callbackFileItem = std::make_unique<CFileItem>(file);
+}
+
+bool CUPnPPlayer::HasCallbackFile() const
+{
+  std::lock_guard<std::mutex> lock(m_callbackFileMutex);
+  return m_callbackFileItem != nullptr;
+}
+
+std::unique_ptr<CFileItem> CUPnPPlayer::TakeCallbackFile()
+{
+  std::lock_guard<std::mutex> lock(m_callbackFileMutex);
+  return std::move(m_callbackFileItem);
 }
 
 } /* namespace UPNP */

@@ -33,6 +33,25 @@ struct ProfileMetadata
   int64_t updatedAt{0};
 };
 
+enum class ProfileMutationStatus
+{
+  NotCommitted,
+  Committed,
+  CommittedRefreshFailed,
+};
+
+struct ProfileMutationResult
+{
+  bool IsCommitted() const { return status != ProfileMutationStatus::NotCommitted; }
+  bool IsFullyApplied() const { return status == ProfileMutationStatus::Committed; }
+  explicit operator bool() const { return IsCommitted(); }
+
+  ProfileMutationStatus status{ProfileMutationStatus::NotCommitted};
+};
+
+using ForgetLocalStatus = ProfileMutationStatus;
+using ForgetLocalResult = ProfileMutationResult;
+
 class CJumpgateProfileRuntime
 {
 public:
@@ -51,22 +70,28 @@ public:
   std::vector<ProfileMetadata> GetProfiles() const;
   std::string GetPairingOrigin() const;
 
-  bool StorePairingResponse(const CVariant& response,
-                            const std::string& expectedOrigin,
-                            bool allowInsecureLoopback,
-                            int64_t now,
-                            std::string& error);
-  bool SelectActive(const std::string& profileId, std::string& error);
-  bool ClearActive(std::string& error);
-  bool ForgetLocal(const std::string& profileId, const std::string& deviceId, std::string& error);
-  bool SetActiveSetting(const std::string& key, const CVariant& value, std::string& error);
-  bool SetPairingOrigin(const std::string& origin, bool allowInsecureLoopback, std::string& error);
+  ProfileMutationResult StorePairingResponse(const CVariant& response,
+                                             const std::string& expectedOrigin,
+                                             bool allowInsecureLoopback,
+                                             int64_t now,
+                                             std::string& error);
+  ProfileMutationResult SelectActive(const std::string& profileId, std::string& error);
+  ProfileMutationResult ClearActive(std::string& error);
+  ForgetLocalResult ForgetLocal(const std::string& profileId,
+                                const std::string& deviceId,
+                                std::string& error);
+  ProfileMutationResult SetActiveSetting(const std::string& key,
+                                         const CVariant& value,
+                                         std::string& error);
+  ProfileMutationResult SetPairingOrigin(const std::string& origin,
+                                         bool allowInsecureLoopback,
+                                         std::string& error);
 
 private:
   bool EnsureInitializedLocked(std::string& error);
   bool ReloadLocked(std::string& error);
   bool RefreshActiveLocked(std::string& error);
-  bool RefreshAfterMutationLocked(std::string& error);
+  ProfileMutationResult RefreshAfterMutationLocked(std::string& error);
 
   mutable std::mutex m_mutex;
   CJumpgateProfileStore m_store;

@@ -17,13 +17,19 @@
 #include "JNIXBMCMediaSession.h"
 #include "interfaces/IAnnouncer.h"
 #include "platform/xbmc.h"
-#include "utils/Variant.h"
 #include "threads/Event.h"
 #include "utils/Geometry.h"
+#include "utils/JumpgatePlaybackAuthority.h"
+#include "utils/JumpgatePlaybackHistory.h"
+#include "utils/JumpgatePlaybackHistoryState.h"
+#include "utils/JumpgatePlaybackResultState.h"
+#include "utils/JumpgateShutdownCoordinator.h"
+#include "utils/Variant.h"
 
 #include <atomic>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -49,7 +55,8 @@ namespace KODI::JUMPGATE
 class CAndroidJumpgateCredentialStore;
 class CJumpgateProfileRuntime;
 class CJumpgateProfileStorage;
-}
+class CJumpgatePlaybackClaimCoordinator;
+} // namespace KODI::JUMPGATE
 
 typedef struct _JNIEnv JNIEnv;
 
@@ -57,7 +64,7 @@ struct androidIcon
 {
   unsigned int width;
   unsigned int height;
-  void *pixels;
+  void* pixels;
 };
 
 struct androidPackage
@@ -102,6 +109,7 @@ public:
     return *m_appinstance;
   }
   static CXBMCApp& Get() { return *m_appinstance; }
+  static bool HasInstance() { return m_appinstance != nullptr; }
   static void Destroy() { m_appinstance.reset(); }
 
   CXBMCApp() = delete;
@@ -141,7 +149,7 @@ public:
   void onStop() override;
   void onDestroy() override;
 
-  void onSaveState(void **data, size_t *size) override;
+  void onSaveState(void** data, size_t* size) override;
   void onConfigurationChanged() override;
   void onLowMemory() override;
 
@@ -160,7 +168,7 @@ public:
   std::shared_ptr<CNativeWindow> GetNativeWindow(int timeout) const;
 
   bool SetBuffersGeometry(int width, int height, int format);
-  static int android_printf(const char *format, ...);
+  static int android_printf(const char* format, ...);
 
   int GetBatteryLevel() const;
   void KeepScreenOn(bool on);
@@ -188,22 +196,29 @@ public:
   CRect MapRenderToDroid(const CRect& srcRect);
 
   // Playback callbacks
-  void OnPlayBackStarted();
+  void OnPlayBackStarted(bool resumed = false, uint64_t token = 0);
   void OnPlayBackPaused();
-  void OnPlayBackStopped();
+  void OnPlayBackStopped(bool completed = false);
+  void CommitExternalPlaybackOpenFailure(uint64_t token);
+  void CommitExternalPlaybackTerminal(bool completed, uint64_t token, bool started);
+  void DeliverPendingExternalPlayerResult();
+  std::optional<uint64_t> BeginExternalPlaybackContinuation();
+  bool IsLatestExternalPlaybackAdmission(uint64_t token);
 
   // External player mode
   bool IsExternalPlayerMode() const { return m_externalPlayerMode.load(std::memory_order_relaxed); }
-  void SetExternalPlayerMode(bool mode) { m_externalPlayerMode.store(mode, std::memory_order_relaxed); }
-  void ExitExternalPlayerMode(bool completed);
+  void SetExternalPlayerMode(bool mode)
+  {
+    m_externalPlayerMode.store(mode, std::memory_order_relaxed);
+  }
   void ReturnToStandaloneMode();
 
   // Version
   static constexpr const char* JUMPGATE_VERSION = "3.0.0";
 
   // Resume store (content-ID based cross-source resume)
-  void SaveResumePosition();
-  int LoadResumePosition(const std::string& imdbId, int season, int episode);
+  void SaveResumePosition(bool explicitEnd = false);
+  int64_t LoadResumePosition(const std::string& imdbId, int season, int episode);
   void OnContentIdentified();
 
   // Jumpgate profile/settings runtime
@@ -252,7 +267,7 @@ protected:
   // limit who can access Volume
   friend class CAESinkAUDIOTRACK;
 
-  static int GetMaxSystemVolume(JNIEnv *env);
+  static int GetMaxSystemVolume(JNIEnv* env);
   bool AcquireAudioFocus();
   bool ReleaseAudioFocus();
   void RequestVisibleBehind(bool requested);
@@ -266,19 +281,44 @@ private:
   jni::CJNIXBMCDisplayManagerDisplayListener m_displayListener;
   std::unique_ptr<jni::CJNIXBMCMainView> m_mainView;
   std::unique_ptr<jni::CJNIXBMCMediaSession> m_mediaSession;
-  std::string GetFilenameFromIntent(const CJNIIntent &intent);
+  std::string GetFilenameFromIntent(const CJNIIntent& intent);
 
   void run();
   void stop();
   void SetupEnv();
   void StartBridgePairing();
   static std::string GetBridgeOriginFromUrl(const std::string& currentUrl);
-  void StopBridgePairingWorker(bool clearPendingState);
+  void StopBridgePairingWorker(bool clearPendingState, bool waitForCompletion = true);
   void QueuePairingRedemption(std::string responseJson,
                               const std::string& origin,
                               const std::string& profileName);
   void QueuePairingError(const std::string& errorMessage);
   void UpdateLoadingOverlayContentInfo(bool force);
+  uint64_t QueuePlaybackSourceClaim(const std::string& rawLaunchUri, int64_t launchedAtMs);
+  std::optional<KODI::JUMPGATE::CJumpgatePlaybackAuthority::Event> BeginExternalPlaybackAdmission(
+      const std::string& rawLaunchUri,
+      int64_t launchedAtMs,
+      std::string resultRequestId,
+      KODI::JUMPGATE::CJumpgatePlaybackResultState::LifecycleOperation& lifecycleOperation);
+  void CommitExternalPlaybackAdmissionFailure(uint64_t token);
+  void DeliverRejectedExternalPlaybackResult(
+      std::string resultRequestId,
+      KODI::JUMPGATE::CJumpgatePlaybackResultState::LifecycleOperation& lifecycleOperation);
+  void DeliverPendingExternalPlayerResult(
+      KODI::JUMPGATE::CJumpgatePlaybackResultState::LifecycleOperation& lifecycleOperation);
+  void ProcessPlaybackSourceClaim();
+  bool SavePairedPlaybackHistory(bool explicitEnd, uint64_t generation = 0);
+  void LoadAndApplyPairedPlaybackResume(uint64_t generation);
+  void ReleasePlaybackSourceClaim();
+  void StopPlaybackClaimCoordinator(bool drainRelease);
+  void ExitExternalPlayerMode(
+      const KODI::JUMPGATE::JumpgatePlaybackResult& result,
+      KODI::JUMPGATE::CJumpgatePlaybackResultState::LifecycleOperation& lifecycleOperation);
+  std::optional<KODI::JUMPGATE::CJumpgatePlaybackAuthority::Token>
+  BeginJumpgateProfileAuthorityTransition(std::string& error);
+  void PrepareJumpgateProfileAuthorityTransition();
+  bool FinishJumpgateProfileAuthorityTransition(
+      KODI::JUMPGATE::CJumpgatePlaybackAuthority::Token token, bool committed);
   static void SetDisplayModeCallback(void* modeVariant);
   static void KeepScreenOnCallback(void* onVariant);
   static void SetViewBackgroundColorCallback(void* mapVariant);
@@ -326,9 +366,9 @@ private:
   // External player mode state (atomic: written on JNI thread, read on Kodi Main thread)
   std::atomic<bool> m_externalPlayerMode{false};
   std::atomic<bool> m_wasStandalone{false}; // true when entered ext player mode from standalone
-  std::atomic<int64_t> m_lastPlaybackTimeMs{0};     // F-003: atomic prevents torn reads on ARM32
-  std::atomic<int64_t> m_lastPlaybackDurationMs{0};  // F-003: atomic prevents torn reads on ARM32
-  std::atomic<int> m_resumePositionMs{0};
+  std::atomic<int64_t> m_lastPlaybackTimeMs{0}; // F-003: atomic prevents torn reads on ARM32
+  std::atomic<int64_t> m_lastPlaybackDurationMs{0}; // F-003: atomic prevents torn reads on ARM32
+  std::atomic<int64_t> m_resumePositionMs{0};
   std::atomic<bool> m_resumeApplied{false}; // Prevents double-seek from content-ID resume
 
   // Resume store file
@@ -337,9 +377,33 @@ private:
   // Profile metadata is plaintext but canonical and secret-free. Bearer/config
   // material is held by the Android Keystore-backed credential store.
   std::unique_ptr<KODI::JUMPGATE::CJumpgateProfileStorage> m_jumpgateProfileStorage;
-  std::unique_ptr<KODI::JUMPGATE::CAndroidJumpgateCredentialStore>
-      m_jumpgateCredentialStore;
+  std::unique_ptr<KODI::JUMPGATE::CJumpgateProfileStorage> m_jumpgatePlaybackHistoryStorage;
+  std::unique_ptr<KODI::JUMPGATE::CJumpgatePlaybackHistoryStore> m_jumpgatePlaybackHistoryStore;
+  std::unique_ptr<KODI::JUMPGATE::CAndroidJumpgateCredentialStore> m_jumpgateCredentialStore;
   std::unique_ptr<KODI::JUMPGATE::CJumpgateProfileRuntime> m_jumpgateProfileRuntime;
+  struct PendingPlaybackClaim
+  {
+    uint64_t generation{0};
+    std::vector<std::string> fingerprints;
+    std::string intentUrlHash;
+    int64_t launchedAtMs{0};
+  };
+  mutable CCriticalSection m_playbackClaimMutex;
+  std::unique_ptr<KODI::JUMPGATE::CJumpgatePlaybackClaimCoordinator> m_playbackClaimCoordinator;
+  std::optional<PendingPlaybackClaim> m_pendingPlaybackClaim;
+  uint64_t m_playbackClaimGeneration{0};
+  uint64_t m_submittedPlaybackClaimGeneration{0};
+  std::string m_submittedPlaybackClaimProfileId;
+  std::string m_submittedPlaybackClaimOrigin;
+  std::string m_activePlaybackClaimSessionId;
+  std::string m_activePlaybackClaimProfileId;
+  std::string m_activePlaybackClaimOrigin;
+  KODI::JUMPGATE::CJumpgatePlaybackHistoryState m_playbackHistoryState;
+  KODI::JUMPGATE::CJumpgatePlaybackAuthority m_playbackAuthority;
+  std::atomic<uint64_t> m_ordinaryPlaybackAuthorityToken{0};
+  KODI::JUMPGATE::CJumpgatePlaybackResultState m_playbackResultState;
+  std::atomic<uint64_t> m_rejectedPlaybackResultGeneration{1};
+  KODI::JUMPGATE::CJumpgateShutdownCoordinator m_shutdownCoordinator;
   std::atomic<bool> m_settingsRequested{false};
   mutable CCriticalSection m_pairingMutex;
   std::thread m_pairingThread;
@@ -357,7 +421,7 @@ private:
   std::string m_lastOverlayMeta;
   std::string m_lastOverlayLogoUrl;
 
-  // Trakt scrobbler (external player mode only)
+  // Stable for the CXBMCApp lifetime; initialized only in external-player mode.
   std::unique_ptr<TraktScrobbler> m_traktScrobbler;
 
   // Subtitle downloader (external player mode only)

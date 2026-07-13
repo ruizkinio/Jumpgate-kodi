@@ -64,7 +64,6 @@ public class Splash extends Activity
 
   private static final int RECORDAUDIO_RESULT_CODE = 8946;
   private static final int PERMISSION_RESULT_CODE = 8947;
-  private static final int EXTERNAL_PLAYER_REQUEST_CODE = 8948;
 
   private String mErrorMsg = "";
 
@@ -108,7 +107,8 @@ public class Splash extends Activity
           showInfoDialog(getString(R.string.notice_dialog, "@APP_NAME@"), CheckingPermissions);
           break;
         case RecordAudioInfo:
-          showInfoDialog(getString(R.string.record_audio_dialog, "@APP_NAME@"), RecordAudioPermission);
+          showInfoDialog(
+              getString(R.string.record_audio_dialog, "@APP_NAME@"), RecordAudioPermission);
           break;
         case RecordAudioPermission:
           requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO},
@@ -560,14 +560,6 @@ public class Splash extends Activity
   protected void onActivityResult(int requestCode, int resultCode, Intent data)
   {
     super.onActivityResult(requestCode, resultCode, data);
-    if (requestCode == EXTERNAL_PLAYER_REQUEST_CODE)
-    {
-      // Relay Main's result (playback position/duration) back to the calling app
-      Log.d(TAG, "Splash: Relaying external player result (code=" + resultCode + ")");
-      setResult(resultCode, data);
-      finish();
-      return;
-    }
     if (requestCode == PERMISSION_RESULT_CODE)
     {
       if (Environment.isExternalStorageManager())
@@ -621,51 +613,24 @@ public class Splash extends Activity
       unregisterReceiver(mExternalStorageReceiver);
   }
 
+  protected boolean prepareToStartXBMC(Bundle savedInstanceState) {
+    return false;
+  }
+
   protected void startXBMC()
   {
     // Run @APP_NAME@
-    Intent intent = getIntent();
-
-    // Detect external player mode: launched with ACTION_VIEW + data URI
-    // from an external app (not our own launcher category)
-    boolean isExternalPlayer = Intent.ACTION_VIEW.equals(intent.getAction())
-            && intent.getData() != null;
-
+    Intent intent = new Intent(getIntent());
     intent.setClass(this, @APP_PACKAGE@.Main.class);
-    // Replace all flags — don't carry forward launcher's FLAG_ACTIVITY_RESET_TASK_IF_NEEDED
-    // which causes the task to be disrupted during Splash→Main transition on phone launchers
-    intent.setFlags(Intent.FLAG_ACTIVITY_PREVIOUS_IS_TOP);
-    if (isExternalPlayer) {
-      intent.putExtra("external_player_mode", true);
-      // Forward content ID extras if present (for Trakt scrobbling)
-      if (intent.hasExtra("imdb_id"))
-        intent.putExtra("imdb_id", intent.getStringExtra("imdb_id"));
-      if (intent.hasExtra("title"))
-        intent.putExtra("title", intent.getStringExtra("title"));
-      if (intent.hasExtra("year"))
-        intent.putExtra("year", intent.getIntExtra("year", 0));
-      if (intent.hasExtra("season"))
-        intent.putExtra("season", intent.getIntExtra("season", -1));
-      if (intent.hasExtra("episode"))
-        intent.putExtra("episode", intent.getIntExtra("episode", -1));
-      // Forward resume position extras (for continue watching)
-      // VLC uses "extra_position" (long), MX Player/mpv use "position" (int)
-      // Stremio uses "startfrom" (milliseconds)
-      if (intent.hasExtra("position"))
-        intent.putExtra("position", intent.getIntExtra("position", 0));
-      if (intent.hasExtra("extra_position"))
-        intent.putExtra("extra_position", intent.getLongExtra("extra_position", 0));
-      if (intent.hasExtra("startfrom"))
-        intent.putExtra("startfrom", intent.getIntExtra("startfrom", 0));
-
-      // Use startActivityForResult so we can relay Main's result back to the caller.
-      // Without this, Splash.finish() breaks the startActivityForResult chain and
-      // the calling app (e.g. Stremio) never receives playback position/duration.
-      startActivityForResult(intent, EXTERNAL_PLAYER_REQUEST_CODE);
-    } else {
-      startActivity(intent);
-      finish();
-    }
+    int contentGrantFlags =
+        intent.getFlags()
+            & (Intent.FLAG_GRANT_READ_URI_PERMISSION
+                | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+                | Intent.FLAG_GRANT_PREFIX_URI_PERMISSION);
+    intent.setFlags(contentGrantFlags | Intent.FLAG_ACTIVITY_PREVIOUS_IS_TOP);
+    startActivity(intent);
+    finish();
   }
 
   @Override
@@ -681,6 +646,8 @@ public class Splash extends Activity
     }
 
     super.onCreate(savedInstanceState);
+
+    if (prepareToStartXBMC(savedInstanceState)) return;
 
     // Be sure properties are initialized for native
     XBMCProperties.initialize(getApplicationContext());

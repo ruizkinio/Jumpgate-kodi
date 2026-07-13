@@ -8,11 +8,19 @@
 
 #include "interfaces/IAnnouncer.h"
 #include "threads/CriticalSection.h"
+#include "utils/JumpgatePlaybackAuthority.h"
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <string>
+
+namespace KODI::JUMPGATE
+{
+class CJumpgateScrobbleDispatcher;
+class CJumpgateScrobbleStartCoordinator;
+} // namespace KODI::JUMPGATE
 
 class TraktScrobbler : public ANNOUNCEMENT::IAnnouncer
 {
@@ -28,7 +36,7 @@ public:
 
   // Lifecycle
   void Initialize();
-  void Deinitialize();
+  void Deinitialize(bool drainScrobble = true);
 
   // Called from ProcessSlow() for device code auth polling
   void ProcessSlow();
@@ -36,11 +44,26 @@ public:
   // Content identification (set before playback starts)
   void SetContentInfo(
       const std::string& imdbId, const std::string& title, int year, int season, int episode);
+  void SetPlaybackGeneration(uint64_t generation, uint64_t attemptToken);
+  void CancelPlaybackGeneration(uint64_t generation, uint64_t attemptToken);
+  bool SetClaimedContentInfo(uint64_t generation,
+                             const std::string& provider,
+                             const std::string& id,
+                             const std::string& mediaType,
+                             const std::string& title,
+                             const std::string& logoUrl,
+                             int year,
+                             int season,
+                             int episode,
+                             bool traktEligible);
+  void StopForReplacement();
   void SetMediaUrl(const std::string& url);
   void ClearContentInfo();
 
   // Content ID getters (for resume store integration)
   std::string GetImdbId() const;
+  std::string GetCanonicalProvider() const;
+  std::string GetCanonicalId() const;
   std::string GetTitle() const;
   std::string GetEpisodeTitle() const;
   std::string GetLogoUrl() const;
@@ -49,26 +72,20 @@ public:
   int GetEpisode() const;
   bool IsContentIdentified() const;
 
-  // Getters for rapid-switch fire-and-forget ScrobbleStop (F-007)
-  // The detached thread must capture ALL state by value -- zero references to this
-  std::string GetAccessToken() const;
-  std::string GetTraktSlug() const;
-  bool IsScrobbleActive() const;
-
   // Re-authentication
   void ForceReAuth();
   bool IsAuthenticatedPublic() const;
 
   // Bridge resume data (populated by QueryBridgeServer when available)
   // Uses std::atomic for lock-free cross-thread access (F-009 fix)
-  int GetBridgeResumePosition() const
+  int64_t GetBridgeResumePosition() const
   {
     return m_bridgeResumePositionMs.load(std::memory_order_relaxed);
   }
   void ClearBridgeResume() { m_bridgeResumePositionMs.store(0, std::memory_order_relaxed); }
 
   // Trakt playback sync (cross-device resume)
-  int GetTraktResumePosition();
+  int64_t GetTraktResumePosition();
 
   // Bridge URL
   std::string GetBridgeUrl() const;
@@ -94,14 +111,17 @@ private:
   void PollForToken();
 
   // Scrobble API
-  bool ScrobbleStart(float progress);
-  bool ScrobbleStop(float progress);
-  bool ScrobblePause(float progress);
   bool SyncWatchHistory();
   std::string BuildSyncHistoryJson();
 
   // Content identification
   bool IdentifyContent();
+  bool IsTraktIdentityAuthorized() const;
+  bool StartScrobbleIfReady();
+  bool QueueCompensatingStop(std::string cleanupKey,
+                             std::string jsonBody,
+                             std::string accessToken,
+                             uint64_t cleanupId);
   bool HydrateFromTraktPublic(const std::string& id,
                               int season,
                               int episode,
@@ -134,6 +154,7 @@ private:
 
   // State
   bool m_initialized{false};
+  bool m_announcerRegistered{false};
   bool m_scrobbleActive{false};
   bool m_scrobblePaused{false};
 
@@ -149,6 +170,9 @@ private:
   // Content info
   std::string m_imdbId;
   std::string m_traktSlug;
+  std::string m_canonicalProvider;
+  std::string m_canonicalId;
+  std::string m_canonicalMediaType;
   std::string m_title;
   std::string m_episodeTitle;
   std::string m_logoUrl;
@@ -157,6 +181,16 @@ private:
   int m_season{-1};
   int m_episode{-1};
   bool m_contentIdentified{false};
+  bool m_sourceClaimResolved{false};
+  bool m_sourceClaimAuthorized{false};
+  bool m_sourceClaimStartPending{false};
+  bool m_playbackActive{false};
+  KODI::JUMPGATE::CJumpgatePlaybackAuthority m_playbackCallbackAuthority;
+  uint64_t m_contentAuthorityGeneration{0};
+  uint64_t m_playbackGeneration{0};
+  uint64_t m_playbackAttemptToken{0};
+  uint64_t m_playbackCallbackAuthorityToken{0};
+  int64_t m_lastSourceClaimStartAttemptTime{0};
 
   // URL from intent for URL-based identification
   std::string m_mediaUrl;
@@ -174,10 +208,9 @@ private:
 
   // Bridge resume data (from /identify response)
   // std::atomic for lock-free access from XBMCApp (F-009 fix)
-  std::atomic<int> m_bridgeResumePositionMs{0};
+  std::atomic<int64_t> m_bridgeResumePositionMs{0};
 
   // Periodic scrobble progress update (keeps Trakt /users/me/watching fresh)
-  int64_t m_lastScrobbleUpdateTime{0};
   static constexpr int SCROBBLE_UPDATE_INTERVAL_SEC = 10;
 
   // Deferred content identification retry
@@ -202,6 +235,10 @@ private:
   static constexpr const char* BRIDGE_CLOUD_URL = "https://jumpgate-bridge.fly.dev";
   static constexpr const char* BRIDGE_LOCAL_URL = "http://127.0.0.1:7515";
 
+  std::shared_ptr<std::recursive_mutex> m_serviceIoMutex;
   std::mutex m_lifecycleMutex;
+  std::mutex m_dispatcherMutex;
   mutable CCriticalSection m_critSection;
+  std::shared_ptr<KODI::JUMPGATE::CJumpgateScrobbleStartCoordinator> m_scrobbleStartCoordinator;
+  std::unique_ptr<KODI::JUMPGATE::CJumpgateScrobbleDispatcher> m_scrobbleDispatcher;
 };

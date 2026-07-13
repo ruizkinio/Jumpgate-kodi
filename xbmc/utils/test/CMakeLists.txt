@@ -24,7 +24,23 @@ set(SOURCES TestAlarmClock.cpp
             TestJobManager.cpp
             TestJSONVariantParser.cpp
             TestJSONVariantWriter.cpp
+            TestJumpgateApplicationLifecycleStatic.cpp
+            TestJumpgateGuiMessageRemoval.cpp
+            TestJumpgatePlaybackAttemptState.cpp
+            TestJumpgatePlaybackHistory.cpp
+            TestJumpgatePlaybackHistoryState.cpp
+            TestJumpgatePlaybackResultState.cpp
+            TestJumpgatePlaybackRetry.cpp
+            TestJumpgatePlaybackClaimClient.cpp
+            TestJumpgatePlaybackClaimCoordinator.cpp
+            TestJumpgatePlaybackContext.cpp
+            TestJumpgatePlaybackAuthority.cpp
+            TestJumpgateScrobbleStartCoordinator.cpp
+            TestJumpgateScrobbleDispatcher.cpp
+            TestJumpgateShutdownCoordinator.cpp
             TestJumpgateProfileRuntime.cpp
+            TestJumpgateProfileHistoryPolicy.cpp
+            TestUPnPPlayerOpenPublication.cpp
             TestJumpgateProfileStore.cpp
             TestJumpgateSourceFingerprint.cpp
             TestLabelFormatter.cpp

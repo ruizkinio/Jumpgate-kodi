@@ -71,6 +71,7 @@ namespace XFILE
       void SetAcceptEncoding(const std::string& encoding) { m_acceptencoding = encoding; }
       void SetAcceptCharset(const std::string& charset) { m_acceptCharset = charset; }
       void SetTimeout(int connecttimeout) { m_connecttimeout = connecttimeout; }
+      void SetTotalTimeout(int timeout) { m_totaltimeout = timeout; }
       void SetLowSpeedTime(int lowspeedtime) { m_lowspeedtime = lowspeedtime; }
       void SetPostData(const std::string& postdata) { m_postdata = postdata; }
       void SetReferer(const std::string& referer) { m_referer = referer; }
@@ -180,6 +181,7 @@ namespace XFILE
       std::string m_cipherlist;
       bool m_ftppasvip;
       int m_connecttimeout;
+      int m_totaltimeout;
       int m_redirectlimit;
       int m_lowspeedtime;
       bool m_opened;

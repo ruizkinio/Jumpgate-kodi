@@ -38,6 +38,20 @@ set(SOURCES ActorProtocol.cpp
             InfoLoader.cpp
             JSONVariantParser.cpp
             JSONVariantWriter.cpp
+            JumpgatePlaybackAttemptState.cpp
+            JumpgatePlaybackHistory.cpp
+            JumpgatePlaybackHistoryState.cpp
+            JumpgatePlaybackResultState.cpp
+            JumpgatePlaybackRetry.cpp
+            JumpgatePlaybackClaimClient.cpp
+            JumpgatePlaybackClaimCoordinator.cpp
+            JumpgatePlaybackContext.cpp
+            JumpgatePlaybackAuthority.cpp
+            JumpgateScrobbleStartCoordinator.cpp
+            JumpgateScrobbleDispatcher.cpp
+            JumpgateThreadRegistry.cpp
+            JumpgateShutdownCoordinator.cpp
+            JumpgateProfileHistoryPolicy.cpp
             JumpgateProfileRuntime.cpp
             JumpgateProfileStore.cpp
             JumpgateSourceFingerprint.cpp
@@ -137,6 +151,20 @@ set(HEADERS ActorProtocol.h
             IXmlDeserializable.h
             JSONVariantParser.h
             JSONVariantWriter.h
+            JumpgatePlaybackAttemptState.h
+            JumpgatePlaybackHistory.h
+            JumpgatePlaybackHistoryState.h
+            JumpgatePlaybackResultState.h
+            JumpgatePlaybackRetry.h
+            JumpgatePlaybackClaimClient.h
+            JumpgatePlaybackClaimCoordinator.h
+            JumpgatePlaybackContext.h
+            JumpgatePlaybackAuthority.h
+            JumpgateScrobbleStartCoordinator.h
+            JumpgateScrobbleDispatcher.h
+            JumpgateThreadRegistry.h
+            JumpgateShutdownCoordinator.h
+            JumpgateProfileHistoryPolicy.h
             JumpgateProfileRuntime.h
             JumpgateProfileStore.h
             JumpgateSourceFingerprint.h

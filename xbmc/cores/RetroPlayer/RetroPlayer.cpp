@@ -199,8 +199,9 @@ bool CRetroPlayer::OpenFile(const CFileItem& file, const CPlayerOptions& options
     CreatePlayback(savestatePath);
     RegisterWindowCallbacks();
     m_playbackControl = std::make_unique<CGUIPlaybackControl>(*this);
-    m_callback.OnPlayBackStarted(fileCopy);
-    m_callback.OnAVStarted(fileCopy);
+    m_fileItem = std::make_unique<CFileItem>(fileCopy);
+    m_callback.OnPlayBackStarted(*m_fileItem);
+    m_callback.OnAVStarted(*m_fileItem);
     if (!bStandalone)
       m_autoSave = std::make_unique<CRetroPlayerAutoSave>(*this, m_gameServices.GameSettings());
 
@@ -265,7 +266,13 @@ bool CRetroPlayer::CloseFile(bool reopen /* = false */)
   }
   m_processInfo.reset();
   CLog::Log(LOGDEBUG, "RetroPlayer[PLAYER]: Playback ended");
-  m_callback.OnPlayBackEnded();
+  if (m_fileItem)
+  {
+    m_callback.OnPlayBackEndedWithItem(*m_fileItem);
+    m_fileItem.reset();
+  }
+  else
+    m_callback.OnPlayBackEnded();
 
   return true;
 }

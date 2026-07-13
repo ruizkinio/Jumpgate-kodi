@@ -90,91 +90,95 @@ std::string CJumpgateProfileRuntime::GetPairingOrigin() const
   return m_document.pairingOrigin;
 }
 
-bool CJumpgateProfileRuntime::StorePairingResponse(const CVariant& response,
-                                                   const std::string& expectedOrigin,
-                                                   bool allowInsecureLoopback,
-                                                   int64_t now,
-                                                   std::string& error)
+ProfileMutationResult CJumpgateProfileRuntime::StorePairingResponse(
+    const CVariant& response,
+    const std::string& expectedOrigin,
+    bool allowInsecureLoopback,
+    int64_t now,
+    std::string& error)
 {
   std::lock_guard<std::mutex> lock(m_mutex);
   error.clear();
   if (!EnsureInitializedLocked(error))
-    return false;
+    return {ProfileMutationStatus::NotCommitted};
 
   std::string normalizedExpectedOrigin;
   if (!NormalizePairingOrigin(expectedOrigin, allowInsecureLoopback, normalizedExpectedOrigin))
   {
     error = "captured pairing origin is invalid";
-    return false;
+    return {ProfileMutationStatus::NotCommitted};
   }
 
   PairingPayload payload;
   if (!ParsePairingPayload(response, allowInsecureLoopback, payload, error))
-    return false;
+    return {ProfileMutationStatus::NotCommitted};
   if (payload.bridgeOrigin != normalizedExpectedOrigin)
   {
     payload.ClearSecrets();
     error = "pairing response origin does not match the captured pairing origin";
-    return false;
+    return {ProfileMutationStatus::NotCommitted};
   }
 
   const bool stored = m_store.StorePairing(m_document, payload, now, error);
   payload.ClearSecrets();
   if (!stored)
-    return false;
+    return {ProfileMutationStatus::NotCommitted};
   return RefreshAfterMutationLocked(error);
 }
 
-bool CJumpgateProfileRuntime::SelectActive(const std::string& profileId, std::string& error)
+ProfileMutationResult CJumpgateProfileRuntime::SelectActive(const std::string& profileId,
+                                                            std::string& error)
 {
   std::lock_guard<std::mutex> lock(m_mutex);
   error.clear();
   if (!EnsureInitializedLocked(error) || !m_store.SelectActive(m_document, profileId, error))
-    return false;
+    return {ProfileMutationStatus::NotCommitted};
   return RefreshAfterMutationLocked(error);
 }
 
-bool CJumpgateProfileRuntime::ClearActive(std::string& error)
+ProfileMutationResult CJumpgateProfileRuntime::ClearActive(std::string& error)
 {
   std::lock_guard<std::mutex> lock(m_mutex);
   error.clear();
   if (!EnsureInitializedLocked(error) || !m_store.ClearActive(m_document, error))
-    return false;
+    return {ProfileMutationStatus::NotCommitted};
   return RefreshAfterMutationLocked(error);
 }
 
-bool CJumpgateProfileRuntime::ForgetLocal(const std::string& profileId,
-                                          const std::string& deviceId,
-                                          std::string& error)
+ForgetLocalResult CJumpgateProfileRuntime::ForgetLocal(const std::string& profileId,
+                                                       const std::string& deviceId,
+                                                       std::string& error)
 {
   std::lock_guard<std::mutex> lock(m_mutex);
   error.clear();
   if (!EnsureInitializedLocked(error) ||
       !m_store.ForgetLocal(m_document, profileId, deviceId, error))
-    return false;
+  {
+    return {ProfileMutationStatus::NotCommitted};
+  }
   return RefreshAfterMutationLocked(error);
 }
 
-bool CJumpgateProfileRuntime::SetActiveSetting(const std::string& key,
-                                               const CVariant& value,
-                                               std::string& error)
+ProfileMutationResult CJumpgateProfileRuntime::SetActiveSetting(const std::string& key,
+                                                                const CVariant& value,
+                                                                std::string& error)
 {
   std::lock_guard<std::mutex> lock(m_mutex);
   error.clear();
   if (!EnsureInitializedLocked(error) || !m_store.SetActiveSetting(m_document, key, value, error))
-    return false;
+    return {ProfileMutationStatus::NotCommitted};
   return RefreshAfterMutationLocked(error);
 }
 
-bool CJumpgateProfileRuntime::SetPairingOrigin(const std::string& origin,
-                                               bool allowInsecureLoopback,
-                                               std::string& error)
+ProfileMutationResult CJumpgateProfileRuntime::SetPairingOrigin(const std::string& origin,
+                                                                bool allowInsecureLoopback,
+                                                                std::string& error)
 {
   std::lock_guard<std::mutex> lock(m_mutex);
   error.clear();
   if (!EnsureInitializedLocked(error) ||
       !m_store.SetPairingOrigin(m_document, origin, allowInsecureLoopback, error))
-    return false;
+    return {ProfileMutationStatus::NotCommitted};
   return RefreshAfterMutationLocked(error);
 }
 
@@ -214,17 +218,17 @@ bool CJumpgateProfileRuntime::RefreshActiveLocked(std::string& error)
   return loaded;
 }
 
-bool CJumpgateProfileRuntime::RefreshAfterMutationLocked(std::string& error)
+ProfileMutationResult CJumpgateProfileRuntime::RefreshAfterMutationLocked(std::string& error)
 {
   const std::string mutationMessage = error;
   std::string refreshError;
   if (!RefreshActiveLocked(refreshError))
   {
     error = std::move(refreshError);
-    return false;
+    return {ProfileMutationStatus::CommittedRefreshFailed};
   }
   error = mutationMessage;
-  return true;
+  return {ProfileMutationStatus::Committed};
 }
 
 } // namespace KODI::JUMPGATE

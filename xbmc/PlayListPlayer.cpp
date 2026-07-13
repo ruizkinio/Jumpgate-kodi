@@ -43,6 +43,8 @@
 #include "video/VideoDatabase.h"
 #include "video/VideoFileItemClassify.h"
 
+#include <memory>
+
 using namespace KODI::MESSAGING;
 using namespace KODI::VIDEO;
 
@@ -953,9 +955,11 @@ void PLAYLIST::CPlayListPlayer::OnApplicationMessage(KODI::MESSAGING::ThreadMess
           Reset();
       }
 
-      CFileItem *item = static_cast<CFileItem*>(pMsg->lpVoid);
-      g_application.PlayFile(*item, "", pMsg->param1 != 0);
-      delete item;
+      std::unique_ptr<CFileItem> item{static_cast<CFileItem*>(pMsg->lpVoid)};
+      const bool jumpgateAdmission = item->HasProperty("jumpgate.playback_token");
+      const bool opened = g_application.PlayFile(*item, "", pMsg->param1 != 0);
+      if (jumpgateAdmission)
+        pMsg->SetResult(opened ? 1 : 0);
       return;
     }
 

@@ -126,6 +126,11 @@ public:
             std::string& error) override
   {
     std::lock_guard<std::mutex> lock(m_mutex);
+    if (m_failLoad)
+    {
+      error = "simulated credential read failure";
+      return false;
+    }
     const auto it = m_records.find(credentialRef);
     if (it == m_records.end() || it->second.profileId != profileId ||
         it->second.deviceId != deviceId)
@@ -150,9 +155,16 @@ public:
     return m_records.size();
   }
 
+  void SetFailLoad(bool fail)
+  {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_failLoad = fail;
+  }
+
 private:
   mutable std::mutex m_mutex;
   int m_sequence{0};
+  bool m_failLoad{false};
   std::map<std::string, Record> m_records;
 };
 
@@ -186,8 +198,10 @@ bool StorePair(CJumpgateProfileRuntime& runtime,
                int64_t now,
                std::string& error)
 {
-  return runtime.StorePairingResponse(PairingResponse(profileId, deviceId, token, config), ORIGIN,
-                                      false, now, error);
+  return runtime
+      .StorePairingResponse(PairingResponse(profileId, deviceId, token, config), ORIGIN, false, now,
+                            error)
+      .IsCommitted();
 }
 
 } // namespace
@@ -268,13 +282,35 @@ TEST(TestJumpgateProfileRuntime, FailedMutationPreservesDocumentAndActiveSnapsho
   const std::string beforeBytes = storage.Contents();
 
   storage.SetFailWrite(true);
-  EXPECT_FALSE(runtime.SetActiveSetting("trakt_enabled", CVariant{false}, error));
+  const ProfileMutationResult result =
+      runtime.SetActiveSetting("trakt_enabled", CVariant{false}, error);
+  EXPECT_EQ(result.status, ProfileMutationStatus::NotCommitted);
+  EXPECT_FALSE(result.IsCommitted());
   const ActiveProfile after = runtime.GetActive();
   const ProfileDocument afterDocument = runtime.GetDocument();
   EXPECT_EQ(after.deviceToken, before.deviceToken);
   EXPECT_EQ(after.traktEnabled, before.traktEnabled);
   EXPECT_EQ(afterDocument.profiles[0].settings, beforeDocument.profiles[0].settings);
   EXPECT_EQ(storage.Contents(), beforeBytes);
+}
+
+TEST(TestJumpgateProfileRuntime, PairAndSelectFailuresReportNotCommitted)
+{
+  RuntimeProfileStorage storage;
+  RuntimeCredentialStore credentials;
+  CJumpgateProfileRuntime runtime(storage, credentials);
+  std::string error;
+  ASSERT_TRUE(runtime.Initialize(error)) << error;
+
+  const ProfileMutationResult invalidPair =
+      runtime.StorePairingResponse(PairingResponse(PROFILE_A, DEVICE_A, TOKEN_A, CONFIG_A),
+                                   "https://wrong.example", false, 1, error);
+  EXPECT_EQ(invalidPair.status, ProfileMutationStatus::NotCommitted);
+  EXPECT_TRUE(runtime.GetProfiles().empty());
+
+  const ProfileMutationResult missingSelect = runtime.SelectActive(PROFILE_A, error);
+  EXPECT_EQ(missingSelect.status, ProfileMutationStatus::NotCommitted);
+  EXPECT_FALSE(runtime.GetActive().selected);
 }
 
 TEST(TestJumpgateProfileRuntime, ReloadFailureClearsCachedActiveSecrets)
@@ -308,12 +344,97 @@ TEST(TestJumpgateProfileRuntime, MutationsRefreshActiveAndMetadataSnapshots)
   ASSERT_TRUE(runtime.SetPairingOrigin("https://pairing.example", false, error)) << error;
   EXPECT_EQ(runtime.GetPairingOrigin(), "https://pairing.example");
 
-  ASSERT_TRUE(runtime.ForgetLocal(PROFILE_A, DEVICE_A, error)) << error;
+  ASSERT_TRUE(runtime.ForgetLocal(PROFILE_A, DEVICE_A, error).IsFullyApplied()) << error;
   EXPECT_FALSE(runtime.GetActive().selected);
   const std::vector<ProfileMetadata> profiles = runtime.GetProfiles();
   ASSERT_EQ(profiles.size(), 1u);
   EXPECT_EQ(profiles[0].profileId, PROFILE_B);
   EXPECT_EQ(credentials.Size(), 1u);
+}
+
+TEST(TestJumpgateProfileRuntime, ForgetReportsCommittedWhenPostCommitRefreshFails)
+{
+  RuntimeProfileStorage storage;
+  RuntimeCredentialStore credentials;
+  CJumpgateProfileRuntime runtime(storage, credentials);
+  std::string error;
+  ASSERT_TRUE(StorePair(runtime, PROFILE_A, DEVICE_A, TOKEN_A, CONFIG_A, 1, error)) << error;
+  ASSERT_TRUE(StorePair(runtime, PROFILE_B, DEVICE_B, TOKEN_B, CONFIG_B, 2, error)) << error;
+  ASSERT_TRUE(runtime.SelectActive(PROFILE_A, error)) << error;
+
+  credentials.SetFailLoad(true);
+  const ForgetLocalResult result = runtime.ForgetLocal(PROFILE_B, DEVICE_B, error);
+  EXPECT_EQ(result.status, ForgetLocalStatus::CommittedRefreshFailed);
+  EXPECT_TRUE(result.IsCommitted());
+  EXPECT_FALSE(result.IsFullyApplied());
+  EXPECT_EQ(error, "simulated credential read failure");
+  EXPECT_TRUE(runtime.GetActive().deviceToken.empty());
+  ASSERT_EQ(runtime.GetProfiles().size(), 1u);
+  EXPECT_EQ(runtime.GetProfiles().front().profileId, PROFILE_A);
+
+  credentials.SetFailLoad(false);
+  ASSERT_TRUE(runtime.Reload(error)) << error;
+  EXPECT_EQ(runtime.GetActive().profileId, PROFILE_A);
+}
+
+TEST(TestJumpgateProfileRuntime, EveryMutationReportsCommittedRefreshFailure)
+{
+  const auto expectRefreshFailure = [](auto mutation)
+  {
+    RuntimeProfileStorage storage;
+    RuntimeCredentialStore credentials;
+    CJumpgateProfileRuntime runtime(storage, credentials);
+    std::string error;
+    ASSERT_TRUE(StorePair(runtime, PROFILE_A, DEVICE_A, TOKEN_A, CONFIG_A, 1, error)) << error;
+    ASSERT_TRUE(StorePair(runtime, PROFILE_B, DEVICE_B, TOKEN_B, CONFIG_B, 2, error)) << error;
+    credentials.SetFailLoad(true);
+
+    const ProfileMutationResult result = mutation(runtime, error);
+    EXPECT_EQ(result.status, ProfileMutationStatus::CommittedRefreshFailed);
+    EXPECT_TRUE(result.IsCommitted());
+    EXPECT_FALSE(result.IsFullyApplied());
+    EXPECT_EQ(error, "simulated credential read failure");
+  };
+
+  expectRefreshFailure([](auto& runtime, auto& error)
+                       { return runtime.SelectActive(PROFILE_A, error); });
+  expectRefreshFailure(
+      [](auto& runtime, auto& error)
+      { return runtime.SetActiveSetting("trakt_enabled", CVariant{false}, error); });
+  expectRefreshFailure(
+      [](auto& runtime, auto& error)
+      { return runtime.SetPairingOrigin("https://pairing.example", false, error); });
+}
+
+TEST(TestJumpgateProfileRuntime, ClearActiveReturnsStructuredCommittedOutcome)
+{
+  RuntimeProfileStorage storage;
+  RuntimeCredentialStore credentials;
+  CJumpgateProfileRuntime runtime(storage, credentials);
+  std::string error;
+  ASSERT_TRUE(StorePair(runtime, PROFILE_A, DEVICE_A, TOKEN_A, CONFIG_A, 1, error)) << error;
+
+  const ProfileMutationResult result = runtime.ClearActive(error);
+  EXPECT_EQ(result.status, ProfileMutationStatus::Committed);
+  EXPECT_TRUE(result.IsFullyApplied());
+  EXPECT_FALSE(runtime.GetActive().selected);
+}
+
+TEST(TestJumpgateProfileRuntime, PairingReportsCommittedRefreshFailure)
+{
+  RuntimeProfileStorage storage;
+  RuntimeCredentialStore credentials;
+  CJumpgateProfileRuntime runtime(storage, credentials);
+  std::string error;
+  ASSERT_TRUE(StorePair(runtime, PROFILE_A, DEVICE_A, TOKEN_A, CONFIG_A, 1, error)) << error;
+  credentials.SetFailLoad(true);
+
+  const ProfileMutationResult result = runtime.StorePairingResponse(
+      PairingResponse(PROFILE_B, DEVICE_B, TOKEN_B, CONFIG_B), ORIGIN, false, 2, error);
+  EXPECT_EQ(result.status, ProfileMutationStatus::CommittedRefreshFailed);
+  EXPECT_TRUE(result.IsCommitted());
+  ASSERT_EQ(runtime.GetProfiles().size(), 2u);
+  EXPECT_EQ(runtime.GetDocument().activeProfileId, PROFILE_B);
 }
 
 TEST(TestJumpgateProfileRuntime, ConcurrentReadsAndMutationsRemainConsistent)

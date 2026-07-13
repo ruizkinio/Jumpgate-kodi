@@ -1680,7 +1680,8 @@ void CGUIWindowManager::DispatchThreadMessages()
   }
 }
 
-int CGUIWindowManager::RemoveThreadMessageByMessageIds(const int* pMessageIDList)
+int CGUIWindowManager::RemoveThreadMessageByMessageIds(const int* pMessageIDList,
+                                                       std::vector<CGUIMessage>* removedMessages)
 {
   std::unique_lock lock(m_critSection);
   int removedMsgCount = 0;
@@ -1694,6 +1695,8 @@ int CGUIWindowManager::RemoveThreadMessageByMessageIds(const int* pMessageIDList
         break;
     if (*pMsgID)
     {
+      if (removedMessages)
+        removedMessages->emplace_back(*pMsg);
       it = m_vecThreadMessages.erase(it);
       delete pMsg;
       ++removedMsgCount;
