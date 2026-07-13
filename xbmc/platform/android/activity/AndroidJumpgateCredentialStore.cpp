@@ -20,18 +20,19 @@ namespace KODI::JUMPGATE
 {
 namespace
 {
-constexpr const char* PROFILE_NAMESPACE = "jumpgate.profile";
+const std::string PROFILE_NAMESPACE = "jumpgate.profile";
 
 jhclass CredentialStoreClass()
 {
-  const std::string className = std::string(CCompileInfo::GetClass()) + "/JumpgateCredentialStore";
-  return CJNIContext::getClassLoader().loadClass(GetDotClassName(className));
+  const std::string className =
+      std::string(CCompileInfo::GetPackage()) + ".JumpgateCredentialStore";
+  return CJNIContext::getClassLoader().loadClass(className);
 }
 
 jhobject ActivityContext()
 {
   CJNIMainActivity* activity = CJNIMainActivity::GetAppInstance();
-  return activity ? activity->get_raw() : jhobject{};
+  return activity ? activity->CJNIContext::get_raw() : jhobject{};
 }
 
 } // namespace
