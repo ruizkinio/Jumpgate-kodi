@@ -294,6 +294,9 @@ fi
 if find "$abi_root" -mindepth 1 -maxdepth 1 -type f ! -name '*.so' -print -quit | grep -q .; then
   fail 'APK ABI directory contains a non-library file'
 fi
+if find "$extract_dir" -type f -name 'libshairplay.so*' -print -quit | grep -q .; then
+  fail 'APK must not bundle Shairplay after static linkage'
+fi
 
 mapfile -d '' -t shared_libraries < <(
   find "$abi_root" -mindepth 1 -maxdepth 1 -type f -name '*.so' -print0 | LC_ALL=C sort -z

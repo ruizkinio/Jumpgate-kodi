@@ -152,7 +152,12 @@ foreach(library IN LISTS LIBRARY_FILES)
 endforeach()
 
 if(TARGET ${APP_NAME_LC}::Shairplay)
-  add_bundle_file(${APP_NAME_LC}::Shairplay ${libdir} "")
+  get_target_property(shairplay_location ${APP_NAME_LC}::Shairplay IMPORTED_LOCATION)
+  if(shairplay_location MATCHES "\\.so(\\..+)?$")
+    add_bundle_file(${APP_NAME_LC}::Shairplay ${libdir} "")
+  elseif(NOT shairplay_location MATCHES "\\.a$")
+    message(FATAL_ERROR "Unsupported Shairplay library type: ${shairplay_location}")
+  endif()
 endif()
 
 # Main targets from Makefile.in

@@ -601,6 +601,18 @@ non_library_apk="$work_dir/non-library.apk"
 make_apk "$non_library" "$non_library_apk"
 expect_failure non-library "$non_library_apk" arm64-v8a
 
+bundled_shairplay="$work_dir/bundled-shairplay"
+copy_fixture "$base_arm64" "$bundled_shairplay"
+cp "$base_arm64/lib/arm64-v8a/libhelper.so" \
+  "$bundled_shairplay/lib/arm64-v8a/libshairplay.so"
+bundled_shairplay_apk="$work_dir/bundled-shairplay.apk"
+make_apk "$bundled_shairplay" "$bundled_shairplay_apk"
+expect_failure_reason \
+  bundled-shairplay \
+  "$bundled_shairplay_apk" \
+  arm64-v8a \
+  'must not bundle Shairplay'
+
 missing_core="$work_dir/missing-core"
 copy_fixture "$base_arm64" "$missing_core"
 rm "$missing_core/lib/arm64-v8a/libkodi.so"

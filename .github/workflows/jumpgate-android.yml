@@ -302,7 +302,8 @@ jobs:
           test "$target_platform" = "$expected_target_platform"
 
           if [[ -f "$DEPENDS_STATE_DIR/native.complete" &&
-                -f "$DEPENDS_STATE_DIR/target.complete" ]]; then
+                -f "$DEPENDS_STATE_DIR/target.complete" ]] &&
+              grep -Fxq "native=$native_platform" "$DEPENDS_STATE_DIR/native.complete"; then
             install -m 0644 "$DEPENDS_STATE_DIR/native.complete" \
               "tools/depends/native/.installed-$native_platform"
             install -m 0644 "$DEPENDS_STATE_DIR/target.complete" \
@@ -313,25 +314,52 @@ jobs:
 
       - name: Build tools and dependencies
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
+          trap 'status=$?; echo "::error file=.github/workflows/jumpgate-android.yml::Dependency validation failed at line $LINENO: $BASH_COMMAND (exit $status)" >&2; exit "$status"' ERR
+          fail() {
+            echo "::error file=.github/workflows/jumpgate-android.yml::$*" >&2
+            exit 1
+          }
+          require_file() {
+            [[ -f "$1" ]] || {
+              echo "Missing required file: $1" >&2
+              find "$(dirname "$1")" -maxdepth 1 -mindepth 1 -printf '%f\n' 2>/dev/null | LC_ALL=C sort >&2 || true
+              fail "$2"
+            }
+          }
+          require_nonempty() {
+            [[ -s "$1" ]] || fail "$2: $1"
+          }
+          require_executable() {
+            [[ -x "$1" ]] || fail "$2: $1"
+          }
+          require_equal() {
+            [[ "$1" == "$2" ]] || fail "$3 (expected '$2', found '$1')"
+          }
           make -C tools/depends -j"$(getconf _NPROCESSORS_ONLN)"
 
           native_platform="$(awk -F= '$1 == "NATIVEPLATFORM" { print $2 }' tools/depends/Makefile.include)"
           target_platform="$(awk -F= '$1 == "PLATFORM" { print $2 }' tools/depends/Makefile.include)"
           ndk_level="$(awk -F= '$1 == "NDK_LEVEL" { print $2 }' tools/depends/Makefile.include)"
-          [[ "$ndk_level" =~ ^[0-9]+$ ]]
-          test "$ndk_level" = "$ANDROID_MIN_SDK_VERSION"
-          test "$target_platform" = "${{ matrix.host }}-${ndk_level}-release"
+          [[ "$ndk_level" =~ ^[0-9]+$ ]] || fail "Invalid configured NDK level: '$ndk_level'"
+          require_equal "$ndk_level" "$ANDROID_MIN_SDK_VERSION" 'Configured NDK level mismatch'
+          require_equal \
+            "$target_platform" \
+            "${{ matrix.host }}-${ndk_level}-release" \
+            'Configured target platform mismatch'
+          echo "Validated dependency platforms: native=$native_platform target=$target_platform"
           shairplay_archive="$DEPENDS_PREFIX/$target_platform/lib/libshairplay.a"
           shairplay_lib_dir="$(dirname "$shairplay_archive")"
           llvm_ar="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
           llvm_nm="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
-          test -s "$shairplay_archive"
-          test -x "$llvm_ar"
-          test -x "$llvm_nm"
+          require_nonempty "$shairplay_archive" 'Static Shairplay archive is missing or empty'
+          require_executable "$llvm_ar" 'NDK llvm-ar is unavailable'
+          require_executable "$llvm_nm" 'NDK llvm-nm is unavailable'
 
           "$llvm_ar" t "$shairplay_archive" > "$RUNNER_TEMP/shairplay-archive-members.txt"
-          test -s "$RUNNER_TEMP/shairplay-archive-members.txt"
+          require_nonempty \
+            "$RUNNER_TEMP/shairplay-archive-members.txt" \
+            'Static Shairplay archive has no members'
           if find "$shairplay_lib_dir" -maxdepth 1 \( -type f -o -type l \) \
               -name 'libshairplay.so*' -print -quit | grep -q .; then
             echo 'Unexpected installed libshairplay shared library:' >&2
@@ -340,41 +368,55 @@ jobs:
             exit 1
           fi
 
-          cat > "$RUNNER_TEMP/shairplay-required-symbols.txt" <<'EOF'
-          dnssd_destroy
-          dnssd_init
-          dnssd_register_airplay
-          dnssd_register_raop
-          dnssd_unregister_airplay
-          dnssd_unregister_raop
-          raop_destroy
-          raop_init
-          raop_init_from_keyfile
-          raop_is_running
-          raop_set_log_callback
-          raop_set_log_level
-          raop_start
-          raop_stop
+          cat > "$RUNNER_TEMP/shairplay-expected-symbol-owners.txt" <<'EOF'
+          dnssd_destroy libshairplay_la-dnssd.o
+          dnssd_init libshairplay_la-dnssd.o
+          dnssd_register_airplay libshairplay_la-dnssd.o
+          dnssd_register_raop libshairplay_la-dnssd.o
+          dnssd_unregister_airplay libshairplay_la-dnssd.o
+          dnssd_unregister_raop libshairplay_la-dnssd.o
+          raop_destroy libshairplay_la-raop.o
+          raop_init libshairplay_la-raop.o
+          raop_init_from_keyfile libshairplay_la-raop.o
+          raop_is_running libshairplay_la-raop.o
+          raop_set_log_callback libshairplay_la-raop.o
+          raop_set_log_level libshairplay_la-raop.o
+          raop_start libshairplay_la-raop.o
+          raop_stop libshairplay_la-raop.o
           EOF
-          "$llvm_nm" --defined-only --extern-only "$shairplay_archive" |
-            awk 'NF >= 2 && $(NF - 1) ~ /^[[:alpha:]]$/ { print $NF }' |
-            LC_ALL=C sort -u > "$RUNNER_TEMP/shairplay-global-defined-symbols.txt"
-          test -s "$RUNNER_TEMP/shairplay-global-defined-symbols.txt"
-          comm -23 \
-            "$RUNNER_TEMP/shairplay-required-symbols.txt" \
-            "$RUNNER_TEMP/shairplay-global-defined-symbols.txt" \
-            > "$RUNNER_TEMP/shairplay-missing-symbols.txt"
-          if [[ -s "$RUNNER_TEMP/shairplay-missing-symbols.txt" ]]; then
-            echo 'Missing required libshairplay symbols:' >&2
-            cat "$RUNNER_TEMP/shairplay-missing-symbols.txt" >&2
-            exit 1
+          "$llvm_nm" \
+            --format=posix \
+            --print-file-name \
+            --defined-only \
+            --extern-only \
+            "$shairplay_archive" > "$RUNNER_TEMP/shairplay-nm.txt"
+          require_nonempty "$RUNNER_TEMP/shairplay-nm.txt" 'Static Shairplay symbol table is empty'
+          awk '
+            NR == FNR { required[$1] = 1; next }
+            $1 ~ /\[[^][]+\]:$/ && ($2 in required) && $3 ~ /^[[:alpha:]]$/ {
+              owner = $1
+              sub(/^.*\[/, "", owner)
+              sub(/\]:$/, "", owner)
+              print $2 " " owner
+            }
+          ' \
+            "$RUNNER_TEMP/shairplay-expected-symbol-owners.txt" \
+            "$RUNNER_TEMP/shairplay-nm.txt" |
+            LC_ALL=C sort -u > "$RUNNER_TEMP/shairplay-actual-symbol-owners.txt"
+          if ! diff -u \
+              "$RUNNER_TEMP/shairplay-expected-symbol-owners.txt" \
+              "$RUNNER_TEMP/shairplay-actual-symbol-owners.txt"; then
+            fail 'Static Shairplay public symbol ownership is incomplete or unexpected'
           fi
-          test -f "tools/depends/native/.installed-$native_platform"
-          test -f "tools/depends/target/.installed-$target_platform"
-          install -m 0644 "tools/depends/native/.installed-$native_platform" \
-            "$DEPENDS_STATE_DIR/native.complete"
+          target_stamp="tools/depends/target/.installed-$target_platform"
+          require_file "$target_stamp" 'Kodi target dependency aggregate stamp is missing'
+          native_sentinel="$DEPENDS_STATE_DIR/native.complete.tmp"
+          printf 'native=%s\n' "$native_platform" > "$native_sentinel"
+          install -m 0644 "$native_sentinel" "$DEPENDS_STATE_DIR/native.complete"
+          rm -f "$native_sentinel"
           install -m 0644 "tools/depends/target/.installed-$target_platform" \
             "$DEPENDS_STATE_DIR/target.complete"
+          echo 'Static Shairplay and dependency cache sentinels validated.'
 
       - name: Configure and build Kodi Release APK
         run: |
