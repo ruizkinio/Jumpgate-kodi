@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<addon id="script.jumpgate.manager"
+       name="Jumpgate Manager"
+       version="0.2.5"
+       provider-name="Jumpgate">
+  <requires>
+    <import addon="xbmc.python" version="3.0.0"/>
+  </requires>
+  <extension point="xbmc.python.script" library="addon.py"/>
+  <extension point="xbmc.addon.metadata">
+    <assets>
+      <icon>icon.png</icon>
+    </assets>
+    <platform>android</platform>
+    <license>GPL-2.0-or-later</license>
+    <summary lang="en_GB">Pair and manage Jumpgate bridge profiles</summary>
+    <summary lang="en_US">Pair and manage Jumpgate bridge profiles</summary>
+    <description lang="en_GB">
+      Open the native Jumpgate manager from Kodi standalone mode to pair, switch, and forget isolated profiles for external-player mode.
+    </description>
+    <description lang="en_US">
+      Open the native Jumpgate manager from Kodi standalone mode to pair, switch, and forget isolated profiles for external-player mode.
+    </description>
+  </extension>
+</addon>

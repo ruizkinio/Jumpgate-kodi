@@ -23,11 +23,13 @@ import android.os.Handler;
 import android.os.Looper;
 import android.text.TextUtils;
 import android.util.Log;
+import android.util.LruCache;
 import android.util.TypedValue;
 import android.graphics.Color;
 import android.graphics.PixelFormat;
 import android.view.Choreographer;
 import android.view.Gravity;
+import android.view.KeyEvent;
 import android.view.View;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
@@ -40,8 +42,13 @@ import android.widget.TextView;
 import android.view.animation.LinearInterpolator;
 
 import java.io.InputStream;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.security.MessageDigest;
+import java.util.Arrays;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.Locale;
@@ -52,6 +59,21 @@ import java.util.regex.Pattern;
 public class Main extends NativeActivity implements Choreographer.FrameCallback
 {
   private static final String TAG = "@APP_NAME@";
+  private static final int OVERLAY_LOGO_CACHE_KB = 6 * 1024;
+  private static final long OVERLAY_LOGO_DISK_MAX_BYTES = 20L * 1024L * 1024L;
+  private static final int OVERLAY_LOGO_DISK_MAX_FILES = 96;
+  private static final long OVERLAY_LOGO_DISK_MAX_AGE_MS = 14L * 24L * 60L * 60L * 1000L;
+  private static final LruCache<String, Bitmap> sOverlayLogoCache = new LruCache<String, Bitmap>(OVERLAY_LOGO_CACHE_KB) {
+    @Override
+    protected int sizeOf(String key, Bitmap value) {
+      if (value == null) {
+        return 1;
+      }
+      int bytes = value.getByteCount();
+      int kb = bytes / 1024;
+      return kb > 0 ? kb : 1;
+    }
+  };
 
   public static Main MainActivity = null;
   public XBMCMainView mMainView = null;
@@ -66,6 +88,8 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
   private boolean mExternalPlayerMode = false;
   private long mLastPlaybackPosition = 0;  // ms
   private long mLastPlaybackDuration = 0;  // ms
+  private static final long EXTERNAL_BACK_LONG_PRESS_MS = 700L;
+  private boolean mExternalBackLongPressHandled = false;
 
   // Tracks whether we entered external player mode from an already-running standalone Kodi.
   // When true, exitExternalPlayerMode returns to standalone instead of killing the process.
@@ -119,6 +143,7 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
   native void _doFrame(long frameTimeNanos);
 
   native void _onVisibleBehindCanceled();
+  native void _requestOpenSettings();
 
   private Runnable leanbackUpdateRunnable = new Runnable()
   {
@@ -274,6 +299,7 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
     // standalone to external player mode. Track this so we return to standalone after playback.
     boolean isActionView = intent.getData() != null
             && Intent.ACTION_VIEW.equals(intent.getAction());
+    boolean wasAlreadyExternal = mExternalPlayerMode;
 
     // Show loading overlay for external player transitions
     if (isActionView)
@@ -286,7 +312,7 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
     if (mPaused)
     {
       Log.d(TAG, "Main: onNewIntent (delayed)");
-      if (isActionView)
+      if (isActionView && !wasAlreadyExternal)
       {
         mPendingWasStandalone = true;
       }
@@ -297,9 +323,12 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
       Log.d(TAG, "Main: onNewIntent (immediate)");
       if (isActionView)
       {
-        mWasStandalone = true;
+        if (!wasAlreadyExternal)
+        {
+          mWasStandalone = true;
+          Log.d(TAG, "Main: Warm transition to external player mode (standalone was running)");
+        }
         mExternalPlayerMode = true;
-        Log.d(TAG, "Main: Warm transition to external player mode (standalone was running)");
       }
       _onNewIntent(intent);
     }
@@ -393,6 +422,57 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
   {
     super.onActivityResult(requestCode, resultCode, resultData);
     _onActivityResult(requestCode, resultCode, resultData);
+  }
+
+  @Override
+  public boolean onKeyUp(int keyCode, KeyEvent event)
+  {
+    if (mExternalPlayerMode && keyCode == KeyEvent.KEYCODE_BACK)
+    {
+      long heldMs = event.getEventTime() - event.getDownTime();
+      if (mExternalBackLongPressHandled || heldMs >= EXTERNAL_BACK_LONG_PRESS_MS)
+      {
+        if (!mExternalBackLongPressHandled)
+          requestExternalSettingsFromBackLongPress("keyup " + heldMs + "ms");
+        mExternalBackLongPressHandled = false;
+        return true;
+      }
+      mExternalBackLongPressHandled = false;
+    }
+
+    return super.onKeyUp(keyCode, event);
+  }
+
+  @Override
+  public boolean onKeyDown(int keyCode, KeyEvent event)
+  {
+    if (mExternalPlayerMode && keyCode == KeyEvent.KEYCODE_BACK)
+    {
+      if (event.getRepeatCount() > 0)
+      {
+        if (!mExternalBackLongPressHandled)
+        {
+          requestExternalSettingsFromBackLongPress("keydown repeat=" + event.getRepeatCount());
+          mExternalBackLongPressHandled = true;
+        }
+        return true;
+      }
+    }
+
+    return super.onKeyDown(keyCode, event);
+  }
+
+  private void requestExternalSettingsFromBackLongPress(String source)
+  {
+    Log.d(TAG, "Main: Back long-press detected (" + source + "), opening settings");
+    try
+    {
+      _requestOpenSettings();
+    }
+    catch (UnsatisfiedLinkError e)
+    {
+      Log.e(TAG, "Main: Native settings request not registered", e);
+    }
   }
 
   @Override
@@ -511,12 +591,15 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
     result.putExtra("duration", (int) durationMs);
     result.putExtra("end_by", completed ? "playback_completion" : "user");
 
-    // Always return RESULT_OK with position data (VLC protocol standard).
-    // RESULT_CANCELED causes some apps (like Stremio) to discard position data.
-    // The "end_by" extra distinguishes completion vs user-stopped.
-    setResult(RESULT_OK, result);
+    // Distinguish stream-open failures from real playback stops.
+    // If playback never started (no position/duration and not completed),
+    // return RESULT_CANCELED so caller can avoid treating it as successful playback.
+    boolean failedToStart = !completed && positionMs <= 0 && durationMs <= 0;
+    result.putExtra("jumpgate_failed_to_start", failedToStart);
+    int resultCode = failedToStart ? RESULT_CANCELED : RESULT_OK;
+    setResult(resultCode, result);
 
-    if (wasStandalone || mWasStandalone) {
+    if (wasStandalone) {
       // Warm-transition: return to standalone Kodi.
       // setResult() delivers to the Splash instance waiting via startActivityForResult.
       // Do NOT finish Main (it stays alive as standalone Kodi).
@@ -916,7 +999,14 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
       title = getExtraString(intent, "title");
     }
     if (TextUtils.isEmpty(title)) {
-      title = extractTitleFromUri(intent != null ? intent.getData() : null);
+      String uriTitle = extractTitleFromUri(intent != null ? intent.getData() : null);
+      if (!TextUtils.isEmpty(uriTitle) && !isLikelyLowConfidenceUriTitle(uriTitle)) {
+        title = uriTitle;
+      }
+    }
+
+    if (!TextUtils.isEmpty(title) && isLikelyOpaqueTokenTitle(title)) {
+      title = "";
     }
 
     if (TextUtils.isEmpty(title)) {
@@ -993,6 +1083,166 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
     }
   }
 
+  private String hashOverlayLogoUrl(String rawUrl) {
+    try {
+      MessageDigest md = MessageDigest.getInstance("SHA-256");
+      byte[] digest = md.digest(rawUrl.getBytes("UTF-8"));
+      StringBuilder out = new StringBuilder(digest.length * 2);
+      for (byte b : digest) {
+        out.append(String.format(Locale.US, "%02x", b));
+      }
+      return out.toString();
+    } catch (Exception _e) {
+      return Integer.toHexString(rawUrl.hashCode());
+    }
+  }
+
+  private File getOverlayLogoCacheDir() {
+    try {
+      File dir = new File(getCacheDir(), "jumpgate_logo_cache");
+      if (!dir.exists() && !dir.mkdirs()) {
+        return null;
+      }
+      return dir;
+    } catch (Exception _e) {
+      return null;
+    }
+  }
+
+  private File getOverlayLogoDiskFile(String rawUrl) {
+    File dir = getOverlayLogoCacheDir();
+    if (dir == null) {
+      return null;
+    }
+    return new File(dir, hashOverlayLogoUrl(rawUrl) + ".png");
+  }
+
+  private Bitmap loadOverlayLogoFromDisk(String rawUrl) {
+    File cacheFile = getOverlayLogoDiskFile(rawUrl);
+    if (cacheFile == null || !cacheFile.exists() || !cacheFile.isFile()) {
+      return null;
+    }
+
+    long now = System.currentTimeMillis();
+    long ageMs = now - cacheFile.lastModified();
+    if (ageMs > OVERLAY_LOGO_DISK_MAX_AGE_MS) {
+      cacheFile.delete();
+      return null;
+    }
+
+    FileInputStream in = null;
+    try {
+      in = new FileInputStream(cacheFile);
+      BitmapFactory.Options opts = new BitmapFactory.Options();
+      opts.inPreferredConfig = Bitmap.Config.RGB_565;
+      opts.inDither = true;
+      Bitmap bmp = BitmapFactory.decodeStream(in, null, opts);
+      if (bmp != null) {
+        cacheFile.setLastModified(now);
+      }
+      return bmp;
+    } catch (Exception _e) {
+      return null;
+    } finally {
+      try {
+        if (in != null) in.close();
+      } catch (Exception _e) {}
+    }
+  }
+
+  private void pruneOverlayLogoDiskCache(File dir) {
+    if (dir == null) {
+      return;
+    }
+    File[] files = dir.listFiles();
+    if (files == null || files.length == 0) {
+      return;
+    }
+
+    final long now = System.currentTimeMillis();
+    long totalBytes = 0L;
+    int count = 0;
+
+    for (File f : files) {
+      if (f == null || !f.isFile()) {
+        continue;
+      }
+      long age = now - f.lastModified();
+      if (age > OVERLAY_LOGO_DISK_MAX_AGE_MS) {
+        f.delete();
+        continue;
+      }
+      totalBytes += Math.max(0L, f.length());
+      count++;
+    }
+
+    if (count <= OVERLAY_LOGO_DISK_MAX_FILES && totalBytes <= OVERLAY_LOGO_DISK_MAX_BYTES) {
+      return;
+    }
+
+    files = dir.listFiles();
+    if (files == null || files.length == 0) {
+      return;
+    }
+    Arrays.sort(files, (a, b) -> Long.compare(a.lastModified(), b.lastModified()));
+    for (File f : files) {
+      if (f == null || !f.isFile()) {
+        continue;
+      }
+      if (count <= OVERLAY_LOGO_DISK_MAX_FILES && totalBytes <= OVERLAY_LOGO_DISK_MAX_BYTES) {
+        break;
+      }
+      long len = Math.max(0L, f.length());
+      if (f.delete()) {
+        count--;
+        totalBytes = Math.max(0L, totalBytes - len);
+      }
+    }
+  }
+
+  private void saveOverlayLogoToDisk(String rawUrl, Bitmap bmp) {
+    if (bmp == null || bmp.isRecycled()) {
+      return;
+    }
+
+    File cacheFile = getOverlayLogoDiskFile(rawUrl);
+    if (cacheFile == null) {
+      return;
+    }
+    File dir = cacheFile.getParentFile();
+    if (dir == null) {
+      return;
+    }
+
+    File temp = new File(cacheFile.getAbsolutePath() + ".tmp");
+    FileOutputStream out = null;
+    try {
+      out = new FileOutputStream(temp, false);
+      if (!bmp.compress(Bitmap.CompressFormat.PNG, 100, out)) {
+        return;
+      }
+      out.flush();
+      if (cacheFile.exists()) {
+        cacheFile.delete();
+      }
+      if (!temp.renameTo(cacheFile)) {
+        temp.delete();
+        return;
+      }
+      cacheFile.setLastModified(System.currentTimeMillis());
+      pruneOverlayLogoDiskCache(dir);
+    } catch (Exception _e) {
+      // Non-critical best-effort cache write.
+    } finally {
+      try {
+        if (out != null) out.close();
+      } catch (Exception _e) {}
+      if (temp.exists() && !temp.equals(cacheFile)) {
+        temp.delete();
+      }
+    }
+  }
+
   private void loadOverlayLogo(String rawUrl, boolean isEpisode) {
     if (mOverlayLogoView == null) {
       return;
@@ -1008,9 +1258,35 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
       return;
     }
 
+    Bitmap cachedBmp = sOverlayLogoCache.get(url);
+    if (cachedBmp != null && !cachedBmp.isRecycled()) {
+      mOverlayLogoUrl = url;
+      mOverlayLogoRequestId++;
+      mOverlayLogoView.setImageBitmap(cachedBmp);
+      mOverlayLogoView.setVisibility(View.VISIBLE);
+      if (!isEpisode && mOverlayTitleText != null) {
+        mOverlayTitleText.setVisibility(View.GONE);
+      }
+      return;
+    }
+
+    Bitmap diskBmp = loadOverlayLogoFromDisk(url);
+    if (diskBmp != null && !diskBmp.isRecycled()) {
+      sOverlayLogoCache.put(url, diskBmp);
+      mOverlayLogoUrl = url;
+      mOverlayLogoRequestId++;
+      mOverlayLogoView.setImageBitmap(diskBmp);
+      mOverlayLogoView.setVisibility(View.VISIBLE);
+      if (!isEpisode && mOverlayTitleText != null) {
+        mOverlayTitleText.setVisibility(View.GONE);
+      }
+      return;
+    }
+
     mOverlayLogoUrl = url;
     mOverlayLogoRequestId++;
     final int reqId = mOverlayLogoRequestId;
+    final String loadedUrl = url;
 
     // Hide until actually loaded (prevents showing broken/empty placeholder).
     mOverlayLogoView.setVisibility(View.GONE);
@@ -1024,15 +1300,24 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
         conn.setConnectTimeout(2000);
         conn.setReadTimeout(3000);
         conn.setInstanceFollowRedirects(true);
+        conn.setUseCaches(true);
         conn.setRequestProperty("User-Agent", "Jumpgate");
+        conn.setRequestProperty("Accept", "image/webp,image/*,*/*;q=0.8");
 
         in = conn.getInputStream();
-        bmp = BitmapFactory.decodeStream(in);
+        BitmapFactory.Options opts = new BitmapFactory.Options();
+        opts.inPreferredConfig = Bitmap.Config.RGB_565;
+        opts.inDither = true;
+        bmp = BitmapFactory.decodeStream(in, null, opts);
       } catch (Exception _e) {
         bmp = null;
       } finally {
         try { if (in != null) in.close(); } catch (Exception _e) {}
         if (conn != null) conn.disconnect();
+      }
+
+      if (bmp != null) {
+        saveOverlayLogoToDisk(loadedUrl, bmp);
       }
 
       final Bitmap finalBmp = bmp;
@@ -1048,6 +1333,7 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
         }
 
         if (finalBmp != null) {
+          sOverlayLogoCache.put(loadedUrl, finalBmp);
           mOverlayLogoView.setImageBitmap(finalBmp);
           mOverlayLogoView.setVisibility(View.VISIBLE);
           if (!isEpisode && mOverlayTitleText != null) {
@@ -1232,6 +1518,21 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
         continue;
       }
 
+      if (token.matches("^\\d{1,2}$")) {
+        continue;
+      }
+
+      if (token.matches("(?i)^[A-Za-z]{4,}\\d{1,4}$")) {
+        continue;
+      }
+
+      if (token.matches("(?i)^[A-Za-z0-9]{8,}$")
+          && token.matches(".*\\d.*")
+          && token.matches(".*[A-Za-z].*")
+          && !token.matches("(?i).*[aeiou].*")) {
+        continue;
+      }
+
       if (token.length() == 1 && Character.isLetter(token.charAt(0))) {
         continue;
       }
@@ -1298,6 +1599,32 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
             return true;
           }
         }
+      }
+    }
+
+    return false;
+  }
+
+  private boolean isLikelyLowConfidenceUriTitle(String value) {
+    if (TextUtils.isEmpty(value)) {
+      return true;
+    }
+
+    String s = value.trim();
+    if (s.matches("(?i)^\\d{1,2}\\s+[a-z]{4,}\\d{1,4}$")) {
+      return true;
+    }
+
+    if (s.length() <= 10) {
+      String[] parts = s.split("\\s+");
+      int alphaWordCount = 0;
+      for (String part : parts) {
+        if (part.matches("(?i)^[a-z]{3,}$")) {
+          alphaWordCount++;
+        }
+      }
+      if (alphaWordCount == 0) {
+        return true;
       }
     }
 

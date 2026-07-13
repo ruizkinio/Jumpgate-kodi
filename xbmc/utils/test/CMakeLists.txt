@@ -24,6 +24,9 @@ set(SOURCES TestAlarmClock.cpp
             TestJobManager.cpp
             TestJSONVariantParser.cpp
             TestJSONVariantWriter.cpp
+            TestJumpgateProfileRuntime.cpp
+            TestJumpgateProfileStore.cpp
+            TestJumpgateSourceFingerprint.cpp
             TestLabelFormatter.cpp
             TestLangCodeExpander.cpp
             TestLocale.cpp

@@ -8,10 +8,10 @@
 
 #include "JumpgateThresholds.h"
 #include "ServiceBroker.h"
+#include "URL.h"
 #include "application/ApplicationComponents.h"
 #include "application/ApplicationPlayer.h"
 #include "dialogs/GUIDialogKaiToast.h"
-#include "URL.h"
 #include "filesystem/CurlFile.h"
 #include "filesystem/File.h"
 #include "filesystem/SpecialProtocol.h"
@@ -22,6 +22,7 @@
 #include "utils/Variant.h"
 #include "utils/log.h"
 
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <mutex>
@@ -41,6 +42,41 @@ int64_t GetCurrentTimeSec()
              std::chrono::system_clock::now().time_since_epoch())
       .count();
 }
+
+void ClearSensitive(std::string& value)
+{
+  std::fill(value.begin(), value.end(), '\0');
+  value.clear();
+}
+
+// Avoid leaking full URLs (which may include user identifiers or signed tokens) into logs.
+std::string RedactUrlForLog(const std::string& rawUrl)
+{
+  if (rawUrl.empty())
+    return "<empty>";
+
+  std::string s = rawUrl;
+
+  // Strip query/fragment.
+  size_t q = s.find('?');
+  if (q != std::string::npos)
+    s.resize(q);
+  size_t f = s.find('#');
+  if (f != std::string::npos)
+    s.resize(f);
+
+  // Keep origin only: scheme://host[:port]/<redacted>
+  size_t scheme = s.find("://");
+  if (scheme == std::string::npos)
+    return "<redacted>";
+
+  size_t hostStart = scheme + 3;
+  size_t pathStart = s.find('/', hostStart);
+  if (pathStart == std::string::npos)
+    return s + "/<redacted>";
+  return s.substr(0, pathStart) + "/<redacted>";
+}
+
 } // namespace
 
 TraktScrobbler::TraktScrobbler() = default;
@@ -52,17 +88,18 @@ TraktScrobbler::~TraktScrobbler()
 
 void TraktScrobbler::Initialize()
 {
+  std::scoped_lock lifecycleLock(m_lifecycleMutex);
   std::unique_lock lock(m_critSection);
   if (m_initialized)
     return;
 
-  // LoadTokens may do file I/O but only local files, not HTTP -- acceptable under lock
-  // during one-time initialization
-  LoadTokens();
-  m_bridgeUrl = BRIDGE_CLOUD_URL;
+  // Once the Jumpgate profile runtime has applied a mode, it is authoritative.
+  // Never revive an unrelated legacy plaintext token after a profile clear.
+  if (!m_profileRuntimeApplied && !m_bridgeProfileBacked)
+    LoadTokens();
+  if (m_bridgeUrl.empty())
+    m_bridgeUrl = BRIDGE_CLOUD_URL;
 
-  // Register announcer and mark initialized BEFORE releasing lock.
-  CServiceBroker::GetAnnouncementManager()->AddAnnouncer(this, ANNOUNCEMENT::Player);
   m_initialized = true;
   // Bridge detection deferred to first ProcessSlow call.
   // CCurlFile crashes (SIGABRT) when called from onNewIntent during early init because
@@ -71,17 +108,30 @@ void TraktScrobbler::Initialize()
   m_bridgeDetected = false;
   lock.unlock();
 
+  // Never call the announcement manager while holding m_critSection. Its dispatch path holds
+  // the manager lock while entering Announce(), so doing so would create an AB/BA lock order.
+  CServiceBroker::GetAnnouncementManager()->AddAnnouncer(this, ANNOUNCEMENT::Player);
+
   CLog::Log(LOGINFO, "TraktScrobbler: Initialized (bridge detection deferred to ProcessSlow)");
 }
 
 void TraktScrobbler::Deinitialize()
 {
+  std::scoped_lock lifecycleLock(m_lifecycleMutex);
   std::unique_lock lock(m_critSection);
   if (!m_initialized)
     return;
 
-  CServiceBroker::GetAnnouncementManager()->RemoveAnnouncer(this);
   m_initialized = false;
+  ++m_authAuthorityGeneration;
+  m_authInProgress = false;
+  ClearSensitive(m_deviceCode);
+  lock.unlock();
+
+  // Removal waits for any callback already copied by DoAnnounce(). Keep m_critSection released
+  // so such a callback can observe m_initialized == false and leave without a lock inversion.
+  CServiceBroker::GetAnnouncementManager()->RemoveAnnouncer(this);
+  lock.lock();
 
   // Check if we need to send a ScrobbleStop (F-008: clear "currently watching" on exit)
   bool shouldScrobbleStop = m_scrobbleActive && m_contentIdentified;
@@ -116,6 +166,7 @@ void TraktScrobbler::Deinitialize()
     {
       CLog::Log(LOGINFO, "TraktScrobbler: Deinitialize ScrobbleStop skipped (empty json or token)");
     }
+    ClearSensitive(accessToken);
   }
   else
   {
@@ -130,9 +181,9 @@ void TraktScrobbler::Deinitialize()
 // Pattern: copy state -> unlock -> I/O -> lock -> check-and-abort
 // ---------------------------------------------------------------------------
 void TraktScrobbler::Announce(AnnouncementFlag flag,
-                               const std::string& sender,
-                               const std::string& message,
-                               const CVariant& data)
+                              const std::string& sender,
+                              const std::string& message,
+                              const CVariant& data)
 {
   if (sender != CAnnouncementManager::ANNOUNCEMENT_SENDER)
     return;
@@ -141,6 +192,9 @@ void TraktScrobbler::Announce(AnnouncementFlag flag,
     return;
 
   std::unique_lock lock(m_critSection);
+
+  if (!m_initialized)
+    return;
 
   if (message == "OnPlay" || message == "OnResume")
   {
@@ -157,7 +211,7 @@ void TraktScrobbler::Announce(AnnouncementFlag flag,
       lock.lock();
 
       // Check-and-abort: if content changed during identification I/O
-      if (m_mediaUrl != urlSnapshot)
+      if (!m_initialized || m_mediaUrl != urlSnapshot)
       {
         CLog::Log(LOGINFO, "TraktScrobbler: Discarding stale identification (content changed)");
         return;
@@ -176,36 +230,44 @@ void TraktScrobbler::Announce(AnnouncementFlag flag,
       }
     }
 
-    // --- Configured Bridge token fetch (profile-scoped Bridge URLs) ---
-    // For configured mode, refresh access token from Bridge on each play/resume.
-    // This prevents profile cross-over when multiple configured URLs are used
-    // on the same device/session.
-    bool configuredBridge = IsConfiguredBridgeUrl(m_bridgeUrl);
-    if (configuredBridge)
+    // A paired profile has one authenticated Bridge identity. It never falls
+    // back to local Trakt credentials or another configured URL.
+    const bool profileBacked = m_bridgeProfileBacked;
+    if (profileBacked)
     {
+      if (!m_bridgeTraktEnabled)
+      {
+        CLog::Log(LOGDEBUG, "TraktScrobbler: Trakt is disabled for the active Jumpgate profile");
+        return;
+      }
+
       std::string urlSnapshot = m_mediaUrl;
+      const std::string profileIdSnapshot = m_bridgeProfileId;
+      const uint64_t authorityGeneration = m_authAuthorityGeneration;
       lock.unlock();
       bool fetched = FetchAccessTokenFromBridge();
       lock.lock();
 
-      if (m_mediaUrl != urlSnapshot)
+      if (!m_initialized || m_mediaUrl != urlSnapshot ||
+          m_authAuthorityGeneration != authorityGeneration ||
+          m_bridgeProfileId != profileIdSnapshot)
       {
-        CLog::Log(LOGINFO, "TraktScrobbler: Discarding stale Bridge token fetch (content changed)");
+        CLog::Log(LOGINFO,
+                  "TraktScrobbler: Discarding stale Bridge token fetch after state change");
         return;
       }
 
       if (fetched)
       {
-        CLog::Log(LOGINFO, "TraktScrobbler: Using configured Trakt token from Bridge");
+        CLog::Log(LOGINFO, "TraktScrobbler: Using active-profile Trakt token from Bridge");
       }
       else
       {
-        // Do not fall back to a previously cached token from another profile.
-        // In configured mode, failing closed is safer than cross-profile scrobbling.
-        m_accessToken.clear();
-        m_refreshToken.clear();
+        ClearSensitive(m_accessToken);
+        ClearSensitive(m_refreshToken);
         m_tokenExpiry = 0;
-        CLog::Log(LOGWARNING, "TraktScrobbler: Configured Bridge token fetch failed, skipping scrobble auth for this playback");
+        CLog::Log(LOGWARNING, "TraktScrobbler: Active-profile token fetch failed; scrobbling is "
+                              "disabled for this playback");
         return;
       }
     }
@@ -213,6 +275,12 @@ void TraktScrobbler::Announce(AnnouncementFlag flag,
     // --- Authentication (may require HTTP for token refresh or device code) ---
     if (!IsAuthenticated())
     {
+      if (m_profileRuntimeApplied)
+      {
+        CLog::Log(LOGWARNING, "TraktScrobbler: Profile runtime supplied no usable token; legacy "
+                              "local auth is disabled");
+        return;
+      }
       if (!m_refreshToken.empty())
       {
         std::string urlSnapshot = m_mediaUrl;
@@ -222,7 +290,7 @@ void TraktScrobbler::Announce(AnnouncementFlag flag,
         lock.lock();
 
         // Check-and-abort
-        if (m_mediaUrl != urlSnapshot)
+        if (!m_initialized || m_mediaUrl != urlSnapshot)
         {
           CLog::Log(LOGINFO, "TraktScrobbler: Discarding stale auth refresh (content changed)");
           return;
@@ -236,7 +304,7 @@ void TraktScrobbler::Announce(AnnouncementFlag flag,
             lock.unlock();
             StartDeviceCodeAuth();
             lock.lock();
-            if (m_mediaUrl != urlSnapshot2)
+            if (!m_initialized || m_mediaUrl != urlSnapshot2)
               return;
           }
           return;
@@ -249,7 +317,7 @@ void TraktScrobbler::Announce(AnnouncementFlag flag,
         lock.unlock();
         StartDeviceCodeAuth();
         lock.lock();
-        if (m_mediaUrl != urlSnapshot)
+        if (!m_initialized || m_mediaUrl != urlSnapshot)
           return;
         return;
       }
@@ -266,6 +334,7 @@ void TraktScrobbler::Announce(AnnouncementFlag flag,
       std::string scrobbleJson = BuildScrobbleJson(progress);
       std::string accessToken = m_accessToken;
       std::string imdbSnapshot = m_imdbId;
+      const uint64_t authorityGeneration = m_authAuthorityGeneration;
 
       lock.unlock();
       bool ok = false;
@@ -277,9 +346,11 @@ void TraktScrobbler::Announce(AnnouncementFlag flag,
       lock.lock();
 
       // Check-and-abort
-      if (m_imdbId != imdbSnapshot)
+      ClearSensitive(accessToken);
+      if (!m_initialized || m_imdbId != imdbSnapshot ||
+          m_authAuthorityGeneration != authorityGeneration)
       {
-        CLog::Log(LOGINFO, "TraktScrobbler: Discarding stale scrobble start (content changed)");
+        CLog::Log(LOGINFO, "TraktScrobbler: Discarding stale scrobble start after state change");
         return;
       }
 
@@ -299,6 +370,7 @@ void TraktScrobbler::Announce(AnnouncementFlag flag,
       float progress = GetPlaybackProgress();
       std::string scrobbleJson = BuildScrobbleJson(progress);
       std::string accessToken = m_accessToken;
+      const uint64_t authorityGeneration = m_authAuthorityGeneration;
       m_scrobblePaused = true;
 
       // Fire-and-forget pause: no state update needed after
@@ -308,8 +380,13 @@ void TraktScrobbler::Announce(AnnouncementFlag flag,
         std::string response;
         TraktPostWithToken("/scrobble/pause", scrobbleJson, response, accessToken);
       }
+      ClearSensitive(accessToken);
       // No re-lock needed -- we don't update state after pause
-      CLog::Log(LOGINFO, "TraktScrobbler: Scrobble paused at {:.1f}%", progress);
+      lock.lock();
+      const bool current = m_initialized && m_authAuthorityGeneration == authorityGeneration;
+      lock.unlock();
+      if (current)
+        CLog::Log(LOGINFO, "TraktScrobbler: Scrobble paused at {:.1f}%", progress);
     }
   }
   else if (message == "OnStop")
@@ -321,6 +398,7 @@ void TraktScrobbler::Announce(AnnouncementFlag flag,
       std::string scrobbleJson = BuildScrobbleJson(progress);
       std::string accessToken = m_accessToken;
       std::string imdbSnapshot = m_imdbId;
+      const uint64_t authorityGeneration = m_authAuthorityGeneration;
 
       // Build watch history JSON under lock (reads content fields)
       std::string historyJson;
@@ -339,15 +417,21 @@ void TraktScrobbler::Announce(AnnouncementFlag flag,
         std::string response;
         TraktPostWithToken("/scrobble/stop", scrobbleJson, response, accessToken);
       }
-      CLog::Log(LOGINFO, "TraktScrobbler: Scrobble stopped at {:.1f}%", progress);
+      lock.lock();
+      const bool current = m_initialized && m_authAuthorityGeneration == authorityGeneration &&
+                           m_imdbId == imdbSnapshot;
+      lock.unlock();
+      if (current)
+        CLog::Log(LOGINFO, "TraktScrobbler: Scrobble stopped at {:.1f}%", progress);
 
       // Sync watch history if >80% complete
-      if (shouldSyncHistory && !historyJson.empty())
+      if (current && shouldSyncHistory && !historyJson.empty())
       {
         std::string response;
         if (TraktPostWithToken("/sync/history", historyJson, response, accessToken))
           CLog::Log(LOGINFO, "TraktScrobbler: Watch history synced at {:.1f}%", progress);
       }
+      ClearSensitive(accessToken);
       // No re-lock needed -- m_scrobbleActive already set to false
     }
   }
@@ -360,6 +444,9 @@ void TraktScrobbler::ProcessSlow()
 {
   std::unique_lock lock(m_critSection);
 
+  if (!m_initialized)
+    return;
+
   // Deferred bridge URL detection (curl isn't safe during early onNewIntent init)
   if (!m_bridgeDetected)
   {
@@ -367,8 +454,11 @@ void TraktScrobbler::ProcessSlow()
     lock.unlock();
     DetectBridgeUrl();
     lock.lock();
+    if (!m_initialized)
+      return;
     std::string bridgeUrlSnapshot = m_bridgeUrl;
-    CLog::Log(LOGINFO, "TraktScrobbler: Bridge detection complete (bridge={})", bridgeUrlSnapshot);
+    CLog::Log(LOGINFO, "TraktScrobbler: Bridge detection complete (bridge={})",
+              RedactUrlForLog(bridgeUrlSnapshot));
   }
 
   // --- Auth polling section ---
@@ -378,6 +468,8 @@ void TraktScrobbler::ProcessSlow()
     lock.unlock();
     PollForToken();
     lock.lock();
+    if (!m_initialized)
+      return;
 
     // Check-and-abort (content may have changed during poll HTTP)
     if (m_mediaUrl != urlSnapshot)
@@ -400,9 +492,10 @@ void TraktScrobbler::ProcessSlow()
       lock.lock();
 
       // Check-and-abort
-      if (m_mediaUrl != urlSnapshot)
+      if (!m_initialized || m_mediaUrl != urlSnapshot)
       {
-        CLog::Log(LOGINFO, "TraktScrobbler: Discarding stale retry identification (content changed)");
+        CLog::Log(LOGINFO,
+                  "TraktScrobbler: Discarding stale retry identification (content changed)");
         return;
       }
 
@@ -418,6 +511,7 @@ void TraktScrobbler::ProcessSlow()
           std::string scrobbleJson = BuildScrobbleJson(progress);
           std::string accessToken = m_accessToken;
           std::string imdbSnapshot = m_imdbId;
+          const uint64_t authorityGeneration = m_authAuthorityGeneration;
 
           lock.unlock();
           bool ok = false;
@@ -428,7 +522,9 @@ void TraktScrobbler::ProcessSlow()
           }
           lock.lock();
 
-          if (m_imdbId != imdbSnapshot)
+          ClearSensitive(accessToken);
+          if (!m_initialized || m_imdbId != imdbSnapshot ||
+              m_authAuthorityGeneration != authorityGeneration)
             return;
 
           if (ok)
@@ -444,9 +540,15 @@ void TraktScrobbler::ProcessSlow()
       // Give up after IDENTIFY_RETRY_SEC
       m_identifyFailed = true;
       CLog::Log(LOGWARNING, "TraktScrobbler: Content identification failed after {}s", elapsed);
-      CGUIDialogKaiToast::QueueNotification(
-          CGUIDialogKaiToast::Warning, "Trakt",
-          "Could not identify content for scrobbling", 5000, true);
+
+      std::string identifyToast = "Could not identify content for scrobbling";
+      {
+        std::unique_lock lock(m_critSection);
+        if (m_bridgeUrl.find("/_c/") != std::string::npos)
+          identifyToast += " (ensure Configured addon is installed, not Quick)";
+      }
+      CGUIDialogKaiToast::QueueNotification(CGUIDialogKaiToast::Warning, "Trakt", identifyToast,
+                                            5000, true);
     }
   }
 
@@ -460,8 +562,7 @@ void TraktScrobbler::ProcessSlow()
     if (needHydrate)
     {
       int64_t now = GetCurrentTimeSec();
-      std::string key =
-          m_imdbId + ":" + std::to_string(m_season) + ":" + std::to_string(m_episode);
+      std::string key = m_imdbId + ":" + std::to_string(m_season) + ":" + std::to_string(m_episode);
 
       if (key != m_lastPublicHydrateKey || (now - m_lastPublicHydrateAttemptTime) >= 20)
       {
@@ -476,18 +577,18 @@ void TraktScrobbler::ProcessSlow()
         lock.unlock();
         HydrateFromTraktPublic(idSnapshot, seasonSnapshot, episodeSnapshot, urlSnapshot);
         lock.lock();
+        if (!m_initialized)
+          return;
       }
     }
   }
 
-  // --- Configured-mode token refresh ---
-  // Configured profiles are bridge-owned; refresh via Bridge token endpoint instead
-  // of starting device auth when token expires mid-session.
+  // --- Active-profile token refresh ---
   if (m_scrobbleActive && !m_scrobblePaused && m_contentIdentified && !IsAuthenticated())
   {
-    bool configuredBridge = IsConfiguredBridgeUrl(m_bridgeUrl);
     int64_t now = GetCurrentTimeSec();
-    if (configuredBridge && !m_authInProgress && (now - m_lastConfiguredTokenFetchTime) >= SCROBBLE_UPDATE_INTERVAL_SEC)
+    if (m_bridgeProfileBacked && m_bridgeTraktEnabled && !m_authInProgress &&
+        (now - m_lastConfiguredTokenFetchTime) >= SCROBBLE_UPDATE_INTERVAL_SEC)
     {
       std::string urlSnapshot = m_mediaUrl;
       m_lastConfiguredTokenFetchTime = now;
@@ -495,14 +596,15 @@ void TraktScrobbler::ProcessSlow()
       bool fetched = FetchAccessTokenFromBridge();
       lock.lock();
 
-      if (m_mediaUrl != urlSnapshot)
+      if (!m_initialized || m_mediaUrl != urlSnapshot)
       {
-        CLog::Log(LOGINFO, "TraktScrobbler: Discarding stale configured token refresh (content changed)");
+        CLog::Log(LOGINFO,
+                  "TraktScrobbler: Discarding stale configured token refresh (content changed)");
         return;
       }
 
       if (fetched)
-        CLog::Log(LOGINFO, "TraktScrobbler: Refreshed configured Trakt token from Bridge");
+        CLog::Log(LOGINFO, "TraktScrobbler: Refreshed active-profile Trakt token from Bridge");
     }
   }
 
@@ -518,6 +620,7 @@ void TraktScrobbler::ProcessSlow()
         std::string scrobbleJson = BuildScrobbleJson(progress);
         std::string accessToken = m_accessToken;
         std::string imdbSnapshot = m_imdbId;
+        const uint64_t authorityGeneration = m_authAuthorityGeneration;
 
         lock.unlock();
         bool ok = false;
@@ -529,7 +632,9 @@ void TraktScrobbler::ProcessSlow()
         lock.lock();
 
         // Check-and-abort
-        if (m_imdbId != imdbSnapshot)
+        ClearSensitive(accessToken);
+        if (!m_initialized || m_imdbId != imdbSnapshot ||
+            m_authAuthorityGeneration != authorityGeneration)
           return;
 
         if (ok)
@@ -542,11 +647,8 @@ void TraktScrobbler::ProcessSlow()
   }
 }
 
-void TraktScrobbler::SetContentInfo(const std::string& imdbId,
-                                     const std::string& title,
-                                     int year,
-                                     int season,
-                                     int episode)
+void TraktScrobbler::SetContentInfo(
+    const std::string& imdbId, const std::string& title, int year, int season, int episode)
 {
   std::unique_lock lock(m_critSection);
   m_imdbId = imdbId;
@@ -572,7 +674,7 @@ void TraktScrobbler::SetMediaUrl(const std::string& url)
 {
   std::unique_lock lock(m_critSection);
   m_mediaUrl = url;
-  CLog::Log(LOGDEBUG, "TraktScrobbler: Media URL set: {}", url);
+  CLog::Log(LOGDEBUG, "TraktScrobbler: Media URL set: {}", RedactUrlForLog(url));
 }
 
 void TraktScrobbler::ClearContentInfo()
@@ -669,6 +771,20 @@ bool TraktScrobbler::IsScrobbleActive() const
 void TraktScrobbler::ForceReAuth()
 {
   std::unique_lock lock(m_critSection);
+  ++m_authAuthorityGeneration;
+
+  if (m_profileRuntimeApplied)
+  {
+    ClearSensitive(m_accessToken);
+    ClearSensitive(m_refreshToken);
+    ClearSensitive(m_deviceCode);
+    m_tokenExpiry = 0;
+    m_authInProgress = false;
+    m_lastConfiguredTokenFetchTime = 0;
+    CLog::Log(LOGINFO, "TraktScrobbler: Cleared runtime token; Jumpgate profile configuration "
+                       "remains authoritative");
+    return;
+  }
 
   // Delete token file
   std::string path = CSpecialProtocol::TranslatePath(TOKEN_FILE);
@@ -707,22 +823,97 @@ void TraktScrobbler::SetBridgeUrl(const std::string& url)
   if (!normalized.empty())
   {
     m_bridgeUrl = normalized;
-    CLog::Log(LOGINFO, "TraktScrobbler: Bridge URL overridden to {}", normalized);
+    CLog::Log(LOGINFO, "TraktScrobbler: Bridge URL overridden to {}", RedactUrlForLog(normalized));
   }
 }
 
-bool TraktScrobbler::IsConfiguredBridgeUrl(const std::string& bridgeUrl) const
+void TraktScrobbler::SetBridgeProfile(const std::string& profileId,
+                                      const std::string& bridgeOrigin,
+                                      const std::string& bridgeBaseUrl,
+                                      const std::string& deviceToken,
+                                      bool traktEnabled)
 {
-  std::string normalized = NormalizeBridgeUrl(bridgeUrl);
-  if (normalized.empty())
-    return false;
+  const std::string normalizedBase = NormalizeBridgeUrl(bridgeBaseUrl);
+  const std::string normalizedOrigin = NormalizeBridgeUrl(bridgeOrigin);
+  std::unique_lock lock(m_critSection);
+  m_profileRuntimeApplied = true;
 
-  if (normalized.find("/_c/") != std::string::npos)
-    return true;
+  const bool sameProfile = m_bridgeProfileBacked && m_bridgeProfileId == profileId &&
+                           m_bridgeOrigin == normalizedOrigin && m_bridgeUrl == normalizedBase &&
+                           m_bridgeDeviceToken == deviceToken;
+  if (sameProfile)
+  {
+    const bool enabled = traktEnabled && !m_bridgeDeviceToken.empty();
+    if (enabled != m_bridgeTraktEnabled)
+    {
+      ++m_authAuthorityGeneration;
+      ClearSensitive(m_accessToken);
+      ClearSensitive(m_refreshToken);
+      m_tokenExpiry = 0;
+      m_authInProgress = false;
+      ClearSensitive(m_deviceCode);
+      m_scrobbleActive = false;
+      m_scrobblePaused = false;
+    }
+    m_bridgeTraktEnabled = enabled;
+    return;
+  }
 
-  // Legacy configured alias base: https://host/<config>
-  static const std::regex aliasPattern("^https?://[^/]+/[A-Za-z0-9_-]{24,}$", std::regex::icase);
-  return std::regex_match(normalized, aliasPattern);
+  ++m_authAuthorityGeneration;
+  ClearSensitive(m_bridgeDeviceToken);
+  ClearSensitive(m_accessToken);
+  ClearSensitive(m_refreshToken);
+  m_tokenExpiry = 0;
+  m_authInProgress = false;
+  ClearSensitive(m_deviceCode);
+  m_scrobbleActive = false;
+  m_scrobblePaused = false;
+
+  m_bridgeProfileId = profileId;
+  m_bridgeOrigin = normalizedOrigin;
+  m_bridgeUrl = normalizedBase;
+  m_bridgeDeviceToken = deviceToken;
+  m_bridgeProfileBacked = !m_bridgeProfileId.empty();
+  const bool credentialsReady = m_bridgeProfileBacked && !m_bridgeOrigin.empty() &&
+                                !m_bridgeUrl.empty() && !m_bridgeDeviceToken.empty();
+  m_bridgeTraktEnabled = credentialsReady && traktEnabled;
+  m_bridgeDetected = m_bridgeProfileBacked;
+
+  if (!m_bridgeProfileBacked)
+  {
+    ClearSensitive(m_bridgeDeviceToken);
+    m_bridgeProfileId.clear();
+    m_bridgeOrigin.clear();
+    m_bridgeUrl = BRIDGE_CLOUD_URL;
+    m_bridgeDetected = false;
+  }
+}
+
+void TraktScrobbler::ClearBridgeProfile()
+{
+  std::unique_lock lock(m_critSection);
+  ++m_authAuthorityGeneration;
+  m_profileRuntimeApplied = true;
+  ClearSensitive(m_bridgeDeviceToken);
+  ClearSensitive(m_accessToken);
+  ClearSensitive(m_refreshToken);
+  m_bridgeProfileId.clear();
+  m_bridgeOrigin.clear();
+  m_bridgeProfileBacked = false;
+  m_bridgeTraktEnabled = false;
+  m_tokenExpiry = 0;
+  m_authInProgress = false;
+  ClearSensitive(m_deviceCode);
+  m_scrobbleActive = false;
+  m_scrobblePaused = false;
+  m_bridgeUrl = BRIDGE_CLOUD_URL;
+  m_bridgeDetected = false;
+}
+
+bool TraktScrobbler::IsBridgeProfileBacked() const
+{
+  std::unique_lock lock(m_critSection);
+  return m_bridgeProfileBacked;
 }
 
 std::string TraktScrobbler::NormalizeBridgeUrl(const std::string& url) const
@@ -787,6 +978,11 @@ bool TraktScrobbler::IsAuthenticated() const
 
 bool TraktScrobbler::LoadTokens()
 {
+  // Caller holds m_critSection. Profile authority permanently disables the
+  // legacy plaintext token store for this scrobbler instance.
+  if (m_profileRuntimeApplied)
+    return false;
+
   std::string path = CSpecialProtocol::TranslatePath(TOKEN_FILE);
 
   XFILE::CFile file;
@@ -802,9 +998,11 @@ bool TraktScrobbler::LoadTokens()
   CVariant data;
   if (!CJSONVariantParser::Parse(json, data))
   {
+    ClearSensitive(json);
     CLog::Log(LOGERROR, "TraktScrobbler: Failed to parse token file");
     return false;
   }
+  ClearSensitive(json);
 
   m_accessToken = data["access_token"].asString();
   m_refreshToken = data["refresh_token"].asString();
@@ -833,6 +1031,13 @@ bool TraktScrobbler::LoadTokens()
 bool TraktScrobbler::SaveTokens()
 {
   // Caller must hold m_critSection or ensure exclusive access
+  if (m_profileRuntimeApplied)
+  {
+    CLog::Log(LOGWARNING,
+              "TraktScrobbler: Refused legacy token persistence under profile authority");
+    return false;
+  }
+
   CVariant data(CVariant::VariantTypeObject);
   data["access_token"] = m_accessToken;
   data["refresh_token"] = m_refreshToken;
@@ -844,20 +1049,24 @@ bool TraktScrobbler::SaveTokens()
     CLog::Log(LOGERROR, "TraktScrobbler: Failed to serialize tokens");
     return false;
   }
+  data = CVariant{};
 
   std::string path = CSpecialProtocol::TranslatePath(TOKEN_FILE);
 
   XFILE::CFile file;
   if (!file.OpenForWrite(path, true))
   {
+    ClearSensitive(json);
     CLog::Log(LOGERROR, "TraktScrobbler: Failed to open token file for writing: {}", path);
     return false;
   }
 
   ssize_t written = file.Write(json.c_str(), json.size());
   file.Close();
+  const size_t expected = json.size();
+  ClearSensitive(json);
 
-  if (written != static_cast<ssize_t>(json.size()))
+  if (written != static_cast<ssize_t>(expected))
   {
     CLog::Log(LOGERROR, "TraktScrobbler: Failed to write tokens");
     return false;
@@ -870,42 +1079,77 @@ bool TraktScrobbler::SaveTokens()
 bool TraktScrobbler::FetchAccessTokenFromBridge()
 {
   std::unique_lock lock(m_critSection);
-  std::string bridgeUrl = NormalizeBridgeUrl(m_bridgeUrl);
+  const std::string bridgeOrigin = NormalizeBridgeUrl(m_bridgeOrigin);
+  const std::string profileId = m_bridgeProfileId;
+  std::string deviceToken = m_bridgeDeviceToken;
+  const bool profileBacked = m_bridgeProfileBacked && m_bridgeTraktEnabled;
+  const uint64_t authorityGeneration = m_authAuthorityGeneration;
   lock.unlock();
 
-  if (bridgeUrl.empty())
+  if (!profileBacked || bridgeOrigin.empty() || profileId.empty() || deviceToken.empty())
+  {
+    ClearSensitive(deviceToken);
     return false;
+  }
 
   XFILE::CCurlFile curl;
+  curl.SetRequestHeader("Authorization", "Bearer " + deviceToken);
   curl.SetTimeout(5);
   std::string response;
-  std::string url = BuildBridgeEndpoint(bridgeUrl, "/auth/token");
+  const std::string url = BuildBridgeEndpoint(bridgeOrigin, "/v1/trakt/token");
+  CURL requestUrl(url);
+  requestUrl.SetProtocolOption("redirect-limit", "0");
 
-  if (!curl.Get(url, response))
+  const bool requested = curl.Get(requestUrl.Get(), response);
+  ClearSensitive(deviceToken);
+  if (!requested)
     return false;
 
   CVariant data;
-  if (!CJSONVariantParser::Parse(response, data))
+  if (!CJSONVariantParser::Parse(response, data) || !data.isObject())
+  {
+    ClearSensitive(response);
     return false;
+  }
+  ClearSensitive(response);
 
-  if (!data["ok"].asBoolean())
+  if (!data.isMember("profile_id") || data["profile_id"].asString() != profileId)
+  {
+    data = CVariant{};
     return false;
+  }
 
-  std::string accessToken = data["access_token"].asString();
+  std::string accessToken = data.isMember("access_token") ? data["access_token"].asString() : "";
   if (accessToken.empty())
+  {
+    data = CVariant{};
     return false;
+  }
 
-  int64_t tokenExpiry = data["token_expiry"].asInteger(0);
-  if (tokenExpiry <= 0)
-    tokenExpiry = GetCurrentTimeSec() + 3600;
+  const int64_t tokenExpiry = data.isMember("token_expiry") ? data["token_expiry"].asInteger(0) : 0;
+  data = CVariant{};
+  if (tokenExpiry <= GetCurrentTimeSec() + 300)
+  {
+    ClearSensitive(accessToken);
+    return false;
+  }
 
   lock.lock();
+  if (!m_bridgeProfileBacked || !m_bridgeTraktEnabled ||
+      m_authAuthorityGeneration != authorityGeneration || m_bridgeProfileId != profileId ||
+      m_bridgeOrigin != bridgeOrigin)
+  {
+    lock.unlock();
+    ClearSensitive(accessToken);
+    return false;
+  }
+  ClearSensitive(m_accessToken);
   m_accessToken = accessToken;
   m_tokenExpiry = tokenExpiry;
-  // Configured Bridge mode owns token refresh. Do not reuse local refresh token.
-  m_refreshToken.clear();
+  ClearSensitive(m_refreshToken);
   m_lastConfiguredTokenFetchTime = GetCurrentTimeSec();
   lock.unlock();
+  ClearSensitive(accessToken);
 
   return true;
 }
@@ -918,11 +1162,12 @@ bool TraktScrobbler::RefreshAccessToken()
 {
   std::unique_lock lock(m_critSection);
 
-  if (m_refreshToken.empty())
+  if (m_profileRuntimeApplied || m_refreshToken.empty())
     return false;
 
   // Copy state needed for HTTP
   std::string refreshToken = m_refreshToken;
+  const uint64_t authorityGeneration = m_authAuthorityGeneration;
 
   // Build request body under lock (uses member)
   CVariant body(CVariant::VariantTypeObject);
@@ -933,7 +1178,12 @@ bool TraktScrobbler::RefreshAccessToken()
   body["grant_type"] = "refresh_token";
 
   std::string jsonBody;
-  CJSONVariantWriter::Write(body, jsonBody, true);
+  if (!CJSONVariantWriter::Write(body, jsonBody, true))
+  {
+    ClearSensitive(refreshToken);
+    return false;
+  }
+  body = CVariant{};
 
   // Release lock for HTTP
   lock.unlock();
@@ -951,29 +1201,70 @@ bool TraktScrobbler::RefreshAccessToken()
 
   if (!curl.Post(url, jsonBody, response))
   {
+    ClearSensitive(refreshToken);
+    ClearSensitive(jsonBody);
     CLog::Log(LOGERROR, "TraktScrobbler: Token refresh request failed");
     return false;
   }
+  ClearSensitive(jsonBody);
 
   CVariant result;
   if (!CJSONVariantParser::Parse(response, result))
+  {
+    ClearSensitive(refreshToken);
+    ClearSensitive(response);
     return false;
+  }
+  ClearSensitive(response);
 
   std::string newAccessToken = result["access_token"].asString();
   std::string newRefreshToken = result["refresh_token"].asString();
   int64_t expiresIn = result["expires_in"].asInteger(7776000); // 90 days default
+  result = CVariant{};
 
   if (newAccessToken.empty())
+  {
+    ClearSensitive(refreshToken);
+    ClearSensitive(newRefreshToken);
     return false;
+  }
 
   // Re-acquire lock to write results
   lock.lock();
+  if (m_profileRuntimeApplied || m_authAuthorityGeneration != authorityGeneration ||
+      m_refreshToken != refreshToken)
+  {
+    lock.unlock();
+    ClearSensitive(refreshToken);
+    ClearSensitive(newAccessToken);
+    ClearSensitive(newRefreshToken);
+    CLog::Log(LOGDEBUG,
+              "TraktScrobbler: Discarded stale legacy token refresh after authority change");
+    return false;
+  }
 
-  m_accessToken = newAccessToken;
-  m_refreshToken = newRefreshToken;
+  ClearSensitive(m_accessToken);
+  ClearSensitive(m_refreshToken);
+  m_accessToken = std::move(newAccessToken);
+  m_refreshToken = std::move(newRefreshToken);
   m_tokenExpiry = GetCurrentTimeSec() + expiresIn;
 
-  SaveTokens();
+  const bool saved = SaveTokens();
+  lock.unlock();
+  ClearSensitive(refreshToken);
+  if (!saved)
+  {
+    lock.lock();
+    if (!m_profileRuntimeApplied && m_authAuthorityGeneration == authorityGeneration)
+    {
+      ClearSensitive(m_accessToken);
+      ClearSensitive(m_refreshToken);
+      m_tokenExpiry = 0;
+    }
+    lock.unlock();
+    CLog::Log(LOGERROR, "TraktScrobbler: Refreshed token could not be persisted");
+    return false;
+  }
   CLog::Log(LOGINFO, "TraktScrobbler: Token refreshed successfully");
   return true;
 }
@@ -983,12 +1274,33 @@ bool TraktScrobbler::RefreshAccessToken()
 // ---------------------------------------------------------------------------
 void TraktScrobbler::StartDeviceCodeAuth()
 {
+  std::unique_lock lock(m_critSection);
+  if (m_profileRuntimeApplied || m_authInProgress)
+    return;
+
+  const uint64_t authorityGeneration = m_authAuthorityGeneration;
+  m_authInProgress = true;
+  lock.unlock();
+
+  auto abandonRequest = [this, authorityGeneration]()
+  {
+    std::unique_lock stateLock(m_critSection);
+    if (!m_profileRuntimeApplied && m_authAuthorityGeneration == authorityGeneration &&
+        m_deviceCode.empty())
+      m_authInProgress = false;
+  };
+
   // Build request body (no member access needed)
   CVariant body(CVariant::VariantTypeObject);
   body["client_id"] = std::string(TRAKT_CLIENT_ID);
 
   std::string jsonBody;
-  CJSONVariantWriter::Write(body, jsonBody, true);
+  if (!CJSONVariantWriter::Write(body, jsonBody, true))
+  {
+    abandonRequest();
+    return;
+  }
+  body = CVariant{};
 
   // HTTP without lock
   XFILE::CCurlFile curl;
@@ -1004,40 +1316,61 @@ void TraktScrobbler::StartDeviceCodeAuth()
 
   if (!curl.Post(url, jsonBody, response))
   {
+    ClearSensitive(jsonBody);
+    abandonRequest();
     CLog::Log(LOGERROR, "TraktScrobbler: Device code request failed");
     return;
   }
+  ClearSensitive(jsonBody);
 
   CVariant result;
   if (!CJSONVariantParser::Parse(response, result))
   {
+    ClearSensitive(response);
+    abandonRequest();
     CLog::Log(LOGERROR, "TraktScrobbler: Failed to parse device code response");
     return;
   }
+  ClearSensitive(response);
 
   std::string deviceCode = result["device_code"].asString();
   std::string userCode = result["user_code"].asString();
   int pollInterval = result["interval"].asInteger(5);
+  result = CVariant{};
 
   if (deviceCode.empty() || userCode.empty())
   {
+    ClearSensitive(deviceCode);
+    ClearSensitive(userCode);
+    abandonRequest();
     CLog::Log(LOGERROR, "TraktScrobbler: Invalid device code response");
     return;
   }
-
   // Acquire lock to write auth state
-  std::unique_lock lock(m_critSection);
-  m_deviceCode = deviceCode;
+  lock.lock();
+  if (m_profileRuntimeApplied || m_authAuthorityGeneration != authorityGeneration ||
+      !m_authInProgress)
+  {
+    lock.unlock();
+    ClearSensitive(deviceCode);
+    ClearSensitive(userCode);
+    CLog::Log(LOGDEBUG,
+              "TraktScrobbler: Discarded stale device-code response after authority change");
+    return;
+  }
+  ClearSensitive(m_deviceCode);
+  m_deviceCode = std::move(deviceCode);
   m_pollIntervalSec = pollInterval;
-  m_authInProgress = true;
   m_lastPollTime = GetCurrentTimeSec();
   lock.unlock();
 
   // Show toast notification with the user code (no lock needed)
   std::string message = "Visit trakt.tv/activate\nCode: " + userCode;
   CGUIDialogKaiToast::QueueNotification(CGUIDialogKaiToast::Info, "Trakt", message, 10000, true);
+  ClearSensitive(userCode);
+  ClearSensitive(message);
 
-  CLog::Log(LOGINFO, "TraktScrobbler: Device auth started - code: {}", userCode);
+  CLog::Log(LOGINFO, "TraktScrobbler: Device auth started (code shown on screen)");
 }
 
 // ---------------------------------------------------------------------------
@@ -1047,7 +1380,7 @@ void TraktScrobbler::PollForToken()
 {
   std::unique_lock lock(m_critSection);
 
-  if (!m_authInProgress || m_deviceCode.empty())
+  if (m_profileRuntimeApplied || !m_authInProgress || m_deviceCode.empty())
     return;
 
   int64_t now = GetCurrentTimeSec();
@@ -1058,6 +1391,7 @@ void TraktScrobbler::PollForToken()
 
   // Copy state for HTTP
   std::string deviceCode = m_deviceCode;
+  const uint64_t authorityGeneration = m_authAuthorityGeneration;
 
   // Build request body
   CVariant body(CVariant::VariantTypeObject);
@@ -1066,7 +1400,12 @@ void TraktScrobbler::PollForToken()
   body["client_secret"] = std::string(TRAKT_CLIENT_SECRET);
 
   std::string jsonBody;
-  CJSONVariantWriter::Write(body, jsonBody, true);
+  if (!CJSONVariantWriter::Write(body, jsonBody, true))
+  {
+    ClearSensitive(deviceCode);
+    return;
+  }
+  body = CVariant{};
 
   // Release lock for HTTP
   lock.unlock();
@@ -1084,40 +1423,69 @@ void TraktScrobbler::PollForToken()
 
   if (!curl.Post(url, jsonBody, response))
   {
+    ClearSensitive(deviceCode);
+    ClearSensitive(jsonBody);
     CLog::Log(LOGDEBUG, "TraktScrobbler: Auth poll - not yet authorized");
     return;
   }
+  ClearSensitive(jsonBody);
 
   CVariant result;
   if (!CJSONVariantParser::Parse(response, result))
+  {
+    ClearSensitive(deviceCode);
+    ClearSensitive(response);
     return;
+  }
+  ClearSensitive(response);
 
   std::string newAccessToken = result["access_token"].asString();
   std::string newRefreshToken = result["refresh_token"].asString();
   int64_t expiresIn = result["expires_in"].asInteger(7776000);
+  result = CVariant{};
 
   if (newAccessToken.empty())
+  {
+    ClearSensitive(deviceCode);
+    ClearSensitive(newRefreshToken);
     return;
+  }
 
   // Re-acquire lock to write auth result
   lock.lock();
 
   // Check if auth was cancelled while we were doing HTTP
-  if (!m_authInProgress || m_deviceCode != deviceCode)
+  if (m_profileRuntimeApplied || m_authAuthorityGeneration != authorityGeneration ||
+      !m_authInProgress || m_deviceCode != deviceCode)
   {
+    lock.unlock();
+    ClearSensitive(deviceCode);
+    ClearSensitive(newAccessToken);
+    ClearSensitive(newRefreshToken);
     CLog::Log(LOGDEBUG, "TraktScrobbler: Auth state changed during poll, discarding");
     return;
   }
 
-  m_accessToken = newAccessToken;
-  m_refreshToken = newRefreshToken;
+  ClearSensitive(m_accessToken);
+  ClearSensitive(m_refreshToken);
+  m_accessToken = std::move(newAccessToken);
+  m_refreshToken = std::move(newRefreshToken);
   m_tokenExpiry = GetCurrentTimeSec() + expiresIn;
   m_authInProgress = false;
-  m_deviceCode.clear();
-  SaveTokens();
+  ClearSensitive(m_deviceCode);
+  const bool saved = SaveTokens();
+  ClearSensitive(deviceCode);
+  if (!saved)
+  {
+    ClearSensitive(m_accessToken);
+    ClearSensitive(m_refreshToken);
+    m_tokenExpiry = 0;
+    CLog::Log(LOGERROR, "TraktScrobbler: Device token could not be persisted");
+    return;
+  }
 
-  CGUIDialogKaiToast::QueueNotification(CGUIDialogKaiToast::Info, "Trakt",
-                                         "Authenticated!", 5000, true);
+  CGUIDialogKaiToast::QueueNotification(CGUIDialogKaiToast::Info, "Trakt", "Authenticated!", 5000,
+                                        true);
   CLog::Log(LOGINFO, "TraktScrobbler: Authentication successful!");
 
   // If content is identified, start scrobbling now
@@ -1137,14 +1505,19 @@ void TraktScrobbler::PollForToken()
     }
     lock.lock();
 
-    if (m_imdbId != imdbSnapshot)
+    if (m_profileRuntimeApplied || m_authAuthorityGeneration != authorityGeneration ||
+        m_imdbId != imdbSnapshot)
+    {
+      ClearSensitive(accessToken);
       return;
+    }
 
     if (ok)
     {
       m_scrobbleActive = true;
       m_lastScrobbleUpdateTime = GetCurrentTimeSec();
     }
+    ClearSensitive(accessToken);
   }
 }
 
@@ -1189,14 +1562,23 @@ bool TraktScrobbler::SyncWatchHistory()
 
   std::string json = BuildSyncHistoryJson();
   std::string accessToken = m_accessToken;
+  const uint64_t authorityGeneration = m_authAuthorityGeneration;
 
   lock.unlock();
 
   if (json.empty())
+  {
+    ClearSensitive(accessToken);
     return false;
+  }
 
   std::string response;
-  return TraktPostWithToken("/sync/history", json, response, accessToken);
+  const bool posted = TraktPostWithToken("/sync/history", json, response, accessToken);
+  ClearSensitive(accessToken);
+  lock.lock();
+  const bool current = m_authAuthorityGeneration == authorityGeneration;
+  lock.unlock();
+  return posted && current;
 }
 
 // ---------------------------------------------------------------------------
@@ -1291,11 +1673,19 @@ void TraktScrobbler::DetectBridgeUrl()
   // Check if user configured a URL via settings
   std::unique_lock lock(m_critSection);
   std::string currentBridgeUrl = m_bridgeUrl;
+  const bool profileBacked = m_bridgeProfileBacked;
   lock.unlock();
+
+  if (profileBacked)
+  {
+    CLog::Log(LOGINFO, "TraktScrobbler: Using the active authenticated Bridge profile");
+    return;
+  }
 
   if (!currentBridgeUrl.empty() && currentBridgeUrl != BRIDGE_CLOUD_URL)
   {
-    CLog::Log(LOGINFO, "TraktScrobbler: Using user-configured Bridge URL: {}", currentBridgeUrl);
+    CLog::Log(LOGINFO, "TraktScrobbler: Using explicit development Bridge URL: {}",
+              RedactUrlForLog(currentBridgeUrl));
     return;
   }
 
@@ -1335,20 +1725,19 @@ void TraktScrobbler::DetectBridgeUrl()
 // ---------------------------------------------------------------------------
 bool TraktScrobbler::QueryBridgeServer()
 {
-  // Read bridge URL under lock
   std::unique_lock lock(m_critSection);
-  std::string bridgeUrl = m_bridgeUrl;
+  const std::string bridgeUrl = NormalizeBridgeUrl(m_bridgeUrl);
   lock.unlock();
 
   if (bridgeUrl.empty())
     return false;
 
-  std::string url = BuildBridgeEndpoint(bridgeUrl, "/identify");
-  if (url.empty())
+  const std::string identifyUrl = BuildBridgeEndpoint(bridgeUrl, "/identify");
+  if (identifyUrl.empty())
     return false;
 
-  // Retry up to 3 times with 2s delay -- handles race condition where Jumpgate
-  // queries /identify before Stremio's stream request arrives at Bridge
+  // Retry a short-lived stream-registration race, but never search another
+  // profile. The selected profile is the only allowed identity boundary.
   for (int attempt = 0; attempt < 3; ++attempt)
   {
     if (attempt > 0)
@@ -1360,46 +1749,39 @@ bool TraktScrobbler::QueryBridgeServer()
     XFILE::CCurlFile curl;
     curl.SetTimeout(3);
     std::string response;
-
-    if (!curl.Get(url, response))
+    if (!curl.Get(identifyUrl, response))
     {
       CLog::Log(LOGDEBUG, "TraktScrobbler: Bridge server query failed (attempt {})", attempt + 1);
-      continue; // Network error — retry may help
+      continue;
     }
 
     CVariant data;
-    if (!CJSONVariantParser::Parse(response, data))
+    if (!CJSONVariantParser::Parse(response, data) || !data.isObject())
+      continue;
+    if (!data.isMember("found") || !data["found"].asBoolean())
       continue;
 
-    if (!data["found"].asBoolean())
-    {
-      // Bridge responded but has no mapping for this IP.
-      // Don't retry — this is a definitive answer, not a transient failure.
-      // Retrying wastes the identification time budget and prevents later layers
-      // (title extraction, Trakt search) from running.
-      CLog::Log(LOGINFO, "TraktScrobbler: Bridge returned not-found (attempt {}), moving to next layer", attempt + 1);
-      return false;
-    }
-
-    std::string imdb = data["imdb"].asString();
+    const std::string imdb = data["imdb"].asString();
     if (imdb.empty())
       continue;
 
-    // Parse results into locals
     int season = -1;
     int episode = -1;
-    std::string seasonStr = data["season"].asString();
-    std::string episodeStr = data["episode"].asString();
+    const std::string seasonStr = data["season"].asString();
+    const std::string episodeStr = data["episode"].asString();
     if (!seasonStr.empty())
       season = std::atoi(seasonStr.c_str());
     if (!episodeStr.empty())
       episode = std::atoi(episodeStr.c_str());
+    const std::string logoUrl = data["logo"].asString();
 
-    // Best-effort artwork hint for overlay (TMDB clearlogo URL).
-    std::string logoUrl = data["logo"].asString();
-
-    // Write results under lock
     lock.lock();
+    if (!StringUtils::EqualsNoCase(m_bridgeUrl, bridgeUrl))
+    {
+      lock.unlock();
+      CLog::Log(LOGINFO, "TraktScrobbler: Discarding stale Bridge identification");
+      return false;
+    }
     m_imdbId = imdb;
     if (season >= 0)
       m_season = season;
@@ -1411,30 +1793,32 @@ bool TraktScrobbler::QueryBridgeServer()
       m_logoFetchedForImdb = imdb;
     }
 
-    // Capture resume data if present in Bridge response
     if (data.isMember("resume") && data["resume"].isMember("position"))
     {
-      int resumePos = static_cast<int>(data["resume"]["position"].asInteger(0));
-      int resumeDur = static_cast<int>(data["resume"]["duration"].asInteger(0));
+      const int resumePos = static_cast<int>(data["resume"]["position"].asInteger(0));
+      const int resumeDur = static_cast<int>(data["resume"]["duration"].asInteger(0));
       if (resumeDur > 0 && resumePos > 0 &&
-          static_cast<float>(resumePos) / static_cast<float>(resumeDur) < Jumpgate::RESUME_DISCARD_RATIO)
+          static_cast<float>(resumePos) / static_cast<float>(resumeDur) <
+              Jumpgate::RESUME_DISCARD_RATIO)
       {
         m_bridgeResumePositionMs.store(resumePos, std::memory_order_relaxed);
-        CLog::Log(LOGINFO, "TraktScrobbler: Bridge resume data - pos={} dur={}", resumePos, resumeDur);
+        CLog::Log(LOGINFO, "TraktScrobbler: Bridge resume data - pos={} dur={}", resumePos,
+                  resumeDur);
       }
     }
     lock.unlock();
 
-    CLog::Log(LOGINFO, "TraktScrobbler: Bridge identified - {} S{}E{} (attempt {})",
-              imdb, season, episode, attempt + 1);
+    CLog::Log(LOGINFO, "TraktScrobbler: Bridge identified - {} S{}E{} (attempt {}/3)", imdb, season,
+              episode, attempt + 1);
     return true;
   }
 
-  CLog::Log(LOGDEBUG, "TraktScrobbler: Bridge server returned not found after 3 attempts");
+  CLog::Log(LOGDEBUG, "TraktScrobbler: Active Bridge returned no identification");
   return false;
 }
 
-bool TraktScrobbler::FetchLogoFromBridge(const std::string& imdbId, const std::string& mediaUrlSnapshot)
+bool TraktScrobbler::FetchLogoFromBridge(const std::string& imdbId,
+                                         const std::string& mediaUrlSnapshot)
 {
   if (imdbId.empty())
     return false;
@@ -1456,7 +1840,9 @@ bool TraktScrobbler::FetchLogoFromBridge(const std::string& imdbId, const std::s
     return false;
 
   XFILE::CCurlFile curl;
-  curl.SetTimeout(3);
+  // Logo fetch is non-critical but can require a second TMDB hop on the bridge.
+  // Keep this slightly above identify timeout so metadata can land without blocking playback start.
+  curl.SetTimeout(5);
   std::string response;
 
   if (!curl.Get(url, response))
@@ -1507,10 +1893,12 @@ bool TraktScrobbler::IdentifyContent()
   // Layer 1: Already set via SetContentInfo (_mk_* params or intent extras)
   if (!imdbId.empty())
   {
-    CLog::Log(LOGINFO, "TraktScrobbler: Content identified via intent/Bridge params - IMDB: {}", imdbId);
+    CLog::Log(LOGINFO, "TraktScrobbler: Content identified via intent/Bridge params - IMDB: {}",
+              imdbId);
+    // Kick logo fetch first so overlay can update as early as possible.
+    FetchLogoFromBridge(imdbId, mediaUrlSnapshot);
     if (title.empty() || year == 0)
       HydrateFromTraktPublic(imdbId, season, episode, mediaUrlSnapshot);
-    FetchLogoFromBridge(imdbId, mediaUrlSnapshot);
     return true;
   }
 
@@ -1548,9 +1936,10 @@ bool TraktScrobbler::IdentifyContent()
       m_episode = parsedEpisode;
       lock.unlock();
 
-      CLog::Log(LOGINFO, "TraktScrobbler: Content identified via URL parsing - IMDB: {}", parsedImdb);
-      HydrateFromTraktPublic(parsedImdb, parsedSeason, parsedEpisode, mediaUrlSnapshot);
+      CLog::Log(LOGINFO, "TraktScrobbler: Content identified via URL parsing - IMDB: {}",
+                parsedImdb);
       FetchLogoFromBridge(parsedImdb, mediaUrlSnapshot);
+      HydrateFromTraktPublic(parsedImdb, parsedSeason, parsedEpisode, mediaUrlSnapshot);
       return true;
     }
   }
@@ -1579,8 +1968,8 @@ bool TraktScrobbler::IdentifyContent()
       int curSeason = m_season;
       int curEpisode = m_episode;
       lock.unlock();
-      HydrateFromTraktPublic(curImdb, curSeason, curEpisode, mediaUrlSnapshot);
       FetchLogoFromBridge(curImdb, mediaUrlSnapshot);
+      HydrateFromTraktPublic(curImdb, curSeason, curEpisode, mediaUrlSnapshot);
       return true;
     }
   }
@@ -1635,7 +2024,7 @@ bool TraktScrobbler::IdentifyContent()
 
     if (!newResolvedUrl.empty() && newResolvedUrl != mediaUrl)
     {
-      CLog::Log(LOGINFO, "TraktScrobbler: Resolved URL: {}", newResolvedUrl);
+      CLog::Log(LOGINFO, "TraktScrobbler: Resolved URL: {}", RedactUrlForLog(newResolvedUrl));
 
       // Try IMDB parse on resolved URL (no HTTP, just regex)
       std::regex imdbPattern("(tt\\d{7,})");
@@ -1653,7 +2042,8 @@ bool TraktScrobbler::IdentifyContent()
         m_imdbId = parsedImdb;
         lock.unlock();
 
-        CLog::Log(LOGINFO, "TraktScrobbler: Content identified via resolved URL - IMDB: {}", parsedImdb);
+        CLog::Log(LOGINFO, "TraktScrobbler: Content identified via resolved URL - IMDB: {}",
+                  parsedImdb);
         HydrateFromTraktPublic(parsedImdb, season, episode, mediaUrlSnapshot);
         FetchLogoFromBridge(parsedImdb, mediaUrlSnapshot);
         return true;
@@ -1662,8 +2052,8 @@ bool TraktScrobbler::IdentifyContent()
   }
 
   // Layer 5: Search Trakt by title (HTTP)
-  bool isAuthenticated = !accessToken.empty() &&
-      (tokenExpiry <= 0 || GetCurrentTimeSec() < (tokenExpiry - 300));
+  bool isAuthenticated =
+      !accessToken.empty() && (tokenExpiry <= 0 || GetCurrentTimeSec() < (tokenExpiry - 300));
 
   if (!title.empty() && isAuthenticated)
   {
@@ -1797,7 +2187,8 @@ bool TraktScrobbler::IdentifyContent()
             m_year = foundYear;
           lock.unlock();
 
-          CLog::Log(LOGINFO, "TraktScrobbler: Content identified via URL title extraction - IMDB: {}",
+          CLog::Log(LOGINFO,
+                    "TraktScrobbler: Content identified via URL title extraction - IMDB: {}",
                     foundImdb);
           return true;
         }
@@ -1806,7 +2197,7 @@ bool TraktScrobbler::IdentifyContent()
   }
 
   CLog::Log(LOGDEBUG, "TraktScrobbler: Content not yet identified (url={}, title={})",
-            mediaUrl, title);
+            RedactUrlForLog(mediaUrl), title);
   return false;
 }
 
@@ -1947,7 +2338,8 @@ std::string TraktScrobbler::ExtractTitleFromUrl(const std::string& url)
   // Pure computation on the URL string, no member access needed for the extraction.
   // May write to m_title and m_year, but IdentifyContent now manages those writes.
 
-  auto urlDecode = [](const std::string& encoded) -> std::string {
+  auto urlDecode = [](const std::string& encoded) -> std::string
+  {
     std::string decoded;
     for (size_t i = 0; i < encoded.size(); ++i)
     {
@@ -1969,6 +2361,14 @@ std::string TraktScrobbler::ExtractTitleFromUrl(const std::string& url)
 
   std::string bestSegment;
   std::string decoded = urlDecode(url);
+  std::string decodedLower = decoded;
+  StringUtils::ToLower(decodedLower);
+
+  // Tokenized proxy URLs are noisy, but some include a clean filename at the tail
+  // (e.g. /proxy/stream/Movie.Title.2025.1080p.mkv). Keep extraction enabled and
+  // rely on strict year/SxxEyy anchors + confidence checks below.
+  const bool tokenizedUrl = (decodedLower.find("/_token_") != std::string::npos ||
+                             decodedLower.find("token=") != std::string::npos);
 
   std::vector<std::string> segments;
   std::string segment;
@@ -1986,38 +2386,79 @@ std::string TraktScrobbler::ExtractTitleFromUrl(const std::string& url)
   if (!segment.empty())
     segments.push_back(segment);
 
+  const std::regex yearPattern("(?:19|20)\\d{2}");
+  const std::regex seasonEpisodePattern("\\bS\\d{1,2}E\\d{1,2}\\b", std::regex::icase);
   for (const auto& seg : segments)
   {
-    if (seg.size() < 5)
+    if (seg.size() < 5 || seg.size() > 220)
       continue;
 
-    bool hasYear = std::regex_search(seg, std::regex("(?:19|20)\\d{2}"));
-    bool hasWords = (seg.find(' ') != std::string::npos || seg.find('.') != std::string::npos);
+    bool hasYear = std::regex_search(seg, yearPattern);
+    bool hasSeasonEpisode = std::regex_search(seg, seasonEpisodePattern);
 
-    if (hasYear && (seg.size() > bestSegment.size()))
-      bestSegment = seg;
-    else if (hasWords && seg.size() > 20 && bestSegment.empty())
+    std::string segLower = seg;
+    StringUtils::ToLower(segLower);
+    if (tokenizedUrl && !hasYear && !hasSeasonEpisode &&
+        (segLower.find("_token_") != std::string::npos ||
+         segLower.find("token") != std::string::npos))
+    {
+      continue;
+    }
+
+    if ((hasYear || hasSeasonEpisode) && (seg.size() > bestSegment.size()))
       bestSegment = seg;
   }
 
   if (bestSegment.empty())
+  {
+    if (tokenizedUrl)
+      CLog::Log(LOGDEBUG, "TraktScrobbler: No anchored filename segment found in tokenized URL");
     return "";
+  }
 
   StringUtils::Replace(bestSegment, ".", " ");
 
-  std::regex titleYearPattern("^(.+?)\\s+\\(?((?:19|20)\\d{2})\\)?\\b");
+  std::string extractedTitle;
   std::smatch match;
+  std::regex titleYearPattern("^(.+?)\\s+\\(?((?:19|20)\\d{2})\\)?\\b");
   if (std::regex_search(bestSegment, match, titleYearPattern))
+    extractedTitle = match[1].str();
+  else
   {
-    std::string extractedTitle = match[1].str();
+    std::regex titleEpisodePattern("^(.+?)\\s+S\\d{1,2}E\\d{1,2}\\b", std::regex::icase);
+    if (std::regex_search(bestSegment, match, titleEpisodePattern))
+      extractedTitle = match[1].str();
+  }
+
+  if (!extractedTitle.empty())
+  {
     // Note: year is extracted but not written to m_year here.
     // The caller (IdentifyContent) handles member writes under lock.
-
     std::regex tagsPattern("\\s+(?:S\\d{2}|WEB|BluRay|BDRip|HDRip|DVDRip|HDTV|REMUX).*$",
                            std::regex::icase);
     extractedTitle = std::regex_replace(extractedTitle, tagsPattern, "");
-    CLog::Log(LOGDEBUG, "TraktScrobbler: Extracted from URL - title='{}'", extractedTitle);
-    return extractedTitle;
+    StringUtils::Trim(extractedTitle);
+
+    // Reject low-confidence token-like strings to avoid wrong scrobbles.
+    int letters = 0;
+    int spaces = 0;
+    bool hasDigit = false;
+    for (char c : extractedTitle)
+    {
+      unsigned char uc = static_cast<unsigned char>(c);
+      if (std::isalpha(uc))
+        ++letters;
+      else if (std::isdigit(uc))
+        hasDigit = true;
+      else if (c == ' ')
+        ++spaces;
+    }
+
+    if (letters >= 4 && spaces >= 1 && !hasDigit)
+    {
+      CLog::Log(LOGDEBUG, "TraktScrobbler: Extracted from URL - title='{}'", extractedTitle);
+      return extractedTitle;
+    }
   }
 
   return "";
@@ -2083,9 +2524,9 @@ bool TraktScrobbler::SearchTrakt(const std::string& query)
 // Does NOT access any member fields (except static constants). Thread-safe.
 // ---------------------------------------------------------------------------
 bool TraktScrobbler::TraktPostWithToken(const std::string& endpoint,
-                                         const std::string& jsonBody,
-                                         std::string& response,
-                                         const std::string& accessToken)
+                                        const std::string& jsonBody,
+                                        std::string& response,
+                                        const std::string& accessToken)
 {
   XFILE::CCurlFile curl;
   curl.SetRequestHeader("Content-Type", "application/json");
@@ -2113,8 +2554,8 @@ bool TraktScrobbler::TraktPostWithToken(const std::string& endpoint,
 // Does NOT access any member fields (except static constants). Thread-safe.
 // ---------------------------------------------------------------------------
 bool TraktScrobbler::TraktGetWithToken(const std::string& endpoint,
-                                        std::string& response,
-                                        const std::string& accessToken)
+                                       std::string& response,
+                                       const std::string& accessToken)
 {
   XFILE::CCurlFile curl;
   curl.SetRequestHeader("Content-Type", "application/json");
@@ -2142,49 +2583,91 @@ bool TraktScrobbler::TraktGetWithToken(const std::string& endpoint,
 // TraktPostWithToken. Includes retry-on-failure with token refresh.
 // ---------------------------------------------------------------------------
 bool TraktScrobbler::TraktPost(const std::string& endpoint,
-                                const std::string& jsonBody,
-                                std::string& response)
+                               const std::string& jsonBody,
+                               std::string& response)
 {
   // Read access token under lock
   std::unique_lock lock(m_critSection);
   std::string accessToken = m_accessToken;
   bool authInProgress = m_authInProgress;
+  const bool profileRuntimeApplied = m_profileRuntimeApplied;
+  const uint64_t authorityGeneration = m_authAuthorityGeneration;
   lock.unlock();
 
   if (TraktPostWithToken(endpoint, jsonBody, response, accessToken))
-    return true;
+  {
+    lock.lock();
+    const bool current = m_authAuthorityGeneration == authorityGeneration;
+    lock.unlock();
+    ClearSensitive(accessToken);
+    return current;
+  }
 
   // POST failed -- try token refresh and retry once
-  if (!accessToken.empty() && !authInProgress)
+  if (!profileRuntimeApplied && !accessToken.empty() && !authInProgress)
   {
+    lock.lock();
+    const bool mayRefresh = !m_profileRuntimeApplied &&
+                            m_authAuthorityGeneration == authorityGeneration &&
+                            m_accessToken == accessToken;
+    lock.unlock();
+    if (!mayRefresh)
+    {
+      ClearSensitive(accessToken);
+      return false;
+    }
+
     CLog::Log(LOGINFO, "TraktScrobbler: Attempting token refresh after POST failure");
     if (RefreshAccessToken())
     {
       // Re-read refreshed token
       lock.lock();
+      if (m_profileRuntimeApplied || m_authAuthorityGeneration != authorityGeneration)
+      {
+        lock.unlock();
+        ClearSensitive(accessToken);
+        return false;
+      }
+      ClearSensitive(accessToken);
       accessToken = m_accessToken;
       lock.unlock();
 
       if (TraktPostWithToken(endpoint, jsonBody, response, accessToken))
       {
+        lock.lock();
+        const bool current =
+            !m_profileRuntimeApplied && m_authAuthorityGeneration == authorityGeneration;
+        lock.unlock();
+        ClearSensitive(accessToken);
+        if (!current)
+          return false;
         CLog::Log(LOGINFO, "TraktScrobbler: POST {} succeeded after token refresh", endpoint);
         return true;
       }
     }
 
     // Refresh failed or retry failed -- trigger full re-auth
-    CLog::Log(LOGWARNING, "TraktScrobbler: Token refresh failed, forcing re-auth");
     lock.lock();
-    m_accessToken.clear();
-    m_refreshToken.clear();
+    if (m_profileRuntimeApplied || m_authAuthorityGeneration != authorityGeneration)
+    {
+      lock.unlock();
+      ClearSensitive(accessToken);
+      return false;
+    }
+    ClearSensitive(m_accessToken);
+    ClearSensitive(m_refreshToken);
     m_tokenExpiry = 0;
     lock.unlock();
+    ClearSensitive(accessToken);
 
-    CGUIDialogKaiToast::QueueNotification(
-        CGUIDialogKaiToast::Warning, "Trakt",
-        "Session expired, re-authenticating...", 5000, true);
+    CLog::Log(LOGWARNING, "TraktScrobbler: Token refresh failed, forcing re-auth");
+
+    CGUIDialogKaiToast::QueueNotification(CGUIDialogKaiToast::Warning, "Trakt",
+                                          "Session expired, re-authenticating...", 5000, true);
     StartDeviceCodeAuth();
   }
+
+  ClearSensitive(accessToken);
 
   return false;
 }
@@ -2194,9 +2677,15 @@ bool TraktScrobbler::TraktGet(const std::string& endpoint, std::string& response
   // Read access token under lock
   std::unique_lock lock(m_critSection);
   std::string accessToken = m_accessToken;
+  const uint64_t authorityGeneration = m_authAuthorityGeneration;
   lock.unlock();
 
-  return TraktGetWithToken(endpoint, response, accessToken);
+  const bool requested = TraktGetWithToken(endpoint, response, accessToken);
+  ClearSensitive(accessToken);
+  lock.lock();
+  const bool current = m_authAuthorityGeneration == authorityGeneration;
+  lock.unlock();
+  return requested && current;
 }
 
 std::string TraktScrobbler::BuildScrobbleJson(float progress)
@@ -2272,26 +2761,35 @@ int TraktScrobbler::GetTraktResumePosition()
   if (!IsAuthenticated() || !m_contentIdentified)
     return 0;
 
-  // Copy state for HTTP
-  std::string type = (m_season >= 0 && m_episode >= 0) ? "episodes" : "movies";
-  std::string endpoint = "/sync/playback/" + type;
+  const std::string type = (m_season >= 0 && m_episode >= 0) ? "episodes" : "movies";
+  const std::string endpoint = "/sync/playback/" + type;
   std::string accessToken = m_accessToken;
-  std::string imdbId = m_imdbId;
-  int season = m_season;
-  int episode = m_episode;
+  const std::string imdbId = m_imdbId;
+  const int season = m_season;
+  const int episode = m_episode;
+  const std::string profileId = m_bridgeProfileId;
+  const uint64_t authorityGeneration = m_authAuthorityGeneration;
 
   lock.unlock();
 
-  // HTTP without lock
   std::string response;
   if (!TraktGetWithToken(endpoint, response, accessToken))
+  {
+    ClearSensitive(accessToken);
+    ClearSensitive(response);
     return 0;
+  }
+  ClearSensitive(accessToken);
 
   CVariant results;
   if (!CJSONVariantParser::Parse(response, results) || !results.isArray())
+  {
+    ClearSensitive(response);
     return 0;
+  }
+  ClearSensitive(response);
 
-  // Find matching entry (uses local copies)
+  float progress = -1.0f;
   for (unsigned int i = 0; i < results.size(); ++i)
   {
     const CVariant& item = results[i];
@@ -2304,17 +2802,8 @@ int TraktScrobbler::GetTraktResumePosition()
         std::string itemImdb = movie["ids"]["imdb"].asString();
         if (itemImdb == imdbId)
         {
-          float progress = item["progress"].asFloat(0.0f);
-          const auto& components = CServiceBroker::GetAppComponents();
-          const auto appPlayer = components.GetComponent<CApplicationPlayer>();
-          int64_t totalMs = appPlayer->GetTotalTime();
-          if (totalMs > 0)
-          {
-            int posMs = static_cast<int>(progress / 100.0f * static_cast<float>(totalMs));
-            CLog::Log(LOGINFO, "TraktScrobbler: Trakt resume for {} - {:.1f}% = {} ms",
-                      imdbId, progress, posMs);
-            return posMs;
-          }
+          progress = item["progress"].asFloat(0.0f);
+          break;
         }
       }
     }
@@ -2330,23 +2819,48 @@ int TraktScrobbler::GetTraktResumePosition()
 
         if (itemImdb == imdbId && itemSeason == season && itemEpisode == episode)
         {
-          float progress = item["progress"].asFloat(0.0f);
-          const auto& components = CServiceBroker::GetAppComponents();
-          const auto appPlayer = components.GetComponent<CApplicationPlayer>();
-          int64_t totalMs = appPlayer->GetTotalTime();
-          if (totalMs > 0)
-          {
-            int posMs = static_cast<int>(progress / 100.0f * static_cast<float>(totalMs));
-            CLog::Log(LOGINFO, "TraktScrobbler: Trakt resume for {} S{}E{} - {:.1f}% = {} ms",
-                      imdbId, season, episode, progress, posMs);
-            return posMs;
-          }
+          progress = item["progress"].asFloat(0.0f);
+          break;
         }
       }
     }
   }
 
-  return 0;
+  results = CVariant{};
+  if (progress < 0.0f)
+    return 0;
+
+  const auto& components = CServiceBroker::GetAppComponents();
+  const auto appPlayer = components.GetComponent<CApplicationPlayer>();
+  const int64_t totalMs = appPlayer->GetTotalTime();
+  if (totalMs <= 0)
+    return 0;
+
+  const int posMs = static_cast<int>(progress / 100.0f * static_cast<float>(totalMs));
+
+  lock.lock();
+  const bool current = m_initialized && m_authAuthorityGeneration == authorityGeneration &&
+                       m_bridgeProfileId == profileId && m_imdbId == imdbId && m_season == season &&
+                       m_episode == episode;
+  lock.unlock();
+  if (!current)
+  {
+    CLog::Log(LOGDEBUG,
+              "TraktScrobbler: Discarded stale personalized resume after authority change");
+    return 0;
+  }
+
+  if (type == "episodes")
+  {
+    CLog::Log(LOGINFO, "TraktScrobbler: Trakt resume for {} S{}E{} - {:.1f}% = {} ms", imdbId,
+              season, episode, progress, posMs);
+  }
+  else
+  {
+    CLog::Log(LOGINFO, "TraktScrobbler: Trakt resume for {} - {:.1f}% = {} ms", imdbId, progress,
+              posMs);
+  }
+  return posMs;
 }
 
 float TraktScrobbler::GetPlaybackProgress() const

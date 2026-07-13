@@ -44,6 +44,13 @@ class CVideoSyncAndroid;
 class TraktScrobbler;
 class SubtitleDownloader;
 
+namespace KODI::JUMPGATE
+{
+class CAndroidJumpgateCredentialStore;
+class CJumpgateProfileRuntime;
+class CJumpgateProfileStorage;
+}
+
 typedef struct _JNIEnv JNIEnv;
 
 struct androidIcon
@@ -113,6 +120,7 @@ public:
   virtual void onAudioFocusChange(int focusChange);
   void doFrame(int64_t frameTimeNanos) override;
   void onVisibleBehindCanceled() override;
+  void onOpenSettingsRequested() override;
 
   // implementation of CJNIInputManagerInputDeviceListener
   void onInputDeviceAdded(int deviceId) override;
@@ -198,9 +206,12 @@ public:
   int LoadResumePosition(const std::string& imdbId, int season, int episode);
   void OnContentIdentified();
 
-  // Settings
-  void LoadSettings();
-  void SaveSettings();
+  // Jumpgate profile/settings runtime
+  bool InitializeJumpgateProfileRuntime();
+  void ApplyActiveJumpgateProfile();
+  void HandleJumpgateManagerCommand(const std::string& command);
+  void ShowJumpgateProfileManager();
+  void ShowJumpgateProfilePicker(bool removeProfile);
   void ShowSettingsDialog();
   std::string GetSettingString(const std::string& key, const std::string& defaultVal = "") const;
   bool GetSettingBool(const std::string& key, bool defaultVal = true) const;
@@ -260,6 +271,13 @@ private:
   void run();
   void stop();
   void SetupEnv();
+  void StartBridgePairing();
+  static std::string GetBridgeOriginFromUrl(const std::string& currentUrl);
+  void StopBridgePairingWorker(bool clearPendingState);
+  void QueuePairingRedemption(std::string responseJson,
+                              const std::string& origin,
+                              const std::string& profileName);
+  void QueuePairingError(const std::string& errorMessage);
   void UpdateLoadingOverlayContentInfo(bool force);
   static void SetDisplayModeCallback(void* modeVariant);
   static void KeepScreenOnCallback(void* onVariant);
@@ -316,11 +334,23 @@ private:
   // Resume store file
   static constexpr const char* RESUME_STORE_FILE = "special://profile/jumpgate_resume.json";
 
-  // Settings
-  static constexpr const char* SETTINGS_FILE = "special://profile/jumpgate_settings.json";
-  CVariant m_settings;
-  mutable CCriticalSection m_settingsMutex;
+  // Profile metadata is plaintext but canonical and secret-free. Bearer/config
+  // material is held by the Android Keystore-backed credential store.
+  std::unique_ptr<KODI::JUMPGATE::CJumpgateProfileStorage> m_jumpgateProfileStorage;
+  std::unique_ptr<KODI::JUMPGATE::CAndroidJumpgateCredentialStore>
+      m_jumpgateCredentialStore;
+  std::unique_ptr<KODI::JUMPGATE::CJumpgateProfileRuntime> m_jumpgateProfileRuntime;
   std::atomic<bool> m_settingsRequested{false};
+  mutable CCriticalSection m_pairingMutex;
+  std::thread m_pairingThread;
+  std::atomic<bool> m_pairingInProgress{false};
+  std::atomic<bool> m_pairingStopRequested{false};
+  bool m_pairingRedemptionPending{false};
+  std::string m_pairingRedemptionJson;
+  std::string m_pairingRedemptionOrigin;
+  std::string m_pairingApplyProfileName;
+  bool m_pairingErrorPending{false};
+  std::string m_pairingErrorMessage;
   bool m_updateChecked{false};
   bool m_overlayHidden{false};
   std::string m_lastOverlayTitle;

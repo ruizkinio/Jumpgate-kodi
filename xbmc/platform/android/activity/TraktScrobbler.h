@@ -10,6 +10,8 @@
 #include "threads/CriticalSection.h"
 
 #include <atomic>
+#include <cstdint>
+#include <mutex>
 #include <string>
 
 class TraktScrobbler : public ANNOUNCEMENT::IAnnouncer
@@ -32,11 +34,8 @@ public:
   void ProcessSlow();
 
   // Content identification (set before playback starts)
-  void SetContentInfo(const std::string& imdbId,
-                      const std::string& title,
-                      int year,
-                      int season,
-                      int episode);
+  void SetContentInfo(
+      const std::string& imdbId, const std::string& title, int year, int season, int episode);
   void SetMediaUrl(const std::string& url);
   void ClearContentInfo();
 
@@ -62,7 +61,10 @@ public:
 
   // Bridge resume data (populated by QueryBridgeServer when available)
   // Uses std::atomic for lock-free cross-thread access (F-009 fix)
-  int GetBridgeResumePosition() const { return m_bridgeResumePositionMs.load(std::memory_order_relaxed); }
+  int GetBridgeResumePosition() const
+  {
+    return m_bridgeResumePositionMs.load(std::memory_order_relaxed);
+  }
   void ClearBridgeResume() { m_bridgeResumePositionMs.store(0, std::memory_order_relaxed); }
 
   // Trakt playback sync (cross-device resume)
@@ -71,6 +73,13 @@ public:
   // Bridge URL
   std::string GetBridgeUrl() const;
   void SetBridgeUrl(const std::string& url);
+  void SetBridgeProfile(const std::string& profileId,
+                        const std::string& bridgeOrigin,
+                        const std::string& bridgeBaseUrl,
+                        const std::string& deviceToken,
+                        bool traktEnabled);
+  void ClearBridgeProfile();
+  bool IsBridgeProfileBacked() const;
 
 private:
   // Auth
@@ -78,7 +87,6 @@ private:
   bool LoadTokens();
   bool SaveTokens();
   bool FetchAccessTokenFromBridge();
-  bool IsConfiguredBridgeUrl(const std::string& bridgeUrl) const;
   std::string NormalizeBridgeUrl(const std::string& url) const;
   std::string BuildBridgeEndpoint(const std::string& bridgeUrl, const std::string& endpoint) const;
   bool RefreshAccessToken();
@@ -94,7 +102,10 @@ private:
 
   // Content identification
   bool IdentifyContent();
-  bool HydrateFromTraktPublic(const std::string& id, int season, int episode, const std::string& mediaUrlSnapshot);
+  bool HydrateFromTraktPublic(const std::string& id,
+                              int season,
+                              int episode,
+                              const std::string& mediaUrlSnapshot);
   bool QueryBridgeServer();
   bool FetchLogoFromBridge(const std::string& imdbId, const std::string& mediaUrlSnapshot);
   bool SearchTrakt(const std::string& query);
@@ -114,9 +125,7 @@ private:
                          const std::string& accessToken);
 
   // HTTP helpers (legacy wrappers: read token under lock, then call *WithToken)
-  bool TraktPost(const std::string& endpoint,
-                 const std::string& jsonBody,
-                 std::string& response);
+  bool TraktPost(const std::string& endpoint, const std::string& jsonBody, std::string& response);
   bool TraktGet(const std::string& endpoint, std::string& response);
   std::string BuildScrobbleJson(float progress);
 
@@ -155,6 +164,13 @@ private:
 
   // Bridge server URL (resolved at startup via auto-detect)
   std::string m_bridgeUrl;
+  std::string m_bridgeOrigin;
+  std::string m_bridgeProfileId;
+  std::string m_bridgeDeviceToken;
+  bool m_bridgeProfileBacked{false};
+  bool m_bridgeTraktEnabled{false};
+  bool m_profileRuntimeApplied{false};
+  uint64_t m_authAuthorityGeneration{0};
 
   // Bridge resume data (from /identify response)
   // std::atomic for lock-free access from XBMCApp (F-009 fix)
@@ -177,12 +193,15 @@ private:
 
   // Trakt API constants
   static constexpr const char* TRAKT_API_URL = "https://api.trakt.tv";
-  static constexpr const char* TRAKT_CLIENT_ID = "d4161a7a106424551add171e5470112e4afdaf2438e6ef2fe0548edc75924868";
-  static constexpr const char* TRAKT_CLIENT_SECRET = "b5fcd7cb5d9bb963784d11bbf8535bc0d25d46225016191eb48e50792d2155c0";
+  static constexpr const char* TRAKT_CLIENT_ID =
+      "d4161a7a106424551add171e5470112e4afdaf2438e6ef2fe0548edc75924868";
+  static constexpr const char* TRAKT_CLIENT_SECRET =
+      "b5fcd7cb5d9bb963784d11bbf8535bc0d25d46225016191eb48e50792d2155c0";
 
   // Jumpgate Bridge server URLs
   static constexpr const char* BRIDGE_CLOUD_URL = "https://jumpgate-bridge.fly.dev";
   static constexpr const char* BRIDGE_LOCAL_URL = "http://127.0.0.1:7515";
 
+  std::mutex m_lifecycleMutex;
   mutable CCriticalSection m_critSection;
 };

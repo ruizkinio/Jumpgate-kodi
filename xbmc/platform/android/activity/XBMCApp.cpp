@@ -9,6 +9,8 @@
 #include "XBMCApp.h"
 
 #include "JumpgateThresholds.h"
+#include "AndroidJumpgateCredentialStore.h"
+#include "JumpgateProfileStorage.h"
 #include "SubtitleDownloader.h"
 #include "TraktScrobbler.h"
 
@@ -34,6 +36,7 @@
 #include "filesystem/SpecialProtocol.h"
 #include "filesystem/VideoDatabaseFile.h"
 #include "dialogs/GUIDialogKaiToast.h"
+#include "dialogs/GUIDialogOK.h"
 #include "dialogs/GUIDialogSelect.h"
 #include "dialogs/GUIDialogYesNo.h"
 #include "guilib/GUIKeyboardFactory.h"
@@ -54,6 +57,7 @@
 #include "threads/Event.h"
 #include "utils/JSONVariantParser.h"
 #include "utils/JSONVariantWriter.h"
+#include "utils/JumpgateProfileRuntime.h"
 #include "utils/StringUtils.h"
 #include "utils/TimeUtils.h"
 #include "utils/URIUtils.h"
@@ -71,6 +75,7 @@
 #include "platform/android/powermanagement/AndroidPowerSyscall.h"
 #include "platform/android/storage/AndroidStorageProvider.h"
 
+#include <algorithm>
 #include <memory>
 #include <mutex>
 #include <cstdio>
@@ -137,7 +142,20 @@ using namespace std::chrono_literals;
 // Forward declaration for static helper used in both Deinitialize() and onNewIntent()
 static void SaveResumeForContent(const std::string& imdbId, int season, int episode,
                                  int64_t posMs, int64_t durMs,
-                                 const std::string& bridgeUrl);
+                                  const std::string& bridgeUrl);
+
+static std::string NoRedirectUrl(const std::string& url)
+{
+  CURL requestUrl(url);
+  requestUrl.SetProtocolOption("redirect-limit", "0");
+  return requestUrl.Get();
+}
+
+static void ClearSensitiveString(std::string& value)
+{
+  std::fill(value.begin(), value.end(), '\0');
+  value.clear();
+}
 
 static bool IsAndroidEmulatorDevice()
 {
@@ -265,6 +283,7 @@ CXBMCApp::CXBMCApp(ANativeActivity* nativeActivity, IInputHandler& inputHandler)
 
 CXBMCApp::~CXBMCApp()
 {
+  StopBridgePairingWorker(true);
 }
 
 void CXBMCApp::Announce(ANNOUNCEMENT::AnnouncementFlag flag,
@@ -487,6 +506,8 @@ void CXBMCApp::onDestroy()
 {
   android_printf("%s", __PRETTY_FUNCTION__);
 
+  StopBridgePairingWorker(true);
+
   // Safety-net: save resume position to local file (F-008)
   // Local file I/O only -- no Bridge POST (too slow for onDestroy)
   if (m_externalPlayerMode.load(std::memory_order_relaxed) && m_traktScrobbler)
@@ -603,18 +624,15 @@ void CXBMCApp::Initialize()
   CServiceBroker::GetAnnouncementManager()->AddAnnouncer(
       this, ANNOUNCEMENT::Input | ANNOUNCEMENT::Player | ANNOUNCEMENT::Info);
 
+  InitializeJumpgateProfileRuntime();
+
   if (m_externalPlayerMode.load(std::memory_order_relaxed))
   {
-    LoadSettings();
     ApplyEmulatorPlaybackSafetyOverrides();
 
     m_traktScrobbler = std::make_unique<TraktScrobbler>();
+    ApplyActiveJumpgateProfile();
     m_traktScrobbler->Initialize();
-
-    // Pass Bridge URL from settings if configured
-    std::string bridgeUrl = GetSettingString("bridge_url", "");
-    if (!bridgeUrl.empty())
-      m_traktScrobbler->SetBridgeUrl(bridgeUrl);
 
     m_subtitleDownloader = std::make_unique<SubtitleDownloader>();
     m_subtitleDownloader->Initialize();
@@ -1452,89 +1470,398 @@ void CXBMCApp::UpdateLoadingOverlayContentInfo(bool force)
                     jcast<jhstring>(logoUrl));
 }
 
-// --- Settings ---
+// --- Secure profile runtime and settings ---
 
-void CXBMCApp::LoadSettings()
+bool CXBMCApp::InitializeJumpgateProfileRuntime()
 {
-  std::unique_lock lock(m_settingsMutex);
-
-  std::string path = CSpecialProtocol::TranslatePath(SETTINGS_FILE);
-  XFILE::CFile file;
-  std::vector<uint8_t> buffer;
-
-  if (file.LoadFile(path, buffer) > 0)
+  if (!m_jumpgateProfileStorage)
+    m_jumpgateProfileStorage = std::make_unique<KODI::JUMPGATE::CJumpgateProfileStorage>(
+        "special://profile/jumpgate_settings.json");
+  if (!m_jumpgateCredentialStore)
+    m_jumpgateCredentialStore =
+        std::make_unique<KODI::JUMPGATE::CAndroidJumpgateCredentialStore>();
+  if (!m_jumpgateProfileRuntime)
   {
-    std::string json(buffer.begin(), buffer.end());
-    if (CJSONVariantParser::Parse(json, m_settings))
-    {
-      CLog::Log(LOGINFO, "CXBMCApp: Settings loaded from {}", path);
-      return;
-    }
+    m_jumpgateProfileRuntime = std::make_unique<KODI::JUMPGATE::CJumpgateProfileRuntime>(
+        *m_jumpgateProfileStorage, *m_jumpgateCredentialStore);
   }
 
-  // Initialize defaults
-  m_settings = CVariant(CVariant::VariantTypeObject);
-  m_settings["subtitle_languages"] = "en";
-  m_settings["trakt_enabled"] = true;
-  m_settings["subtitles_enabled"] = true;
-  m_settings["bridge_url"] = "";
-  m_settings["auto_update_check"] = true;
-  CLog::Log(LOGINFO, "CXBMCApp: Settings initialized with defaults");
+  std::string error;
+  if (!m_jumpgateProfileRuntime->Initialize(error))
+  {
+    CLog::Log(LOGERROR, "CXBMCApp: Jumpgate profile runtime failed closed: {}", error);
+    return false;
+  }
+  return true;
 }
 
-void CXBMCApp::SaveSettings()
+void CXBMCApp::ApplyActiveJumpgateProfile()
 {
-  std::unique_lock lock(m_settingsMutex);
-
-  std::string json;
-  if (!CJSONVariantWriter::Write(m_settings, json, true))
-  {
-    CLog::Log(LOGERROR, "CXBMCApp: Failed to serialize settings");
+  if (!m_jumpgateProfileRuntime || !m_traktScrobbler)
     return;
+
+  KODI::JUMPGATE::ActiveProfile active = m_jumpgateProfileRuntime->GetActive();
+  if (active.selected)
+  {
+    m_traktScrobbler->SetBridgeProfile(active.profileId, active.bridgeOrigin,
+                                       active.bridgeBaseUrl, active.deviceToken,
+                                       active.traktEnabled && active.credentialsValid);
+  }
+  else
+  {
+    m_traktScrobbler->ClearBridgeProfile();
   }
 
-  std::string path = CSpecialProtocol::TranslatePath(SETTINGS_FILE);
-  XFILE::CFile outFile;
-  if (outFile.OpenForWrite(path, true))
-  {
-    outFile.Write(json.c_str(), json.size());
-    outFile.Close();
-    CLog::Log(LOGINFO, "CXBMCApp: Settings saved");
-  }
+  if (m_subtitleDownloader)
+    m_subtitleDownloader->SetLanguages(active.subtitleLanguages);
+  active.ClearSecrets();
 }
 
 std::string CXBMCApp::GetSettingString(const std::string& key, const std::string& defaultVal) const
 {
-  std::unique_lock lock(m_settingsMutex);
-  if (m_settings.isMember(key))
-    return m_settings[key].asString();
-  return defaultVal;
+  if (!m_jumpgateProfileRuntime)
+    return defaultVal;
+  KODI::JUMPGATE::ActiveProfile active = m_jumpgateProfileRuntime->GetActive();
+  std::string value = defaultVal;
+  if (key == "subtitle_languages")
+    value = active.subtitleLanguages;
+  active.ClearSecrets();
+  return value;
 }
 
 bool CXBMCApp::GetSettingBool(const std::string& key, bool defaultVal) const
 {
-  std::unique_lock lock(m_settingsMutex);
-  if (m_settings.isMember(key))
-    return m_settings[key].asBoolean();
-  return defaultVal;
+  if (!m_jumpgateProfileRuntime)
+    return defaultVal;
+  KODI::JUMPGATE::ActiveProfile active = m_jumpgateProfileRuntime->GetActive();
+  bool value = defaultVal;
+  if (key == "trakt_enabled")
+    value = active.traktEnabled;
+  else if (key == "subtitles_enabled")
+    value = active.subtitlesEnabled;
+  else if (key == "auto_update_check")
+    value = active.autoUpdateCheck;
+  active.ClearSecrets();
+  return value;
 }
 
 void CXBMCApp::SetSetting(const std::string& key, const std::string& value)
 {
-  {
-    std::unique_lock lock(m_settingsMutex);
-    m_settings[key] = value;
-  }
-  SaveSettings();
+  if (!m_jumpgateProfileRuntime)
+    return;
+  std::string error;
+  if (!m_jumpgateProfileRuntime->SetActiveSetting(key, CVariant{value}, error))
+    CLog::Log(LOGERROR, "CXBMCApp: Jumpgate setting update rejected: {}", error);
+  ApplyActiveJumpgateProfile();
 }
 
 void CXBMCApp::SetSetting(const std::string& key, bool value)
 {
+  if (!m_jumpgateProfileRuntime)
+    return;
+  std::string error;
+  if (!m_jumpgateProfileRuntime->SetActiveSetting(key, CVariant{value}, error))
+    CLog::Log(LOGERROR, "CXBMCApp: Jumpgate setting update rejected: {}", error);
+  ApplyActiveJumpgateProfile();
+}
+
+std::string CXBMCApp::GetBridgeOriginFromUrl(const std::string& currentUrl)
+{
+  std::string normalized = currentUrl;
+  StringUtils::Trim(normalized);
+  if (normalized.empty())
+    return "";
+
+  size_t schemePos = normalized.find("://");
+  if (schemePos == std::string::npos)
   {
-    std::unique_lock lock(m_settingsMutex);
-    m_settings[key] = value;
+    normalized = "https://" + normalized;
+    schemePos = normalized.find("://");
   }
-  SaveSettings();
+
+  if (schemePos == std::string::npos)
+    return "";
+
+  std::string scheme = StringUtils::ToLower(normalized.substr(0, schemePos));
+  if (scheme == "stremio")
+    scheme = "https";
+
+  const size_t authorityStart = schemePos + 3;
+  if (authorityStart >= normalized.size())
+    return "";
+
+  const size_t authorityEnd = normalized.find_first_of("/?#", authorityStart);
+  std::string authority = normalized.substr(
+      authorityStart, authorityEnd == std::string::npos ? std::string::npos : authorityEnd - authorityStart);
+  if (authority.empty())
+    return "";
+
+  return scheme + "://" + authority;
+}
+
+void CXBMCApp::QueuePairingRedemption(std::string responseJson,
+                                      const std::string& origin,
+                                      const std::string& profileName)
+{
+  std::unique_lock lock(m_pairingMutex);
+  ClearSensitiveString(m_pairingRedemptionJson);
+  m_pairingRedemptionJson = std::move(responseJson);
+  m_pairingRedemptionOrigin = origin;
+  m_pairingApplyProfileName = profileName;
+  m_pairingRedemptionPending = true;
+  m_pairingErrorPending = false;
+  m_pairingErrorMessage.clear();
+}
+
+void CXBMCApp::QueuePairingError(const std::string& errorMessage)
+{
+  std::unique_lock lock(m_pairingMutex);
+  m_pairingErrorPending = true;
+  m_pairingErrorMessage = errorMessage;
+  m_pairingRedemptionPending = false;
+  ClearSensitiveString(m_pairingRedemptionJson);
+  m_pairingRedemptionOrigin.clear();
+  m_pairingApplyProfileName.clear();
+}
+
+void CXBMCApp::StopBridgePairingWorker(bool clearPendingState)
+{
+  m_pairingStopRequested.store(true, std::memory_order_relaxed);
+
+  if (m_pairingThread.joinable())
+    m_pairingThread.join();
+
+  m_pairingInProgress.store(false, std::memory_order_relaxed);
+  m_pairingStopRequested.store(false, std::memory_order_relaxed);
+
+  if (clearPendingState)
+  {
+    std::unique_lock lock(m_pairingMutex);
+    m_pairingRedemptionPending = false;
+    ClearSensitiveString(m_pairingRedemptionJson);
+    m_pairingRedemptionOrigin.clear();
+    m_pairingApplyProfileName.clear();
+    m_pairingErrorPending = false;
+    m_pairingErrorMessage.clear();
+  }
+}
+
+void CXBMCApp::StartBridgePairing()
+{
+  if (m_playback_state & (PLAYBACK_STATE_VIDEO | PLAYBACK_STATE_AUDIO))
+  {
+    CGUIDialogKaiToast::QueueNotification(CGUIDialogKaiToast::Warning, "Jumpgate",
+                                          "Stop playback before pairing a profile", 4000,
+                                          true);
+    return;
+  }
+
+  if (m_pairingInProgress.load(std::memory_order_relaxed))
+  {
+    CGUIDialogKaiToast::QueueNotification(
+        CGUIDialogKaiToast::Info, "Jumpgate", "Pairing already in progress", 3000, true);
+    return;
+  }
+
+  StopBridgePairingWorker(false); // join stale completed worker, if any
+  m_pairingStopRequested.store(false, std::memory_order_relaxed);
+  m_pairingInProgress.store(true, std::memory_order_relaxed);
+
+  {
+    std::unique_lock lock(m_pairingMutex);
+    m_pairingRedemptionPending = false;
+    ClearSensitiveString(m_pairingRedemptionJson);
+    m_pairingRedemptionOrigin.clear();
+    m_pairingApplyProfileName.clear();
+    m_pairingErrorPending = false;
+    m_pairingErrorMessage.clear();
+  }
+
+  auto failStart = [this](const std::string& msg) {
+    CLog::Log(LOGWARNING, "CXBMCApp: Pairing start failed: {}", msg);
+    QueuePairingError(msg);
+    m_pairingInProgress.store(false, std::memory_order_relaxed);
+  };
+
+  if (!InitializeJumpgateProfileRuntime())
+  {
+    failStart("Pairing failed: secure profile runtime is unavailable");
+    return;
+  }
+
+  // Capture one immutable origin. Code issuance, polling, response validation,
+  // and credential commit all remain bound to this exact origin.
+  const std::string origin = m_jumpgateProfileRuntime->GetPairingOrigin();
+  if (!KODI::JUMPGATE::IsValidPairingOrigin(origin, true))
+  {
+    failStart("Pairing failed: invalid Bridge origin");
+    return;
+  }
+
+  XFILE::CCurlFile curl;
+  curl.SetRequestHeader("Content-Type", "application/json");
+  curl.SetTimeout(8);
+
+  CVariant body(CVariant::VariantTypeObject);
+  std::string bodyJson;
+  if (!CJSONVariantWriter::Write(body, bodyJson, true))
+    bodyJson = "{}";
+
+  std::string response;
+  if (!curl.Post(NoRedirectUrl(origin + "/pair/device/code"), bodyJson, response))
+  {
+    failStart("Pairing failed: unable to reach Bridge");
+    return;
+  }
+
+  CVariant data;
+  if (!CJSONVariantParser::Parse(response, data))
+  {
+    failStart("Pairing failed: invalid Bridge response");
+    return;
+  }
+
+  if (data.isMember("ok") && !data["ok"].asBoolean())
+  {
+    const std::string err =
+        data.isMember("error") ? data["error"].asString() : std::string("Pairing start rejected");
+    failStart(err);
+    return;
+  }
+
+  std::string userCode = data.isMember("user_code") ? data["user_code"].asString() : "";
+  if (userCode.empty())
+    userCode = data.isMember("userCode") ? data["userCode"].asString() : "";
+
+  std::string deviceCode = data.isMember("device_code") ? data["device_code"].asString() : "";
+  if (deviceCode.empty())
+    deviceCode = data.isMember("deviceCode") ? data["deviceCode"].asString() : "";
+
+  std::string verificationUrl =
+      data.isMember("verification_url") ? data["verification_url"].asString() : "";
+  if (verificationUrl.empty())
+    verificationUrl = data.isMember("verificationUrl") ? data["verificationUrl"].asString() : "";
+
+  int expiresIn =
+      data.isMember("expires_in") ? static_cast<int>(data["expires_in"].asInteger(0)) : 0;
+  if (expiresIn <= 0)
+    expiresIn = data.isMember("expiresIn") ? static_cast<int>(data["expiresIn"].asInteger(0)) : 0;
+  int interval = data.isMember("interval") ? static_cast<int>(data["interval"].asInteger(0)) : 0;
+
+  if (verificationUrl.empty())
+    verificationUrl = origin + "/configure";
+  if (expiresIn <= 0)
+    expiresIn = 600;
+  if (interval <= 0)
+    interval = 2;
+
+  if (userCode.empty() || deviceCode.empty())
+  {
+    failStart("Pairing failed: invalid code response");
+    return;
+  }
+
+  CGUIDialogOK::ShowAndGetInput(
+      CVariant{"Pair Jumpgate"},
+      CVariant{"On your phone or laptop, open:"},
+      CVariant{verificationUrl},
+      CVariant{"Enter code: " + userCode});
+
+  m_pairingThread = std::thread([this, origin, deviceCode, expiresIn, interval]() {
+    auto getStringOrEmpty = [](const CVariant& payload, const char* key) {
+      return payload.isMember(key) ? payload[key].asString() : std::string{};
+    };
+
+    const int pollIntervalSec = std::max(1, interval);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(expiresIn);
+
+    while (!m_pairingStopRequested.load(std::memory_order_relaxed) &&
+           std::chrono::steady_clock::now() < deadline)
+    {
+      CVariant pollBody(CVariant::VariantTypeObject);
+      pollBody["device_code"] = deviceCode;
+
+      std::string pollBodyJson;
+      if (!CJSONVariantWriter::Write(pollBody, pollBodyJson, true))
+      {
+        if (!m_pairingStopRequested.load(std::memory_order_relaxed))
+          QueuePairingError("Pairing failed: request serialization error");
+        m_pairingInProgress.store(false, std::memory_order_relaxed);
+        return;
+      }
+
+      XFILE::CCurlFile pollCurl;
+      pollCurl.SetRequestHeader("Content-Type", "application/json");
+      pollCurl.SetTimeout(8);
+
+      std::string pollResponse;
+      if (!pollCurl.Post(NoRedirectUrl(origin + "/pair/device/token"), pollBodyJson,
+                         pollResponse))
+      {
+        if (!m_pairingStopRequested.load(std::memory_order_relaxed))
+          QueuePairingError("Pairing failed: unable to reach Bridge");
+        m_pairingInProgress.store(false, std::memory_order_relaxed);
+        return;
+      }
+
+      CVariant pollData;
+      if (!CJSONVariantParser::Parse(pollResponse, pollData))
+      {
+        ClearSensitiveString(pollResponse);
+        if (!m_pairingStopRequested.load(std::memory_order_relaxed))
+          QueuePairingError("Pairing failed: invalid token response");
+        m_pairingInProgress.store(false, std::memory_order_relaxed);
+        return;
+      }
+
+      if (pollData.isMember("ok") && !pollData["ok"].asBoolean())
+      {
+        std::string err = getStringOrEmpty(pollData, "error");
+        if (err.empty())
+          err = getStringOrEmpty(pollData, "message");
+        if (err.empty())
+          err = "Pairing failed";
+        ClearSensitiveString(pollResponse);
+        if (!m_pairingStopRequested.load(std::memory_order_relaxed))
+          QueuePairingError(err);
+        m_pairingInProgress.store(false, std::memory_order_relaxed);
+        return;
+      }
+
+      const bool paired = pollData.isMember("paired") && pollData["paired"].asBoolean();
+      if (paired)
+      {
+        std::string profileName = getStringOrEmpty(pollData, "name");
+        if (profileName.empty())
+          profileName = getStringOrEmpty(pollData, "profile_name");
+        if (profileName.empty())
+          profileName = getStringOrEmpty(pollData, "profileName");
+
+        // Commit through AndroidKeyStore on Kodi's main thread. The polling
+        // worker never makes JNI calls or mutates the active profile runtime.
+        QueuePairingRedemption(std::move(pollResponse), origin, profileName);
+        ClearSensitiveString(pollResponse);
+        m_pairingInProgress.store(false, std::memory_order_relaxed);
+        return;
+      }
+
+      ClearSensitiveString(pollResponse);
+
+      const int sleepMs = pollIntervalSec * 1000;
+      for (int elapsed = 0; elapsed < sleepMs; elapsed += 200)
+      {
+        if (m_pairingStopRequested.load(std::memory_order_relaxed) ||
+            std::chrono::steady_clock::now() >= deadline)
+          break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      }
+    }
+
+    if (!m_pairingStopRequested.load(std::memory_order_relaxed))
+      QueuePairingError("Pairing expired, try again");
+
+    m_pairingInProgress.store(false, std::memory_order_relaxed);
+  });
 }
 
 void CXBMCApp::CheckForUpdate()
@@ -1546,11 +1873,16 @@ void CXBMCApp::CheckForUpdate()
   if (bridgeUrl.empty())
     return;
 
+  // Configured Bridge URLs include /_c/<config>; version endpoint lives at host root.
+  std::string bridgeOrigin = GetBridgeOriginFromUrl(bridgeUrl);
+  if (bridgeOrigin.empty())
+    bridgeOrigin = bridgeUrl;
+
   XFILE::CCurlFile curl;
   curl.SetTimeout(3);
   std::string response;
 
-  if (!curl.Get(bridgeUrl + "/version", response))
+  if (!curl.Get(bridgeOrigin + "/version", response))
     return;
 
   CVariant data;
@@ -1587,6 +1919,223 @@ void CXBMCApp::CheckForUpdate()
   }
 }
 
+void CXBMCApp::ShowJumpgateProfilePicker(bool removeProfile)
+{
+  if (m_playback_state & (PLAYBACK_STATE_VIDEO | PLAYBACK_STATE_AUDIO))
+  {
+    CGUIDialogKaiToast::QueueNotification(
+        CGUIDialogKaiToast::Warning, "Jumpgate",
+        "Stop playback before changing the active profile", 4000, true);
+    return;
+  }
+
+  if (!InitializeJumpgateProfileRuntime())
+    return;
+
+  const std::vector<KODI::JUMPGATE::ProfileMetadata> profiles =
+      m_jumpgateProfileRuntime->GetProfiles();
+  if (profiles.empty())
+  {
+    CGUIDialogKaiToast::QueueNotification(CGUIDialogKaiToast::Info, "Jumpgate",
+                                          "No paired profiles", 3000, true);
+    return;
+  }
+
+  CGUIDialogSelect* dialog =
+      CServiceBroker::GetGUI()->GetWindowManager().GetWindow<CGUIDialogSelect>(
+          WINDOW_DIALOG_SELECT);
+  if (!dialog)
+    return;
+  dialog->Reset();
+  dialog->SetHeading(CVariant{removeProfile ? "Forget Jumpgate Profile"
+                                            : "Select Jumpgate Profile"});
+  for (const auto& profile : profiles)
+  {
+    std::string label = profile.name.empty() ? "Jumpgate Profile" : profile.name;
+    if (profile.active)
+      label += " [active]";
+    if (profile.state != "paired")
+      label += " [" + profile.state + "]";
+    dialog->Add(label);
+  }
+  dialog->Open();
+  if (!dialog->IsConfirmed())
+    return;
+
+  const int selected = dialog->GetSelectedItem();
+  if (selected < 0 || static_cast<size_t>(selected) >= profiles.size())
+    return;
+  const auto& profile = profiles[static_cast<size_t>(selected)];
+
+  std::string error;
+  bool changed = false;
+  if (removeProfile)
+  {
+    if (!CGUIDialogYesNo::ShowAndGetInput(
+            CVariant{"Forget Jumpgate Profile"},
+            CVariant{"Remove " + profile.name + " and its encrypted local credential?"}))
+      return;
+    changed = m_jumpgateProfileRuntime->ForgetLocal(profile.profileId, profile.deviceId, error);
+  }
+  else
+  {
+    changed = m_jumpgateProfileRuntime->SelectActive(profile.profileId, error);
+  }
+
+  if (!changed)
+  {
+    CGUIDialogKaiToast::QueueNotification(CGUIDialogKaiToast::Error, "Jumpgate",
+                                          error.empty() ? "Profile update failed" : error,
+                                          5000, true);
+    return;
+  }
+
+  ApplyActiveJumpgateProfile();
+  CGUIDialogKaiToast::QueueNotification(
+      error.empty() ? CGUIDialogKaiToast::Info : CGUIDialogKaiToast::Warning, "Jumpgate",
+      error.empty() ? (removeProfile ? "Profile forgotten" : "Active profile updated")
+                    : error,
+      4000, true);
+}
+
+void CXBMCApp::ShowJumpgateProfileManager()
+{
+  CGUIDialogSelect* dialog =
+      CServiceBroker::GetGUI()->GetWindowManager().GetWindow<CGUIDialogSelect>(
+          WINDOW_DIALOG_SELECT);
+  if (!dialog)
+    return;
+  dialog->Reset();
+  dialog->SetHeading(CVariant{"Jumpgate Profiles"});
+  dialog->Add("Pair New Profile");
+  dialog->Add("Switch Active Profile");
+  dialog->Add("Forget Profile");
+  dialog->Add("Use Unpaired Local Mode");
+  dialog->Add("Show Saved Profiles");
+  dialog->Open();
+  if (!dialog->IsConfirmed())
+    return;
+
+  switch (dialog->GetSelectedItem())
+  {
+    case 0:
+      StartBridgePairing();
+      break;
+    case 1:
+      ShowJumpgateProfilePicker(false);
+      break;
+    case 2:
+      ShowJumpgateProfilePicker(true);
+      break;
+    case 3:
+      HandleJumpgateManagerCommand("clear");
+      break;
+    case 4:
+      HandleJumpgateManagerCommand("show");
+      break;
+    default:
+      break;
+  }
+}
+
+void CXBMCApp::HandleJumpgateManagerCommand(const std::string& command)
+{
+  if (command == "pair")
+  {
+    StartBridgePairing();
+    return;
+  }
+  if (command == "switch")
+  {
+    ShowJumpgateProfilePicker(false);
+    return;
+  }
+  if (command == "remove")
+  {
+    ShowJumpgateProfilePicker(true);
+    return;
+  }
+  if (command == "menu")
+  {
+    ShowJumpgateProfileManager();
+    return;
+  }
+  if (!InitializeJumpgateProfileRuntime())
+    return;
+
+  if (command == "clear")
+  {
+    if (m_playback_state & (PLAYBACK_STATE_VIDEO | PLAYBACK_STATE_AUDIO))
+    {
+      CGUIDialogKaiToast::QueueNotification(
+          CGUIDialogKaiToast::Warning, "Jumpgate",
+          "Stop playback before clearing the active profile", 4000, true);
+      return;
+    }
+    auto active = m_jumpgateProfileRuntime->GetActive();
+    if (!active.selected)
+    {
+      active.ClearSecrets();
+      CGUIDialogKaiToast::QueueNotification(CGUIDialogKaiToast::Info, "Jumpgate",
+                                            "Unpaired local mode is already active", 3000,
+                                            true);
+      return;
+    }
+    const std::string profileName = active.name.empty() ? "the active profile" : active.name;
+    active.ClearSecrets();
+    if (!CGUIDialogYesNo::ShowAndGetInput(
+            CVariant{"Use Unpaired Local Mode"},
+            CVariant{"Stop using " + profileName + " for this Kodi profile?"}))
+      return;
+    std::string error;
+    if (!m_jumpgateProfileRuntime->ClearActive(error))
+    {
+      CGUIDialogKaiToast::QueueNotification(CGUIDialogKaiToast::Error, "Jumpgate", error,
+                                            5000, true);
+      return;
+    }
+    ApplyActiveJumpgateProfile();
+    CGUIDialogKaiToast::QueueNotification(CGUIDialogKaiToast::Info, "Jumpgate",
+                                          "Using unpaired local mode", 4000, true);
+    return;
+  }
+
+  if (command == "show")
+  {
+    const auto profiles = m_jumpgateProfileRuntime->GetProfiles();
+    CGUIDialogSelect* dialog =
+        CServiceBroker::GetGUI()->GetWindowManager().GetWindow<CGUIDialogSelect>(
+            WINDOW_DIALOG_SELECT);
+    if (!dialog)
+      return;
+    dialog->Reset();
+    dialog->SetHeading(CVariant{"Saved Jumpgate Profiles"});
+    if (profiles.empty())
+      dialog->Add("No paired profiles");
+    for (const auto& profile : profiles)
+    {
+      std::string label = profile.name.empty() ? "Jumpgate Profile" : profile.name;
+      if (profile.active)
+        label += " [active]";
+      dialog->Add(label);
+    }
+    dialog->Open();
+    return;
+  }
+
+  if (command == "help")
+  {
+    CGUIDialogOK::ShowAndGetInput(
+        CVariant{"Jumpgate Pairing"},
+        CVariant{"Pair once from Kodi, then open the shown URL on your phone or laptop."},
+        CVariant{"Finish Trakt and addon setup in the browser. The approved profile is applied automatically."},
+        CVariant{"Each saved profile keeps a separate encrypted device credential."});
+    return;
+  }
+
+  CLog::Log(LOGWARNING, "CXBMCApp: Ignored unknown Jumpgate manager command");
+}
+
 void CXBMCApp::ShowSettingsDialog()
 {
   CGUIDialogSelect* dialog =
@@ -1599,15 +2148,16 @@ void CXBMCApp::ShowSettingsDialog()
   dialog->Reset();
   dialog->SetHeading(CVariant{"Jumpgate Settings"});
 
-  // Menu items
+  KODI::JUMPGATE::ActiveProfile active;
+  if (m_jumpgateProfileRuntime)
+    active = m_jumpgateProfileRuntime->GetActive();
+  dialog->Add("Profiles (" + (active.selected ? active.name : "unpaired local mode") + ")");
   dialog->Add("Subtitle Languages (" + GetSettingString("subtitle_languages", "en") + ")");
-  dialog->Add(std::string("Trakt Account") +
-              (m_traktScrobbler && m_traktScrobbler->IsAuthenticatedPublic()
-                   ? " (Connected)"
-                   : " (Not connected)"));
+  dialog->Add(active.selected ? "Trakt (managed by active profile)" :
+                                "Trakt (pair a Jumpgate profile)");
   dialog->Add("OpenSubtitles Account");
-  dialog->Add("Bridge Server URL");
   dialog->Add("About Jumpgate");
+  active.ClearSecrets();
 
   dialog->Open();
 
@@ -1618,7 +2168,12 @@ void CXBMCApp::ShowSettingsDialog()
 
   switch (sel)
   {
-    case 0: // Subtitle Languages
+    case 0: // Profiles
+    {
+      ShowJumpgateProfileManager();
+      break;
+    }
+    case 1: // Subtitle Languages
     {
       std::string langs = GetSettingString("subtitle_languages", "en");
       if (CGUIKeyboardFactory::ShowAndGetInput(
@@ -1633,25 +2188,27 @@ void CXBMCApp::ShowSettingsDialog()
       }
       break;
     }
-    case 1: // Trakt Account
+    case 2: // Trakt Account
     {
-      if (m_traktScrobbler && m_traktScrobbler->IsAuthenticatedPublic())
+      KODI::JUMPGATE::ActiveProfile current;
+      if (m_jumpgateProfileRuntime)
+        current = m_jumpgateProfileRuntime->GetActive();
+      if (current.selected)
       {
-        bool signOut = CGUIDialogYesNo::ShowAndGetInput(
-            CVariant{"Trakt Account"},
-            CVariant{"Connected to Trakt. Sign out and re-authenticate?"});
-        if (signOut)
-        {
-          m_traktScrobbler->ForceReAuth();
-        }
+        current.ClearSecrets();
+        CGUIDialogKaiToast::QueueNotification(
+            CGUIDialogKaiToast::Info, "Jumpgate",
+            "Trakt is managed from the paired Jumpgate configuration page", 5000, true);
+        break;
       }
-      else if (m_traktScrobbler)
-      {
-        m_traktScrobbler->ForceReAuth();
-      }
+      current.ClearSecrets();
+      if (CGUIDialogYesNo::ShowAndGetInput(
+              CVariant{"Trakt via Jumpgate"},
+              CVariant{"Pair a Jumpgate profile to connect a separate Trakt account securely?"}))
+        StartBridgePairing();
       break;
     }
-    case 2: // OpenSubtitles Account
+    case 3: // OpenSubtitles Account
     {
       if (m_subtitleDownloader)
       {
@@ -1661,19 +2218,6 @@ void CXBMCApp::ShowSettingsDialog()
         CGUIDialogKaiToast::QueueNotification(
             CGUIDialogKaiToast::Info, "Jumpgate",
             "OpenSubtitles will prompt for credentials on next play", 3000, true);
-      }
-      break;
-    }
-    case 3: // Bridge Server URL
-    {
-      std::string url = GetSettingString("bridge_url", "");
-      if (CGUIKeyboardFactory::ShowAndGetInput(
-              url, CVariant{"Bridge URL (empty = auto-detect)"}, true))
-      {
-        SetSetting("bridge_url", url);
-        CGUIDialogKaiToast::QueueNotification(
-            CGUIDialogKaiToast::Info, "Jumpgate",
-            url.empty() ? "Bridge: auto-detect" : "Bridge: " + url, 3000, true);
       }
       break;
     }
@@ -1705,6 +2249,73 @@ void CXBMCApp::ProcessSlow()
   if ((m_playback_state & PLAYBACK_STATE_PLAYING) && !m_mediaSessionUpdated &&
       m_mediaSession->isActive())
     UpdateSessionState();
+
+  std::string pairingRedemptionJson;
+  std::string pairingRedemptionOrigin;
+  std::string pairingProfileName;
+  std::string pairingErrorMessage;
+  {
+    std::unique_lock lock(m_pairingMutex);
+    if (m_pairingRedemptionPending &&
+        !(m_playback_state & (PLAYBACK_STATE_VIDEO | PLAYBACK_STATE_AUDIO)))
+    {
+      pairingRedemptionJson.swap(m_pairingRedemptionJson);
+      pairingRedemptionOrigin.swap(m_pairingRedemptionOrigin);
+      pairingProfileName.swap(m_pairingApplyProfileName);
+      m_pairingRedemptionPending = false;
+      m_pairingApplyProfileName.clear();
+      m_pairingErrorPending = false;
+      m_pairingErrorMessage.clear();
+    }
+    else if (m_pairingErrorPending)
+    {
+      pairingErrorMessage = m_pairingErrorMessage;
+      m_pairingErrorPending = false;
+      m_pairingErrorMessage.clear();
+    }
+  }
+
+  if (!pairingRedemptionJson.empty())
+  {
+    CVariant redemption;
+    if (!CJSONVariantParser::Parse(pairingRedemptionJson, redemption) ||
+        !redemption.isObject())
+    {
+      pairingErrorMessage = "Pairing failed: invalid redemption response";
+    }
+    ClearSensitiveString(pairingRedemptionJson);
+
+    std::string storeError;
+    const int64_t now = static_cast<int64_t>(std::time(nullptr));
+    if (pairingErrorMessage.empty() &&
+        (!InitializeJumpgateProfileRuntime() ||
+         !m_jumpgateProfileRuntime->StorePairingResponse(
+             redemption, pairingRedemptionOrigin, true, now, storeError)))
+    {
+      pairingErrorMessage = storeError.empty() ? "Pairing credential commit failed" : storeError;
+    }
+    redemption = CVariant{};
+
+    if (pairingErrorMessage.empty())
+    {
+      if (pairingProfileName.empty())
+      {
+        KODI::JUMPGATE::ActiveProfile active = m_jumpgateProfileRuntime->GetActive();
+        pairingProfileName = active.name.empty() ? "Jumpgate Profile" : active.name;
+        active.ClearSecrets();
+      }
+      ApplyActiveJumpgateProfile();
+      const std::string toast = "Paired and applied (" + pairingProfileName + ")";
+
+      CGUIDialogKaiToast::QueueNotification(
+          CGUIDialogKaiToast::Info, "Jumpgate", toast, 5000, true);
+    }
+  }
+  if (!pairingErrorMessage.empty())
+  {
+    CGUIDialogKaiToast::QueueNotification(
+        CGUIDialogKaiToast::Error, "Jumpgate", pairingErrorMessage, 5000, true);
+  }
 
   // Track playback position for external player mode result
   // Track during both PLAYING and PAUSED states (video/audio flag stays set when paused)
@@ -2303,6 +2914,7 @@ void CXBMCApp::onNewIntent(CJNIIntent intent)
     if (!m_traktScrobbler)
     {
       m_traktScrobbler = std::make_unique<TraktScrobbler>();
+      ApplyActiveJumpgateProfile();
       m_traktScrobbler->Initialize();
     }
 
@@ -2446,6 +3058,7 @@ void CXBMCApp::onNewIntent(CJNIIntent intent)
     {
       m_subtitleDownloader = std::make_unique<SubtitleDownloader>();
       m_subtitleDownloader->Initialize();
+      m_subtitleDownloader->SetLanguages(GetSettingString("subtitle_languages", "en"));
     }
     if (m_subtitleDownloader)
     {
@@ -2570,6 +3183,15 @@ void CXBMCApp::onVisibleBehindCanceled()
       CServiceBroker::GetAppMessenger()->PostMsg(TMSG_GUI_ACTION, WINDOW_INVALID, -1,
                                                  static_cast<void*>(new CAction(ACTION_PAUSE)));
   }
+}
+
+void CXBMCApp::onOpenSettingsRequested()
+{
+  if (!m_externalPlayerMode.load(std::memory_order_relaxed))
+    return;
+
+  m_settingsRequested.store(true, std::memory_order_relaxed);
+  CLog::Log(LOGINFO, "CXBMCApp: Settings requested from Java long-press Back");
 }
 
 void CXBMCApp::onVolumeChanged(int volume)
@@ -2812,7 +3434,8 @@ void CXBMCApp::UnregisterInputDeviceEventHandler()
 
 bool CXBMCApp::onInputDeviceEvent(const AInputEvent* event)
 {
-  // Intercept Menu key in external player mode to show settings dialog
+  // Intercept Menu/Guide keys in external player mode to show settings dialog.
+  // Phone long-press Back path is handled in Java Main.onKeyUp() and forwarded via JNI.
   if (m_externalPlayerMode.load(std::memory_order_relaxed) && AInputEvent_getType(event) == AINPUT_EVENT_TYPE_KEY)
   {
     int32_t keycode = AKeyEvent_getKeyCode(event);

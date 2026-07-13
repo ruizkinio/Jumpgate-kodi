@@ -38,6 +38,9 @@ set(SOURCES ActorProtocol.cpp
             InfoLoader.cpp
             JSONVariantParser.cpp
             JSONVariantWriter.cpp
+            JumpgateProfileRuntime.cpp
+            JumpgateProfileStore.cpp
+            JumpgateSourceFingerprint.cpp
             LabelFormatter.cpp
             LangCodeExpander.cpp
             LegacyPathTranslation.cpp
@@ -134,6 +137,9 @@ set(HEADERS ActorProtocol.h
             IXmlDeserializable.h
             JSONVariantParser.h
             JSONVariantWriter.h
+            JumpgateProfileRuntime.h
+            JumpgateProfileStore.h
+            JumpgateSourceFingerprint.h
             LabelFormatter.h
             LangCodeExpander.h
             LegacyPathTranslation.h
