@@ -322,6 +322,35 @@ jobs:
           [[ "$ndk_level" =~ ^[0-9]+$ ]]
           test "$ndk_level" = "$ANDROID_MIN_SDK_VERSION"
           test "$target_platform" = "${{ matrix.host }}-${ndk_level}-release"
+          shairplay_so="$DEPENDS_PREFIX/$target_platform/lib/libshairplay.so"
+          readelf="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          test -s "$shairplay_so"
+          test -x "$readelf"
+
+          cat > "$RUNNER_TEMP/shairplay-expected-exports.txt" <<'EOF'
+          dnssd_destroy
+          dnssd_init
+          dnssd_register_airplay
+          dnssd_register_raop
+          dnssd_unregister_airplay
+          dnssd_unregister_raop
+          raop_destroy
+          raop_init
+          raop_init_from_keyfile
+          raop_is_running
+          raop_set_log_callback
+          raop_set_log_level
+          raop_start
+          raop_stop
+          EOF
+          "$readelf" --dyn-syms --wide "$shairplay_so" |
+            awk '$7 != "UND" && $5 != "LOCAL" {
+              if ($8 != "") print $8
+            }' |
+            LC_ALL=C sort -u > "$RUNNER_TEMP/shairplay-actual-exports.txt"
+          diff -u \
+            "$RUNNER_TEMP/shairplay-expected-exports.txt" \
+            "$RUNNER_TEMP/shairplay-actual-exports.txt"
           test -f "tools/depends/native/.installed-$native_platform"
           test -f "tools/depends/target/.installed-$target_platform"
           install -m 0644 "tools/depends/native/.installed-$native_platform" \
