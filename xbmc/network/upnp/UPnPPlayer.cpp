@@ -389,7 +389,7 @@ bool CUPnPPlayer::OpenFile(const CFileItem& file, const CPlayerOptions& options)
             const bool started = NPT_SUCCEEDED(m_control->GetPositionInfo(
                 m_delegate->m_device, m_delegate->m_instance, m_delegate.get()));
             if (!started)
-              m_logger->warning("OpenFile({}): failed to request initial position info",
+              m_logger->warn("OpenFile({}): failed to request initial position info",
                                 file.GetPath());
             return started;
           },
@@ -398,7 +398,7 @@ bool CUPnPPlayer::OpenFile(const CFileItem& file, const CPlayerOptions& options)
             const bool started = NPT_SUCCEEDED(m_control->GetMediaInfo(
                 m_delegate->m_device, m_delegate->m_instance, m_delegate.get()));
             if (!started)
-              m_logger->warning("OpenFile({}): failed to request initial media info",
+              m_logger->warn("OpenFile({}): failed to request initial media info",
                                 file.GetPath());
             return started;
           },
