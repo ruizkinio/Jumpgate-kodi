@@ -91,7 +91,19 @@ jobs:
         run: |
           set -euo pipefail
           : "${ANDROID_SDK_ROOT:?ANDROID_SDK_ROOT is required on the runner}"
-          sdkmanager_bin="$(command -v sdkmanager)"
+          sdkmanager_bin="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          if [[ ! -x "$sdkmanager_bin" ]]; then
+            sdkmanager_bin="$(
+              find "$ANDROID_SDK_ROOT/cmdline-tools" \
+                -path '*/bin/sdkmanager' -type f -perm -u+x -print 2>/dev/null |
+                LC_ALL=C sort -V |
+                tail -n 1 || true
+            )"
+          fi
+          if [[ -z "$sdkmanager_bin" || ! -x "$sdkmanager_bin" ]]; then
+            echo "Unable to locate sdkmanager below $ANDROID_SDK_ROOT/cmdline-tools" >&2
+            exit 1
+          fi
 
           set +o pipefail
           yes | "$sdkmanager_bin" --sdk_root="$ANDROID_SDK_ROOT" --licenses >/dev/null
