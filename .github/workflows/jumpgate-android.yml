@@ -322,12 +322,25 @@ jobs:
           [[ "$ndk_level" =~ ^[0-9]+$ ]]
           test "$ndk_level" = "$ANDROID_MIN_SDK_VERSION"
           test "$target_platform" = "${{ matrix.host }}-${ndk_level}-release"
-          shairplay_so="$DEPENDS_PREFIX/$target_platform/lib/libshairplay.so"
-          readelf="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
-          test -s "$shairplay_so"
-          test -x "$readelf"
+          shairplay_archive="$DEPENDS_PREFIX/$target_platform/lib/libshairplay.a"
+          shairplay_lib_dir="$(dirname "$shairplay_archive")"
+          llvm_ar="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
+          llvm_nm="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
+          test -s "$shairplay_archive"
+          test -x "$llvm_ar"
+          test -x "$llvm_nm"
 
-          cat > "$RUNNER_TEMP/shairplay-expected-exports.txt" <<'EOF'
+          "$llvm_ar" t "$shairplay_archive" > "$RUNNER_TEMP/shairplay-archive-members.txt"
+          test -s "$RUNNER_TEMP/shairplay-archive-members.txt"
+          if find "$shairplay_lib_dir" -maxdepth 1 \( -type f -o -type l \) \
+              -name 'libshairplay.so*' -print -quit | grep -q .; then
+            echo 'Unexpected installed libshairplay shared library:' >&2
+            find "$shairplay_lib_dir" -maxdepth 1 \( -type f -o -type l \) \
+              -name 'libshairplay.so*' -print >&2
+            exit 1
+          fi
+
+          cat > "$RUNNER_TEMP/shairplay-required-symbols.txt" <<'EOF'
           dnssd_destroy
           dnssd_init
           dnssd_register_airplay
@@ -343,14 +356,19 @@ jobs:
           raop_start
           raop_stop
           EOF
-          "$readelf" --dyn-syms --wide "$shairplay_so" |
-            awk '$7 != "UND" && $5 != "LOCAL" {
-              if ($8 != "") print $8
-            }' |
-            LC_ALL=C sort -u > "$RUNNER_TEMP/shairplay-actual-exports.txt"
-          diff -u \
-            "$RUNNER_TEMP/shairplay-expected-exports.txt" \
-            "$RUNNER_TEMP/shairplay-actual-exports.txt"
+          "$llvm_nm" --defined-only --extern-only "$shairplay_archive" |
+            awk 'NF >= 2 && $(NF - 1) ~ /^[[:alpha:]]$/ { print $NF }' |
+            LC_ALL=C sort -u > "$RUNNER_TEMP/shairplay-global-defined-symbols.txt"
+          test -s "$RUNNER_TEMP/shairplay-global-defined-symbols.txt"
+          comm -23 \
+            "$RUNNER_TEMP/shairplay-required-symbols.txt" \
+            "$RUNNER_TEMP/shairplay-global-defined-symbols.txt" \
+            > "$RUNNER_TEMP/shairplay-missing-symbols.txt"
+          if [[ -s "$RUNNER_TEMP/shairplay-missing-symbols.txt" ]]; then
+            echo 'Missing required libshairplay symbols:' >&2
+            cat "$RUNNER_TEMP/shairplay-missing-symbols.txt" >&2
+            exit 1
+          fi
           test -f "tools/depends/native/.installed-$native_platform"
           test -f "tools/depends/target/.installed-$target_platform"
           install -m 0644 "tools/depends/native/.installed-$native_platform" \
@@ -363,7 +381,30 @@ jobs:
           set -euo pipefail
           rm -rf "$KODI_BUILD_DIR"
           mkdir -p "$KODI_BUILD_DIR"
+          target_platform="$(awk -F= '$1 == "PLATFORM" { print $2 }' tools/depends/Makefile.include)"
+          shairplay_archive="$DEPENDS_PREFIX/$target_platform/lib/libshairplay.a"
+          cmake_cache="$KODI_BUILD_DIR/CMakeCache.txt"
+          read_cmake_cache_value() {
+            local key="$1"
+            awk -v key="$key" '
+              index($0, key ":") == 1 && index($0, "=") != 0 {
+                print substr($0, index($0, "=") + 1)
+                matches++
+              }
+              END { if (matches != 1) exit 1 }
+            ' "$cmake_cache"
+          }
           make -C tools/depends/target/cmakebuildsys BUILD_DIR="$KODI_BUILD_DIR"
+          test -s "$cmake_cache"
+          cached_shairplay_library="$(read_cmake_cache_value SHAIRPLAY_LIBRARY)"
+          test "$cached_shairplay_library" = "$shairplay_archive"
+          have_shairplay_callback_cls="$(read_cmake_cache_value HAVE_SHAIRPLAY_CALLBACK_CLS)"
+          case "${have_shairplay_callback_cls^^}" in
+            ''|0|OFF|NO|FALSE|N|IGNORE|NOTFOUND|*-NOTFOUND)
+              echo "HAVE_SHAIRPLAY_CALLBACK_CLS is not truthy: $have_shairplay_callback_cls" >&2
+              exit 1
+              ;;
+          esac
           make -C "$KODI_BUILD_DIR" -j"$(getconf _NPROCESSORS_ONLN)"
           make -C "$KODI_BUILD_DIR" apk
           ccache --show-stats

@@ -3,8 +3,6 @@ include ../../depends/Makefile.include
 BUILD_TYPE:=@CMAKE_BUILD_TYPE@
 BUILD_TYPE_LC:=$(shell echo $(BUILD_TYPE) | tr A-Z a-z)
 
-OBJS = libshairplay.so
-
 EXCLUDED_ADDONS =
 
 CMAKE_SOURCE_DIR = $(shell cd $(CURDIR)/../../..; pwd)
@@ -28,8 +26,6 @@ endif
 
 # libc++
 STLLIB=$(TOOLCHAIN)/sysroot/usr/lib/$(HOST)/libc++_shared.so
-
-SRCLIBS = $(addprefix $(PREFIX)/lib/,$(OBJS))
 
 all: apk
 
@@ -68,7 +64,6 @@ res:
 libs: $(PREFIX)/lib/@APP_NAME_LC@/lib@APP_NAME_LC@.so
 	rm -rf xbmc/lib/$(CPU) xbmc/obj/local/$(CPU)
 	mkdir -p xbmc/lib/$(CPU) xbmc/assets/python@PYTHON_VERSION@/lib/ xbmc/obj/local/$(CPU)
-	cp -fpL $(SRCLIBS) xbmc/obj/local/$(CPU)/
 	cp -fp $(PREFIX)/lib/@APP_NAME_LC@/lib@APP_NAME_LC@.so xbmc/obj/local/$(CPU)/
 	(test -d $(PREFIX)/lib/@APP_NAME_LC@/addons && \
 	  find $(PREFIX)/lib/@APP_NAME_LC@/addons -name "*.so" -exec cp -fp {} xbmc/obj/local/$(CPU)/ \;) || true
@@ -92,10 +87,8 @@ package: libs python java
 	ANDROID_HOME=$(SDKROOT) ./gradlew assemble$(BUILD_TYPE)
 	@cp xbmc/build/outputs/apk/$(BUILD_TYPE_LC)/xbmc-$(BUILD_TYPE_LC).apk $(CMAKE_SOURCE_DIR)/@APP_NAME_LC@app-$(CPU)-$(BUILD_TYPE_LC).apk
 
-$(PREFIX)/lib/xbmc/lib@APP_NAME_LC@.so: $(SRCLIBS)
+$(PREFIX)/lib/xbmc/lib@APP_NAME_LC@.so:
 	$(MAKE) -C ../../depends/target/xbmc
-
-$(SRCLIBS):
 
 apk-clean:
 	rm -rf xbmc/java

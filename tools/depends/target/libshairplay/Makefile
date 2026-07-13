@@ -1,10 +1,6 @@
 include ../../Makefile.include
 DEPS = ../../Makefile.include Makefile 0001-configure-fix-dns-sd-check.patch ../../download-files.include
 
-ifeq ($(OS),android)
-DEPS += 0002-android-use-explicit-export-list.patch
-endif
-
 # lib name, version
 LIBNAME=shairplay
 VERSION=096b61a
@@ -16,6 +12,9 @@ include ../../download-files.include
 # configuration settings
 CONFIGURE=./configure --prefix=$(PREFIX)
 
+ifeq ($(OS),android)
+CONFIGURE += --disable-shared
+endif
 
 LIBDYLIB=$(PLATFORM)/src/lib/.libs/libshairplay.a
 
@@ -26,9 +25,6 @@ $(PLATFORM): $(DEPS) | $(TARBALLS_LOCATION)/$(ARCHIVE).$(HASH_TYPE)
 	rm -rf $(PLATFORM); mkdir -p $(PLATFORM)
 	cd $(PLATFORM); $(ARCHIVE_TOOL) $(ARCHIVE_TOOL_FLAGS) $(TARBALLS_LOCATION)/$(ARCHIVE)
 	cd $(PLATFORM); patch -p1 -i ../0001-configure-fix-dns-sd-check.patch
-ifeq ($(OS),android)
-	cd $(PLATFORM); patch -p1 -i ../0002-android-use-explicit-export-list.patch
-endif
 	cd $(PLATFORM); $(AUTORECONF) -vif
 	cd $(PLATFORM); $(CONFIGURE)
 
