@@ -440,6 +440,39 @@ TEST(TestJumpgateApplicationLifecycleStatic, AndroidDestroyQuiescesBeforeTheFina
 }
 
 TEST(TestJumpgateApplicationLifecycleStatic,
+     TraktWritesRequirePairedClaimsAndBridgeIssuedClientIdentity)
+{
+  const std::string source = ReadKodiSource("platform/android/activity/TraktScrobbler.cpp");
+  const std::string header = ReadKodiSource("platform/android/activity/TraktScrobbler.h");
+  ASSERT_FALSE(source.empty());
+  ASSERT_FALSE(header.empty());
+
+  EXPECT_EQ(source.find("client_secret"), std::string::npos);
+  EXPECT_EQ(source.find("/oauth/device"), std::string::npos);
+  EXPECT_NE(source.find("special://profile/trakt.json"), std::string::npos);
+  EXPECT_NE(source.find("CFile::Delete(legacyTokenPath)"), std::string::npos);
+  EXPECT_EQ(source.find("LoadFile(legacyTokenPath"), std::string::npos);
+  EXPECT_EQ(source.find("OpenForWrite(legacyTokenPath"), std::string::npos);
+  EXPECT_EQ(header.find("TRAKT_CLIENT_SECRET"), std::string::npos);
+  EXPECT_EQ(header.find("TRAKT_CLIENT_ID"), std::string::npos);
+  EXPECT_EQ(source.find("?query="), std::string::npos);
+
+  const std::string authority =
+      FunctionBody(source, "bool TraktScrobbler::IsTraktIdentityAuthorized() const");
+  const std::string tokenFetch =
+      FunctionBody(source, "bool TraktScrobbler::FetchAccessTokenFromBridge()");
+  ASSERT_FALSE(authority.empty());
+  ASSERT_FALSE(tokenFetch.empty());
+  EXPECT_NE(authority.find("m_bridgeProfileBacked"), std::string::npos);
+  EXPECT_NE(authority.find("m_sourceClaimResolved"), std::string::npos);
+  EXPECT_NE(authority.find("m_sourceClaimAuthorized"), std::string::npos);
+  EXPECT_NE(tokenFetch.find("/v1/trakt/token"), std::string::npos);
+  EXPECT_NE(tokenFetch.find("data[\"client_id\"]"), std::string::npos);
+  EXPECT_NE(tokenFetch.find("IsValidTraktClientId(clientId)"), std::string::npos);
+  EXPECT_NE(tokenFetch.find("m_traktClientId = clientId"), std::string::npos);
+}
+
+TEST(TestJumpgateApplicationLifecycleStatic,
      AndroidSubtitlesCommitTerminalAndQuiesceBeforeCleanupOrServiceDrain)
 {
   const std::string app = ReadKodiSource("platform/android/activity/XBMCApp.cpp");

@@ -37,11 +37,13 @@ CJumpgateScrobbleDispatcher::~CJumpgateScrobbleDispatcher()
 bool CJumpgateScrobbleDispatcher::QueueStop(std::string cleanupId,
                                             std::string jsonBody,
                                             std::string accessToken,
+                                            std::string clientId,
                                             Completion completion)
 {
-  Job job{std::move(cleanupId), std::move(jsonBody), std::move(accessToken)};
+  Job job{std::move(cleanupId), std::move(jsonBody), std::move(accessToken), std::move(clientId)};
   const std::shared_ptr<WorkerState> state = m_state;
-  if (!state || job.cleanupId.empty() || job.jsonBody.empty() || job.accessToken.empty())
+  if (!state || job.cleanupId.empty() || job.jsonBody.empty() || job.accessToken.empty() ||
+      job.clientId.empty())
   {
     ClearJob(job);
     return false;
@@ -119,6 +121,7 @@ void CJumpgateScrobbleDispatcher::ClearJob(Job& job)
 {
   std::fill(job.accessToken.begin(), job.accessToken.end(), '\0');
   job.accessToken.clear();
+  job.clientId.clear();
   job.jsonBody.clear();
   job.cleanupId.clear();
 }
@@ -151,7 +154,7 @@ void CJumpgateScrobbleDispatcher::Run(const std::shared_ptr<WorkerState>& state)
       }
     }
 
-    const bool sent = state->transport->SendStop(job.jsonBody, job.accessToken);
+    const bool sent = state->transport->SendStop(job.jsonBody, job.accessToken, job.clientId);
     std::vector<Completion> completions;
     {
       std::lock_guard<std::mutex> lock(state->mutex);

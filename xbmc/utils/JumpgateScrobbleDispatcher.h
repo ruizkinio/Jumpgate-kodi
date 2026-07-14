@@ -31,7 +31,9 @@ class IJumpgateScrobbleStopTransport
 {
 public:
   virtual ~IJumpgateScrobbleStopTransport() = default;
-  virtual bool SendStop(const std::string& jsonBody, const std::string& accessToken) = 0;
+  virtual bool SendStop(const std::string& jsonBody,
+                        const std::string& accessToken,
+                        const std::string& clientId) = 0;
 };
 
 class CJumpgateScrobbleDispatcher final
@@ -50,6 +52,7 @@ public:
   bool QueueStop(std::string cleanupId,
                  std::string jsonBody,
                  std::string accessToken,
+                 std::string clientId,
                  Completion completion = {});
   bool Stop(bool drain, std::chrono::milliseconds timeout = std::chrono::milliseconds{3500});
 
@@ -59,6 +62,7 @@ private:
     std::string cleanupId;
     std::string jsonBody;
     std::string accessToken;
+    std::string clientId;
   };
 
   struct WorkerState

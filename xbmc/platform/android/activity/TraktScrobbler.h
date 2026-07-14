@@ -38,7 +38,7 @@ public:
   void Initialize();
   void Deinitialize(bool drainScrobble = true);
 
-  // Called from ProcessSlow() for device code auth polling
+  // Called from ProcessSlow() for deferred identification and token renewal.
   void ProcessSlow();
 
   // Content identification (set before playback starts)
@@ -101,14 +101,9 @@ public:
 private:
   // Auth
   bool IsAuthenticated() const;
-  bool LoadTokens();
-  bool SaveTokens();
   bool FetchAccessTokenFromBridge();
   std::string NormalizeBridgeUrl(const std::string& url) const;
   std::string BuildBridgeEndpoint(const std::string& bridgeUrl, const std::string& endpoint) const;
-  bool RefreshAccessToken();
-  void StartDeviceCodeAuth();
-  void PollForToken();
 
   // Scrobble API
   bool SyncWatchHistory();
@@ -121,6 +116,7 @@ private:
   bool QueueCompensatingStop(std::string cleanupKey,
                              std::string jsonBody,
                              std::string accessToken,
+                             std::string clientId,
                              uint64_t cleanupId);
   bool HydrateFromTraktPublic(const std::string& id,
                               int season,
@@ -128,10 +124,6 @@ private:
                               const std::string& mediaUrlSnapshot);
   bool QueryBridgeServer();
   bool FetchLogoFromBridge(const std::string& imdbId, const std::string& mediaUrlSnapshot);
-  bool SearchTrakt(const std::string& query);
-  bool ParseImdbFromUrl(const std::string& url);
-  std::string ExtractTitleFromUrl(const std::string& url);
-
   // Bridge auto-detect
   void DetectBridgeUrl();
 
@@ -139,14 +131,12 @@ private:
   bool TraktPostWithToken(const std::string& endpoint,
                           const std::string& jsonBody,
                           std::string& response,
-                          const std::string& accessToken);
+                          const std::string& accessToken,
+                          const std::string& clientId);
   bool TraktGetWithToken(const std::string& endpoint,
                          std::string& response,
-                         const std::string& accessToken);
-
-  // HTTP helpers (legacy wrappers: read token under lock, then call *WithToken)
-  bool TraktPost(const std::string& endpoint, const std::string& jsonBody, std::string& response);
-  bool TraktGet(const std::string& endpoint, std::string& response);
+                         const std::string& accessToken,
+                         const std::string& clientId);
   std::string BuildScrobbleJson(float progress);
 
   // Get current playback progress (0-100)
@@ -160,12 +150,8 @@ private:
 
   // Auth tokens
   std::string m_accessToken;
-  std::string m_refreshToken;
+  std::string m_traktClientId;
   int64_t m_tokenExpiry{0};
-  std::string m_deviceCode;
-  bool m_authInProgress{false};
-  int m_pollIntervalSec{5};
-  int64_t m_lastPollTime{0};
 
   // Content info
   std::string m_imdbId;
@@ -226,10 +212,6 @@ private:
 
   // Trakt API constants
   static constexpr const char* TRAKT_API_URL = "https://api.trakt.tv";
-  static constexpr const char* TRAKT_CLIENT_ID =
-      "d4161a7a106424551add171e5470112e4afdaf2438e6ef2fe0548edc75924868";
-  static constexpr const char* TRAKT_CLIENT_SECRET =
-      "b5fcd7cb5d9bb963784d11bbf8535bc0d25d46225016191eb48e50792d2155c0";
 
   // Jumpgate Bridge server URLs
   static constexpr const char* BRIDGE_CLOUD_URL = "https://jumpgate-bridge.fly.dev";

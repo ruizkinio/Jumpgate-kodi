@@ -26,11 +26,14 @@ namespace
 class BlockingStopTransport final : public IJumpgateScrobbleStopTransport
 {
 public:
-  bool SendStop(const std::string& jsonBody, const std::string&) override
+  bool SendStop(const std::string& jsonBody,
+                const std::string&,
+                const std::string& clientId) override
   {
     std::unique_lock<std::mutex> lock(m_mutex);
     ++m_calls;
     m_json.emplace_back(jsonBody);
+    m_clientIds.emplace_back(clientId);
     m_condition.notify_all();
     if (m_block)
       m_condition.wait(lock, [this] { return m_released; });
@@ -70,6 +73,12 @@ public:
     return m_json;
   }
 
+  std::vector<std::string> ClientIds() const
+  {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_clientIds;
+  }
+
 private:
   mutable std::mutex m_mutex;
   std::condition_variable m_condition;
@@ -77,6 +86,7 @@ private:
   bool m_block{false};
   bool m_released{false};
   std::vector<std::string> m_json;
+  std::vector<std::string> m_clientIds;
 };
 } // namespace
 
@@ -86,7 +96,7 @@ TEST(TestJumpgateScrobbleDispatcher, StopWithoutDrainReturnsAndRegistryJoinsLate
   auto registry = std::make_shared<CJumpgateThreadRegistry>();
   transport->Block();
   CJumpgateScrobbleDispatcher dispatcher{transport, registry};
-  ASSERT_TRUE(dispatcher.QueueStop("one", "{\"progress\":10}", "token"));
+  ASSERT_TRUE(dispatcher.QueueStop("one", "{\"progress\":10}", "token", "client-one"));
   ASSERT_TRUE(transport->WaitForCalls(1));
 
   const auto started = std::chrono::steady_clock::now();
@@ -103,17 +113,19 @@ TEST(TestJumpgateScrobbleDispatcher, CoalescesIdentityAndCompletesEverySubscribe
   transport->Block();
   CJumpgateScrobbleDispatcher dispatcher{transport};
   std::atomic<int> completions{0};
-  ASSERT_TRUE(
-      dispatcher.QueueStop("same", "first", "token", [&completions](bool) { ++completions; }));
+  ASSERT_TRUE(dispatcher.QueueStop("same", "first", "token", "client-one",
+                                   [&completions](bool) { ++completions; }));
   ASSERT_TRUE(transport->WaitForCalls(1));
-  ASSERT_TRUE(
-      dispatcher.QueueStop("same", "duplicate", "token", [&completions](bool) { ++completions; }));
+  ASSERT_TRUE(dispatcher.QueueStop("same", "duplicate", "token", "client-two",
+                                   [&completions](bool) { ++completions; }));
   transport->Release();
   EXPECT_TRUE(dispatcher.Stop(true));
   EXPECT_EQ(transport->Calls(), 1);
   EXPECT_EQ(completions.load(), 2);
   ASSERT_EQ(transport->Json().size(), 1u);
   EXPECT_EQ(transport->Json().front(), "first");
+  ASSERT_EQ(transport->ClientIds().size(), 1u);
+  EXPECT_EQ(transport->ClientIds().front(), "client-one");
 }
 
 TEST(TestJumpgateScrobbleDispatcher, CapacityOverflowRetainsEveryDistinctCleanup)
@@ -121,14 +133,14 @@ TEST(TestJumpgateScrobbleDispatcher, CapacityOverflowRetainsEveryDistinctCleanup
   auto transport = std::make_shared<BlockingStopTransport>();
   transport->Block();
   CJumpgateScrobbleDispatcher dispatcher{transport};
-  ASSERT_TRUE(dispatcher.QueueStop("cleanup-0", "json-0", "token"));
+  ASSERT_TRUE(dispatcher.QueueStop("cleanup-0", "json-0", "token", "client"));
   ASSERT_TRUE(transport->WaitForCalls(1));
   for (int index = 1; index < 8; ++index)
   {
     ASSERT_TRUE(dispatcher.QueueStop("cleanup-" + std::to_string(index),
-                                     "json-" + std::to_string(index), "token"));
+                                     "json-" + std::to_string(index), "token", "client"));
   }
-  EXPECT_TRUE(dispatcher.QueueStop("cleanup-8", "json-8", "token"));
+  EXPECT_TRUE(dispatcher.QueueStop("cleanup-8", "json-8", "token", "client"));
 
   transport->Release();
   EXPECT_TRUE(dispatcher.Stop(true));
@@ -144,17 +156,17 @@ TEST(TestJumpgateScrobbleDispatcher, CapacityRejectionRetriesOnFreshOwnedDispatc
   auto registry = std::make_shared<CJumpgateThreadRegistry>();
   transport->Block();
   CJumpgateScrobbleDispatcher primary{transport, registry};
-  ASSERT_TRUE(primary.QueueStop("cleanup-0", "json-0", "token"));
+  ASSERT_TRUE(primary.QueueStop("cleanup-0", "json-0", "token", "client"));
   ASSERT_TRUE(transport->WaitForCalls(1));
   for (int index = 1; index < 64; ++index)
   {
     ASSERT_TRUE(primary.QueueStop("cleanup-" + std::to_string(index),
-                                  "json-" + std::to_string(index), "token"));
+                                  "json-" + std::to_string(index), "token", "client"));
   }
 
-  EXPECT_FALSE(primary.QueueStop("cleanup-64", "json-64", "token"));
+  EXPECT_FALSE(primary.QueueStop("cleanup-64", "json-64", "token", "client"));
   CJumpgateScrobbleDispatcher fallback{transport, registry};
-  EXPECT_TRUE(fallback.QueueStop("cleanup-64", "json-64", "token"));
+  EXPECT_TRUE(fallback.QueueStop("cleanup-64", "json-64", "token", "client"));
 
   transport->Release();
   EXPECT_TRUE(primary.Stop(true));
@@ -166,11 +178,12 @@ TEST(TestJumpgateScrobbleDispatcher, RejectsEmptyAndPostStopJobs)
 {
   auto transport = std::make_shared<BlockingStopTransport>();
   CJumpgateScrobbleDispatcher dispatcher{transport};
-  EXPECT_FALSE(dispatcher.QueueStop("", "json", "token"));
-  EXPECT_FALSE(dispatcher.QueueStop("id", "", "token"));
-  EXPECT_FALSE(dispatcher.QueueStop("id", "json", ""));
+  EXPECT_FALSE(dispatcher.QueueStop("", "json", "token", "client"));
+  EXPECT_FALSE(dispatcher.QueueStop("id", "", "token", "client"));
+  EXPECT_FALSE(dispatcher.QueueStop("id", "json", "", "client"));
+  EXPECT_FALSE(dispatcher.QueueStop("id", "json", "token", ""));
   EXPECT_TRUE(dispatcher.Stop(true));
-  EXPECT_FALSE(dispatcher.QueueStop("id", "json", "token"));
+  EXPECT_FALSE(dispatcher.QueueStop("id", "json", "token", "client"));
 }
 
 TEST(TestJumpgateScrobbleDispatcher, DrainReturnsAtDeadlineAndRegistryEventuallyJoins)
@@ -182,7 +195,7 @@ TEST(TestJumpgateScrobbleDispatcher, DrainReturnsAtDeadlineAndRegistryEventually
   for (int index = 0; index < 8; ++index)
   {
     ASSERT_TRUE(dispatcher.QueueStop("cleanup-" + std::to_string(index),
-                                     "json-" + std::to_string(index), "token"));
+                                     "json-" + std::to_string(index), "token", "client"));
   }
   ASSERT_TRUE(transport->WaitForCalls(1));
 

@@ -3612,7 +3612,7 @@ void CXBMCApp::ProcessSlow()
     ProcessJumpgateSubtitles();
   }
 
-  // Trakt scrobbler: poll for device code auth
+  // Process deferred claim metadata and renew the paired Bridge token when needed.
   if (m_traktScrobbler && m_externalPlayerMode.load(std::memory_order_relaxed))
     m_traktScrobbler->ProcessSlow();
 

@@ -78,7 +78,8 @@ set(SOURCES TestAlarmClock.cpp
 
 if(NOT CORE_SYSTEM_NAME STREQUAL android)
   list(APPEND SOURCES ../../platform/android/activity/AndroidJumpgateSubtitleFileStore.cpp
-                      ../../platform/android/activity/AndroidJumpgateSubtitleTransport.cpp)
+                      ../../platform/android/activity/AndroidJumpgateSubtitleTransport.cpp
+                      ../../platform/android/activity/TraktScrobbler.cpp)
 endif()
 
 if(TARGET ${APP_NAME_LC}::Bluray)
