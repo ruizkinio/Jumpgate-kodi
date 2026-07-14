@@ -448,20 +448,23 @@ UTF8_WHITESPACE_BYTES = tuple(sorted(
 ))
 
 
-scan_entry = None
+scan_entry_sha256 = None
 scan_phase = 'archive-structure'
 
 
 def set_scan_context(record, phase: str) -> None:
-    global scan_entry, scan_phase
-    scan_entry = None if record is None else record[1].as_posix()
+    global scan_entry_sha256, scan_phase
+    scan_entry_sha256 = None
     scan_phase = phase
+    if record is not None:
+        entry = record[1].as_posix().encode('utf-8')
+        scan_entry_sha256 = hashlib.sha256(entry).hexdigest()
 
 
 def fail() -> None:
     detail = {'phase': scan_phase}
-    if scan_entry is not None:
-        detail['entry'] = scan_entry
+    if scan_entry_sha256 is not None:
+        detail['entry_sha256'] = scan_entry_sha256
     raise ValueError(
         'JUMPGATE_APK_SCAN_REJECT ' +
         json.dumps(detail, ensure_ascii=True, separators=(',', ':'), sort_keys=True)
@@ -1612,6 +1615,7 @@ def main() -> None:
     # Known plaintext encodings and normalizations are covered. Compression,
     # encryption, and arbitrary cryptographic obfuscation are intentionally out of scope.
     for record in files:
+        set_scan_context(record, 'file-read')
         with mapped_file(record) as data:
             if data is None:
                 continue
@@ -1639,7 +1643,9 @@ then
 fi
 
 if ! python3 - "$extract_dir" <<'PY'
+import hashlib
 import json
+import os
 import pathlib
 import re
 import sys
@@ -1673,10 +1679,79 @@ ASSIGNMENT = re.compile(
     r'''^\s*(?:export\s+)?(?:"([^"]+)"|'([^']+)'|([A-Za-z_][A-Za-z0-9_.-]*))'''
     r'''\s*[:=]\s*(.*?)\s*$''',
 )
+GETTEXT_CATALOG_ENTRY = re.compile(
+    r'^(?:assets/)?addons/'
+    r'[a-z0-9]+(?:[._-][a-z0-9]+)*/lang/_strings/'
+    r'[a-z0-9]+(?:[_@-][a-z0-9]+)*\.json$'
+)
+# Catalog exemptions authenticate exact reviewed bytes. Any catalog change requires
+# a reviewed SHA-256 refresh; do not replace this map with message-key heuristics.
+AUTHENTICATED_GETTEXT_CATALOGS = {
+    'addons/webinterface.default/lang/_strings/ca.json':
+        '3cf7893600ad0b6a06a5c8f7b819f8628d221758b3595b33dbbdf4f008bd52fb',
+    'addons/webinterface.default/lang/_strings/de.json':
+        '71962a3e5d06ff4c1e6f8b4a6dcf74ee2f0ab65fd10b73953c61d879e228c3a4',
+    'addons/webinterface.default/lang/_strings/en.json':
+        '3635a6232502075988c7e7d4f50dfa50a25ff0a6d8b9986f4d434ccfb978cff6',
+    'addons/webinterface.default/lang/_strings/et.json':
+        '35b5e614b902ed788e2bc6102a1da989a4552ccc41535b5317a228b31eb5d24c',
+    'addons/webinterface.default/lang/_strings/fi.json':
+        '6149652b2aa36687a7c487f83da4447c51793b05f4ab02fcc1f22583966eb611',
+    'addons/webinterface.default/lang/_strings/fr.json':
+        '0570b7c22a4f4d7a520038ca84a975ffa4e8f0f177c583eba76662db11ed1a93',
+    'addons/webinterface.default/lang/_strings/hr.json':
+        '7ba2b179ba47657aecd29f2d2017a245ff8a903597269e5ccaf169449b10bfb3',
+    'addons/webinterface.default/lang/_strings/hu.json':
+        '13361d638b5e06245254cea75bda8d214d59014f13bb8e50afdeb6d3b5fc8262',
+    'addons/webinterface.default/lang/_strings/it.json':
+        '7102338e7cdf4a47af49eb75ba5e3f51aa7fc3923e321bac1a6f975b6f347694',
+    'addons/webinterface.default/lang/_strings/ja.json':
+        'd2edffca36008913bab04328eb1fe8a5f3d5ce375252550f9eacbd8debee4d64',
+    'addons/webinterface.default/lang/_strings/ko.json':
+        'b6c3900e142171193c3ff38b1f03bbf412a36a4e603d2b29344d3032cfee13ad',
+    'addons/webinterface.default/lang/_strings/nl.json':
+        'b630c74bf1a292e6db9aa9369fc75e06daa0195b4477ab39e88b019606af9f43',
+    'addons/webinterface.default/lang/_strings/ru.json':
+        'ca03a5ef31e4bb5a4326fed9b5940d710250f7a29b4246d06a5c4ae04baa4bfb',
+    'addons/webinterface.default/lang/_strings/sk.json':
+        '8f939ff044bfa27e8f85d338c45b8eec2dd5ff120752b15eff153afd087064c7',
+    'addons/webinterface.default/lang/_strings/zh_tw.json':
+        '5a73da1376e81bee87400f7d35564af4d5773c7f6b6d0e1fcc343b2d347ee6e1',
+}
+
+scan_entry_sha256 = None
+scan_phase = None
 
 
 class SecretFound(Exception):
     pass
+
+
+def normalized_entry(path: pathlib.Path) -> str:
+    relative = pathlib.PurePosixPath(path.relative_to(root).as_posix())
+    if relative.is_absolute() or any(part in {'', '.', '..'} for part in relative.parts):
+        raise ValueError('invalid packaged configuration path')
+    return relative.as_posix()
+
+
+def set_scan_context(entry: str, phase: str) -> None:
+    global scan_entry_sha256, scan_phase
+    scan_entry_sha256 = None
+    scan_phase = phase
+    scan_entry_sha256 = hashlib.sha256(entry.encode('utf-8')).hexdigest()
+
+
+def candidate_files() -> list[tuple[pathlib.Path, str]]:
+    candidates = []
+    for path in root.rglob('*'):
+        if path.is_file():
+            candidates.append((path, normalized_entry(path)))
+    sort_key = lambda record: record[1].encode('utf-8')
+    # The test hook perturbs discovery order; the final production sort remains decisive.
+    if os.environ.get('JUMPGATE_TEST_REVERSE_CONFIG_CANDIDATES') == '1':
+        candidates.sort(key=sort_key, reverse=True)
+    candidates.sort(key=sort_key)
+    return candidates
 
 
 def normalize_key(key: object) -> str:
@@ -1739,7 +1814,11 @@ def is_placeholder(value: object, seen: set[int] | None = None) -> bool:
     return bool(re.fullmatch(r'\{\{\s*[A-Z_][A-Z0-9_]*\s*\}\}', text))
 
 
-def inspect_structure(node: object, seen: set[int] | None = None) -> None:
+def inspect_structure(
+    node: object,
+    message_ids: dict | None = None,
+    seen: set[int] | None = None,
+) -> None:
     if seen is None:
         seen = set()
     if isinstance(node, (dict, list)):
@@ -1748,12 +1827,16 @@ def inspect_structure(node: object, seen: set[int] | None = None) -> None:
         seen.add(id(node))
     if isinstance(node, dict):
         for key, value in node.items():
-            if is_high_risk_key(key) and not is_placeholder(value):
+            if (
+                node is not message_ids
+                and is_high_risk_key(key)
+                and not is_placeholder(value)
+            ):
                 raise SecretFound
-            inspect_structure(value, seen)
+            inspect_structure(value, message_ids, seen)
     elif isinstance(node, list):
         for value in node:
-            inspect_structure(value, seen)
+            inspect_structure(value, message_ids, seen)
 
 
 def unique_json_object(pairs: list[tuple[object, object]]) -> dict:
@@ -1763,6 +1846,57 @@ def unique_json_object(pairs: list[tuple[object, object]]) -> dict:
             raise ValueError('duplicate JSON key')
         mapping[key] = value
     return mapping
+
+
+def authenticated_gettext_message_ids(
+    document: object,
+    entry: str,
+    raw: bytes,
+) -> dict | None:
+    if GETTEXT_CATALOG_ENTRY.fullmatch(entry) is None:
+        return None
+    if not isinstance(document, dict) or set(document) != {'domain', 'locale_data'}:
+        return None
+    if document.get('domain') != 'messages':
+        return None
+    locale_data = document.get('locale_data')
+    if not isinstance(locale_data, dict) or set(locale_data) != {'messages'}:
+        return None
+    messages = locale_data.get('messages')
+    if not isinstance(messages, dict):
+        return None
+    metadata = messages.get('')
+    if (
+        not isinstance(metadata, dict)
+        or set(metadata) != {'domain', 'plural_forms', 'lang'}
+        or metadata.get('domain') != 'messages'
+        or not isinstance(metadata.get('plural_forms'), str)
+        or not isinstance(metadata.get('lang'), str)
+        or not metadata['lang']
+    ):
+        return None
+    for message_id, translations in messages.items():
+        if message_id == '':
+            continue
+        if (
+            not isinstance(message_id, str)
+            or not message_id
+            or not isinstance(translations, list)
+            or not translations
+            or any(not isinstance(value, str) for value in translations)
+        ):
+            return None
+    canonical_entry = entry[7:] if entry.startswith('assets/') else entry
+    expected_digest = AUTHENTICATED_GETTEXT_CATALOGS.get(canonical_entry)
+    if expected_digest is None or hashlib.sha256(raw).hexdigest() != expected_digest:
+        return None
+    return messages
+
+
+def inspect_json(path: pathlib.Path, entry: str) -> None:
+    raw = path.read_bytes()
+    document = json.loads(raw, object_pairs_hook=unique_json_object)
+    inspect_structure(document, authenticated_gettext_message_ids(document, entry, raw))
 
 
 class UniqueKeySafeLoader(yaml.SafeLoader):
@@ -1846,28 +1980,50 @@ def inspect_assignments(path: pathlib.Path) -> None:
                 raise SecretFound
 
 
-try:
-    for path in root.rglob('*'):
-        if not path.is_file():
-            continue
+def scan_configuration() -> None:
+    if os.environ.get('JUMPGATE_TEST_FORCE_CONFIG_SCANNER_ERROR') == '1':
+        raise RuntimeError('forced configuration scanner error')
+    for path, entry in candidate_files():
         lower_name = path.name.lower()
         if path.suffix.lower() == '.json':
-            inspect_structure(json.loads(path.read_bytes(), object_pairs_hook=unique_json_object))
+            set_scan_context(entry, 'config-json')
+            inspect_json(path, entry)
         elif path.suffix.lower() in {'.yaml', '.yml'}:
+            set_scan_context(entry, 'config-yaml')
             inspect_yaml(path)
         elif (
             path.suffix.lower() in TEXT_SUFFIXES
             or lower_name == '.env'
             or lower_name.startswith('.env.')
         ):
+            set_scan_context(entry, 'config-text')
             with path.open('rb') as stream:
                 binary_prefix = stream.read(4096)
             if b'\x00' not in binary_prefix:
                 inspect_assignments(path)
-except SecretFound:
-    raise SystemExit(1)
-except (OSError, UnicodeError, ValueError, json.JSONDecodeError, yaml.YAMLError, RecursionError):
-    raise SystemExit(2)
+
+
+def scanner_status() -> int:
+    try:
+        scan_configuration()
+    except SecretFound:
+        if scan_entry_sha256 is None or scan_phase is None:
+            return 2
+        detail = {'entry_sha256': scan_entry_sha256, 'phase': scan_phase}
+        print(
+            'JUMPGATE_APK_SCAN_REJECT ' +
+            json.dumps(detail, ensure_ascii=True, separators=(',', ':'), sort_keys=True),
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
+try:
+    status = scanner_status()
+except BaseException:
+    status = 2
+raise SystemExit(status)
 PY
 then
   fail 'APK contains a non-placeholder secret assignment in packaged configuration'

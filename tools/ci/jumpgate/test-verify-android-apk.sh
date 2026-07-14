@@ -519,13 +519,21 @@ expect_failure_without_value() {
   fi
 }
 
+entry_sha256() {
+  local digest
+  digest="$(printf '%s' "$1" | sha256sum)"
+  digest="${digest%% *}"
+  [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
+  printf '%s\n' "$digest"
+}
+
 expect_failure_diagnostic() {
   local label="$1"
   local apk="$2"
   local abi="$3"
   local expected_entry="$4"
   local expected_phase="$5"
-  local output status diagnostic
+  local output status diagnostic expected_entry_sha256 entry_name
   shift 5
   set +e
   output="$(verify_apk "$apk" "$abi" "$@" 2>&1)"
@@ -535,10 +543,92 @@ expect_failure_diagnostic() {
     echo "Expected verifier failure: $label" >&2
     exit 1
   fi
-  diagnostic="JUMPGATE_APK_SCAN_REJECT {\"entry\":\"$expected_entry\",\"phase\":\"$expected_phase\"}"
+  expected_entry_sha256="$(entry_sha256 "$expected_entry")"
+  diagnostic="JUMPGATE_APK_SCAN_REJECT {\"entry_sha256\":\"$expected_entry_sha256\",\"phase\":\"$expected_phase\"}"
   if [[ "$output" != *"$diagnostic"* ]]; then
     echo "Verifier omitted the sanitized finding diagnostic: $label" >&2
     exit 1
+  fi
+  entry_name="${expected_entry##*/}"
+  if [[ "$output" == *"$expected_entry"* || "$output" == *"$entry_name"* ]]; then
+    echo "Verifier disclosed a scanned archive entry path: $label" >&2
+    exit 1
+  fi
+}
+
+expect_failure_diagnostic_without_value() {
+  local label="$1"
+  local apk="$2"
+  local abi="$3"
+  local expected_entry="$4"
+  local expected_phase="$5"
+  local forbidden_value="$6"
+  local output status diagnostic expected_entry_sha256 entry_name
+  shift 6
+  set +e
+  output="$(verify_apk "$apk" "$abi" "$@" 2>&1)"
+  status="$?"
+  set -e
+  if [[ "$status" -eq 0 ]]; then
+    echo "Expected verifier failure: $label" >&2
+    exit 1
+  fi
+  expected_entry_sha256="$(entry_sha256 "$expected_entry")"
+  diagnostic="JUMPGATE_APK_SCAN_REJECT {\"entry_sha256\":\"$expected_entry_sha256\",\"phase\":\"$expected_phase\"}"
+  if [[ "$output" != *"$diagnostic"* ]]; then
+    echo "Verifier omitted the sanitized finding diagnostic: $label" >&2
+    exit 1
+  fi
+  entry_name="${expected_entry##*/}"
+  if [[ "$output" == *"$expected_entry"* || "$output" == *"$entry_name"* ]]; then
+    echo "Verifier disclosed a scanned archive entry path: $label" >&2
+    exit 1
+  fi
+  if [[ "$output" == *"$forbidden_value"* ]]; then
+    echo "Verifier disclosed a matched secret value: $label" >&2
+    exit 1
+  fi
+}
+
+expect_failure_without_diagnostic() {
+  local label="$1"
+  local apk="$2"
+  local abi="$3"
+  local expected_reason="$4"
+  local forbidden_detail="$5"
+  local forbidden_entry="$6"
+  local output status entry_name
+  shift 6
+  set +e
+  output="$(verify_apk "$apk" "$abi" "$@" 2>&1)"
+  status="$?"
+  set -e
+  if [[ "$status" -eq 0 ]]; then
+    echo "Expected verifier failure: $label" >&2
+    exit 1
+  fi
+  if ! grep -Fqx -- "$expected_reason" <<< "$output"; then
+    echo "Verifier omitted the exact outer failure: $label" >&2
+    exit 1
+  fi
+  if [[ "$output" == *'JUMPGATE_APK_SCAN_REJECT '* ]]; then
+    echo "Verifier emitted a finding diagnostic for a scanner error: $label" >&2
+    exit 1
+  fi
+  if [[ "$output" == *'Traceback (most recent call last)'* ]]; then
+    echo "Verifier disclosed a scanner traceback: $label" >&2
+    exit 1
+  fi
+  if [[ -n "$forbidden_detail" && "$output" == *"$forbidden_detail"* ]]; then
+    echo "Verifier disclosed scanner exception text: $label" >&2
+    exit 1
+  fi
+  if [[ -n "$forbidden_entry" ]]; then
+    entry_name="${forbidden_entry##*/}"
+    if [[ "$output" == *"$forbidden_entry"* || "$output" == *"$entry_name"* ]]; then
+      echo "Verifier disclosed a scanner-error archive entry path: $label" >&2
+      exit 1
+    fi
   fi
 }
 
@@ -1292,12 +1382,184 @@ expect_failure wrong-signer "$arm64_apk" arm64-v8a \
 expect_failure multiple-signers "$arm64_apk" arm64-v8a \
   MOCK_SECOND_SIGNER_DIGEST=cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd
 expect_failure signer-warning "$arm64_apk" arm64-v8a MOCK_APKSIGNER_FAIL=true
-expect_failure_reason \
+expect_failure_without_diagnostic \
   scanner-forced-error \
   "$arm64_apk" \
   arm64-v8a \
-  'private signing, deployment, or runtime secret material' \
+  'APK contains apparent private signing, deployment, or runtime secret material' \
+  'forced scanner error' \
+  '' \
   JUMPGATE_TEST_FORCE_SECRET_SCANNER_ERROR=1
+
+expect_failure_without_diagnostic \
+  config-scanner-forced-error \
+  "$arm64_apk" \
+  arm64-v8a \
+  'APK contains a non-placeholder secret assignment in packaged configuration' \
+  'forced configuration scanner error' \
+  '' \
+  JUMPGATE_TEST_FORCE_CONFIG_SCANNER_ERROR=1
+
+mixed_case_secrets="$work_dir/mixed-case-secrets"
+copy_fixture "$base_arm64" "$mixed_case_secrets"
+mixed_case_first_value='uppercase-entry-live-secret'
+mixed_case_second_value='lowercase-entry-live-secret'
+printf '{"api_key":"%s"}\n' "$mixed_case_first_value" > \
+  "$mixed_case_secrets/assets/Z-competing.json"
+printf '{"api_key":"%s"}\n' "$mixed_case_second_value" > \
+  "$mixed_case_secrets/assets/a-competing.json"
+mixed_case_secrets_apk="$work_dir/mixed-case-secrets.apk"
+make_apk "$mixed_case_secrets" "$mixed_case_secrets_apk"
+expect_failure_diagnostic_without_value \
+  mixed-case-secrets "$mixed_case_secrets_apk" arm64-v8a \
+  'assets/Z-competing.json' 'config-json' "$mixed_case_first_value" \
+  JUMPGATE_TEST_REVERSE_CONFIG_CANDIDATES=1
+
+gettext_catalog="$work_dir/gettext-catalog"
+copy_fixture "$base_arm64" "$gettext_catalog"
+gettext_catalog_source="$script_dir/../../../addons/webinterface.default/lang/_strings/en.json"
+gettext_catalog_path='assets/addons/webinterface.default/lang/_strings/en.json'
+test -f "$gettext_catalog_source"
+mkdir -p "$gettext_catalog/$(dirname "$gettext_catalog_path")"
+cp "$gettext_catalog_source" "$gettext_catalog/$gettext_catalog_path"
+gettext_catalog_apk="$work_dir/gettext-catalog.apk"
+make_apk "$gettext_catalog" "$gettext_catalog_apk"
+verify_apk "$gettext_catalog_apk" arm64-v8a >/dev/null
+
+mutate_gettext_catalog() {
+  local path="$1"
+  local value="$2"
+  local mode="$3"
+  python3 - "$path" "$value" "$mode" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+value = sys.argv[2]
+mode = sys.argv[3]
+document = json.loads(path.read_bytes())
+messages = document['locale_data']['messages']
+message_id = 'Set your personal API key'
+original = messages.get(message_id)
+if not isinstance(original, list) or not original or not all(
+    isinstance(item, str) for item in original
+):
+    raise SystemExit(1)
+if mode == 'string':
+    messages[message_id] = [value]
+elif mode == 'object':
+    messages[message_id] = [{'translation': value}]
+else:
+    raise SystemExit(1)
+path.write_text(
+    json.dumps(document, ensure_ascii=True, separators=(',', ':')),
+    encoding='utf-8',
+)
+PY
+}
+
+gettext_modified_catalog="$work_dir/gettext-modified-catalog"
+copy_fixture "$base_arm64" "$gettext_modified_catalog"
+gettext_modified_catalog_value='modified-catalog-live-secret'
+gettext_modified_catalog_path='addons/webinterface.default/lang/_strings/en.json'
+mkdir -p "$gettext_modified_catalog/$(dirname "$gettext_modified_catalog_path")"
+cp "$gettext_catalog_source" \
+  "$gettext_modified_catalog/$gettext_modified_catalog_path"
+mutate_gettext_catalog \
+  "$gettext_modified_catalog/$gettext_modified_catalog_path" \
+  "$gettext_modified_catalog_value" \
+  string
+gettext_modified_catalog_apk="$work_dir/gettext-modified-catalog.apk"
+make_apk "$gettext_modified_catalog" "$gettext_modified_catalog_apk"
+expect_failure_diagnostic_without_value \
+  gettext-modified-catalog \
+  "$gettext_modified_catalog_apk" \
+  arm64-v8a \
+  "$gettext_modified_catalog_path" \
+  'config-json' \
+  "$gettext_modified_catalog_value"
+
+gettext_schema_mimic="$work_dir/gettext-schema-mimic"
+copy_fixture "$base_arm64" "$gettext_schema_mimic"
+gettext_schema_mimic_value='schema-mimic-live-secret'
+gettext_schema_mimic_path='assets/catalog-schema-mimic.json'
+cat > "$gettext_schema_mimic/$gettext_schema_mimic_path" <<JSON
+{
+  "domain": "messages",
+  "locale_data": {
+    "messages": {
+      "": {
+        "domain": "messages",
+        "plural_forms": "nplurals=2; plural=(n != 1);",
+        "lang": "en_gb"
+      },
+      "Set your personal API key": ["$gettext_schema_mimic_value"]
+    }
+  }
+}
+JSON
+gettext_schema_mimic_apk="$work_dir/gettext-schema-mimic.apk"
+make_apk "$gettext_schema_mimic" "$gettext_schema_mimic_apk"
+expect_failure_diagnostic_without_value \
+  gettext-schema-mimic \
+  "$gettext_schema_mimic_apk" \
+  arm64-v8a \
+  "$gettext_schema_mimic_path" \
+  'config-json' \
+  "$gettext_schema_mimic_value"
+
+gettext_identifier_secret="$work_dir/gettext-identifier-secret"
+copy_fixture "$base_arm64" "$gettext_identifier_secret"
+gettext_identifier_secret_value='identifier-message-live-secret'
+gettext_identifier_secret_path='addons/plugin.video.fixture/lang/_strings/en_us.json'
+mkdir -p "$gettext_identifier_secret/$(dirname "$gettext_identifier_secret_path")"
+cat > "$gettext_identifier_secret/$gettext_identifier_secret_path" <<JSON
+{
+  "domain": "messages",
+  "locale_data": {
+    "messages": {
+      "": {
+        "domain": "messages",
+        "plural_forms": "nplurals=2; plural=(n != 1);",
+        "lang": "en_us"
+      },
+      "api_key": ["$gettext_identifier_secret_value"]
+    }
+  }
+}
+JSON
+gettext_identifier_secret_apk="$work_dir/gettext-identifier-secret.apk"
+make_apk "$gettext_identifier_secret" "$gettext_identifier_secret_apk"
+expect_failure_diagnostic_without_value \
+  gettext-identifier-secret \
+  "$gettext_identifier_secret_apk" \
+  arm64-v8a \
+  "$gettext_identifier_secret_path" \
+  'config-json' \
+  "$gettext_identifier_secret_value"
+
+gettext_malformed_mutation="$work_dir/gettext-malformed-mutation"
+copy_fixture "$base_arm64" "$gettext_malformed_mutation"
+gettext_malformed_mutation_value='malformed-catalog-live-secret'
+gettext_malformed_mutation_path='addons/webinterface.default/lang/_strings/en.json'
+mkdir -p \
+  "$gettext_malformed_mutation/$(dirname "$gettext_malformed_mutation_path")"
+cp "$gettext_catalog_source" \
+  "$gettext_malformed_mutation/$gettext_malformed_mutation_path"
+mutate_gettext_catalog \
+  "$gettext_malformed_mutation/$gettext_malformed_mutation_path" \
+  "$gettext_malformed_mutation_value" \
+  object
+gettext_malformed_mutation_apk="$work_dir/gettext-malformed-mutation.apk"
+make_apk "$gettext_malformed_mutation" "$gettext_malformed_mutation_apk"
+expect_failure_diagnostic_without_value \
+  gettext-malformed-mutation \
+  "$gettext_malformed_mutation_apk" \
+  arm64-v8a \
+  "$gettext_malformed_mutation_path" \
+  'config-json' \
+  "$gettext_malformed_mutation_value"
 
 json_secret="$work_dir/json-secret"
 copy_fixture "$base_arm64" "$json_secret"
@@ -1306,8 +1568,22 @@ printf '{"nested":{"apiKey":"%s"}}\n' "$json_secret_value" > \
   "$json_secret/assets/private.json"
 json_secret_apk="$work_dir/json-secret.apk"
 make_apk "$json_secret" "$json_secret_apk"
-expect_failure_without_value json-short-secret "$json_secret_apk" arm64-v8a \
-  "$json_secret_value"
+expect_failure_diagnostic_without_value \
+  json-short-secret "$json_secret_apk" arm64-v8a \
+  'assets/private.json' 'config-json' "$json_secret_value"
+
+secret_filename="$work_dir/secret-filename"
+copy_fixture "$base_arm64" "$secret_filename"
+secret_filename_marker='password-token-file-live-secret'
+secret_filename_value='filename-payload-live-secret'
+secret_filename_path="assets/$secret_filename_marker.json"
+printf '{"api_key":"%s"}\n' "$secret_filename_value" > \
+  "$secret_filename/$secret_filename_path"
+secret_filename_apk="$work_dir/secret-filename.apk"
+make_apk "$secret_filename" "$secret_filename_apk"
+expect_failure_diagnostic_without_value \
+  secret-filename "$secret_filename_apk" arm64-v8a \
+  "$secret_filename_path" 'config-json' "$secret_filename_value"
 
 json_sequence_secret="$work_dir/json-sequence-secret"
 copy_fixture "$base_arm64" "$json_sequence_secret"
@@ -1337,8 +1613,9 @@ printf 'refresh-token: %s\n' "$yaml_fixture_value" > \
   "$yaml_secret/assets/private.yaml"
 yaml_secret_apk="$work_dir/yaml-secret.apk"
 make_apk "$yaml_secret" "$yaml_secret_apk"
-expect_failure_without_value yaml-unquoted-secret "$yaml_secret_apk" arm64-v8a \
-  "$yaml_fixture_value"
+expect_failure_diagnostic_without_value \
+  yaml-unquoted-secret "$yaml_secret_apk" arm64-v8a \
+  'assets/private.yaml' 'config-yaml' "$yaml_fixture_value"
 
 deploy_token_yaml="$work_dir/deploy-token-yaml"
 copy_fixture "$base_arm64" "$deploy_token_yaml"
@@ -1433,8 +1710,25 @@ printf 'password: "%s"\n' "$text_secret_value" > \
   "$text_secret/assets/private.txt"
 text_secret_apk="$work_dir/text-secret.apk"
 make_apk "$text_secret" "$text_secret_apk"
-expect_failure_without_value text-secret "$text_secret_apk" arm64-v8a \
-  "$text_secret_value"
+expect_failure_diagnostic_without_value \
+  text-secret "$text_secret_apk" arm64-v8a \
+  'assets/private.txt' 'config-text' "$text_secret_value"
+
+yaml_parser_error="$work_dir/yaml-parser-error"
+copy_fixture "$base_arm64" "$yaml_parser_error"
+cat > "$yaml_parser_error/assets/duplicate.yaml" <<'YAML'
+setting: first
+setting: second
+YAML
+yaml_parser_error_apk="$work_dir/yaml-parser-error.apk"
+make_apk "$yaml_parser_error" "$yaml_parser_error_apk"
+expect_failure_without_diagnostic \
+  yaml-parser-error \
+  "$yaml_parser_error_apk" \
+  arm64-v8a \
+  'APK contains a non-placeholder secret assignment in packaged configuration' \
+  'found a duplicate key' \
+  'assets/duplicate.yaml'
 
 path_traversal_apk="$work_dir/path-traversal.apk"
 python3 - "$path_traversal_apk" <<'PY'
