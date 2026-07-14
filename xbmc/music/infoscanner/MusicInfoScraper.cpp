@@ -134,6 +134,7 @@ void CMusicInfoScraper::Cancel()
 {
   m_http->Cancel();
   m_bCanceled=true;
+  StopThread();
   m_http->Reset();
 }
 

@@ -12,8 +12,11 @@
 #include "utils/HttpHeader.h"
 #include "utils/RingBuffer.h"
 
+#include <atomic>
 #include <map>
+#include <memory>
 #include <string>
+#include <string_view>
 
 typedef void CURL_HANDLE;
 typedef void CURLM;
@@ -21,6 +24,9 @@ struct curl_slist;
 
 namespace XFILE
 {
+  std::string RedactCurlUrlForLogging(const CURL& url);
+  std::string RedactCurlHeaderForLogging(std::string_view line, bool& redactContinuation);
+
   class CCurlFile : public IFile
   {
     private:
@@ -37,6 +43,8 @@ namespace XFILE
 
       CCurlFile();
       ~CCurlFile() override;
+      CCurlFile(const CCurlFile&) = delete;
+      CCurlFile& operator=(const CCurlFile&) = delete;
       bool Open(const CURL& url) override;
       bool OpenForWrite(const CURL& url, bool bOverWrite = false) override;
       bool ReOpen(const CURL& url) override;
@@ -62,6 +70,7 @@ namespace XFILE
       bool ReadData(std::string& strHTML);
       bool Download(const std::string& strURL, const std::string& strFileName, unsigned int* pdwSize = NULL);
       bool IsInternet();
+      // All operations except Cancel() are owner-thread only. Cancel() may be called cross-thread.
       void Cancel();
       void Reset();
       void SetUserAgent(const std::string& sUserAgent) { m_userAgent = sUserAgent; }
@@ -74,6 +83,7 @@ namespace XFILE
       void SetTotalTimeout(int timeout) { m_totaltimeout = timeout; }
       void SetLowSpeedTime(int lowspeedtime) { m_lowspeedtime = lowspeedtime; }
       void SetPostData(const std::string& postdata) { m_postdata = postdata; }
+      void SetRetry(bool allowRetry) { m_allowRetry = allowRetry; }
       void SetReferer(const std::string& referer) { m_referer = referer; }
       void SetCookie(const std::string& cookie) { m_cookie = cookie; }
       void SetMimeType(const std::string& mimetype) { SetRequestHeader("Content-Type", mimetype); }
@@ -102,6 +112,7 @@ namespace XFILE
       {
       public:
           CReadState();
+          explicit CReadState(std::shared_ptr<std::atomic_bool> cancellationState);
           ~CReadState();
           CURL_HANDLE* m_easyHandle;
           CURLM* m_multiHandle;
@@ -112,7 +123,6 @@ namespace XFILE
           char* m_overflowBuffer; // in the rare case we would overflow the above buffer
           unsigned int m_overflowSize; // size of the overflow buffer
           int m_stillRunning; // Is background url fetch still in progress
-          bool m_cancelled;
           int64_t m_fileSize;
           int64_t m_filePos;
           bool m_bFirstLoop;
@@ -120,6 +130,11 @@ namespace XFILE
           bool m_sendRange;
           bool m_bLastError;
           bool m_bRetry;
+          bool m_abortAfterData{false};
+          bool m_debugHeaderInSensitive{false};
+          bool m_debugHeaderOutSensitive{false};
+
+          std::shared_ptr<std::atomic_bool> m_cancellationState;
 
           char* m_readBuffer;
 
@@ -138,6 +153,8 @@ namespace XFILE
           ssize_t Read(void* lpBuf, size_t uiBufSize);
           ReadLineResult ReadLine(char* buffer, std::size_t bufferSize);
           int8_t FillBuffer(unsigned int want);
+          bool IsCancelled() const noexcept;
+          bool WaitForActivity();
           void SetReadBuffer(const void* lpBuf, int64_t uiBufSize);
 
           void SetResume(void);
@@ -150,10 +167,12 @@ namespace XFILE
       void SetCommonOptions(CReadState* state, bool failOnError = true);
       void SetRequestHeaders(CReadState* state);
       void SetCorrectHeaders(CReadState* state);
+      bool UseAutomaticRange() const;
       bool Service(const std::string& strURL, std::string& strHTML);
       std::string GetInfoString(int infoType);
 
     protected:
+      std::shared_ptr<std::atomic_bool> m_cancellationState;
       CReadState* m_state;
       CReadState* m_oldState;
       unsigned int m_bufferSize;
