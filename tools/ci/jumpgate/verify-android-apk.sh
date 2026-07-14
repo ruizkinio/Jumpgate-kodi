@@ -225,6 +225,18 @@ while IFS= read -r entry; do
       fail 'APK contains a forbidden credential or runtime-config artifact'
       ;;
   esac
+
+  normalized_entry="${lower_entry%/}"
+  case "/$normalized_entry/" in
+    */site-packages/cryptodome/selftest/*)
+      fail 'APK contains a forbidden Cryptodome SelfTest artifact'
+      ;;
+  esac
+  case "$normalized_entry" in
+    lib/"$expected_abi"/libcryptodome_selftest_*.so)
+      fail 'APK contains a forbidden Cryptodome SelfTest artifact'
+      ;;
+  esac
 done < "$entry_list"
 
 if ! "$aapt2" dump badging "$apk" > "$badging_raw_file" 2>&1; then

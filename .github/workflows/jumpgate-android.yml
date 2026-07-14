@@ -155,6 +155,7 @@ jobs:
         run: |
           python3 tools/ci/jumpgate/test-manager-addon.py
           bash tools/ci/jumpgate/test-verify-shairplay-crypto-symbols.sh
+          python3 tools/ci/jumpgate/test-verify-android-python-runtime.py
           bash tools/ci/jumpgate/test-verify-android-apk.sh
 
       - name: Derive tracked-source cache keys
@@ -489,9 +490,13 @@ jobs:
           IFS=. read -r code_major code_minor code_patch <<< "$version_code_source"
           expected_version_code="$(((10#$code_major * 100 + 10#$code_minor) * 1000 + 10#$code_patch))"
           expected_version_name="${version_major}.${version_minor}-${version_tag}"
+          target_platform="$(awk -F= '$1 == "PLATFORM" { print $2 }' tools/depends/Makefile.include)"
+          target_prefix="$DEPENDS_PREFIX/$target_platform"
           source_apk="kodiapp-${{ matrix.abi }}-release.apk"
           artifact_apk="$ARTIFACT_DIR/jumpgate-android-ci-ephemeral-signed-${{ matrix.abi }}-${GITHUB_SHA}.apk"
           test -n "$expected_package"
+          test -n "$target_platform"
+          test -d "$target_prefix"
           [[ "${EXPECTED_APK_SIGNER_SHA256:-}" =~ ^[0-9a-f]{64}$ ]]
           test -f "$source_apk"
           mkdir -p "$ARTIFACT_DIR"
@@ -505,6 +510,10 @@ jobs:
             "$expected_version_name" \
             "$expected_version_code" \
             "$EXPECTED_APK_SIGNER_SHA256"
+          python3 tools/ci/jumpgate/verify-android-python-runtime.py \
+            "$artifact_apk" \
+            "${{ matrix.abi }}" \
+            "$target_prefix"
 
       - name: Save shared source tarballs
         if: ${{ github.repository == env.CANONICAL_REPOSITORY && github.event_name != 'pull_request' && matrix.cache_id == 'arm64' && steps.restore-tarballs.outputs.cache-hit != 'true' }}

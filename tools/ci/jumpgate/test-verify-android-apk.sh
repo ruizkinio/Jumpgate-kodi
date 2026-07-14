@@ -817,6 +817,62 @@ grep -Fxq 'libhelper.so' "$readelf_log"
 grep -Fxq 'libkodi.so' "$readelf_log"
 test -s "$armv7_apk.sha256"
 
+benign_cryptodome_runtime="$work_dir/benign-cryptodome-runtime"
+copy_fixture "$base_arm64" "$benign_cryptodome_runtime"
+benign_cryptodome_root="$benign_cryptodome_runtime/assets/python3.11/lib/python3.11/site-packages/Cryptodome"
+mkdir -p "$benign_cryptodome_root/Cipher/__pycache__"
+printf 'benign sibling runtime module\n' > "$benign_cryptodome_root/Cipher/AES.py"
+printf 'benign sibling bytecode\n' > \
+  "$benign_cryptodome_root/Cipher/__pycache__/AES.cpython-311.pyc"
+benign_cryptodome_apk="$work_dir/benign-cryptodome-runtime.apk"
+make_apk "$benign_cryptodome_runtime" "$benign_cryptodome_apk"
+verify_apk "$benign_cryptodome_apk" arm64-v8a >/dev/null
+
+selftest_py="$work_dir/cryptodome-selftest-py"
+copy_fixture "$base_arm64" "$selftest_py"
+selftest_py_entry='assets/python3.11/lib/python3.11/site-packages/Cryptodome/SelfTest/Cipher/test_AES.py'
+mkdir -p "$selftest_py/$(dirname "$selftest_py_entry")"
+printf 'SELFTEST_PY_CONTENT_MUST_NOT_BE_PRINTED\n' > "$selftest_py/$selftest_py_entry"
+selftest_py_apk="$work_dir/cryptodome-selftest-py.apk"
+make_apk "$selftest_py" "$selftest_py_apk"
+expect_failure_without_diagnostic \
+  cryptodome-selftest-py \
+  "$selftest_py_apk" \
+  arm64-v8a \
+  'APK contains a forbidden Cryptodome SelfTest artifact' \
+  'SELFTEST_PY_CONTENT_MUST_NOT_BE_PRINTED' \
+  "$selftest_py_entry"
+
+selftest_pyc="$work_dir/cryptodome-selftest-pyc"
+copy_fixture "$base_arm64" "$selftest_pyc"
+selftest_pyc_entry='assets/python3.11/lib/python3.11/site-packages/Cryptodome/SelfTest/__pycache__/loader.cpython-311.pyc'
+mkdir -p "$selftest_pyc/$(dirname "$selftest_pyc_entry")"
+printf 'SELFTEST_PYC_CONTENT_MUST_NOT_BE_PRINTED\n' > "$selftest_pyc/$selftest_pyc_entry"
+selftest_pyc_apk="$work_dir/cryptodome-selftest-pyc.apk"
+make_apk "$selftest_pyc" "$selftest_pyc_apk"
+expect_failure_without_diagnostic \
+  cryptodome-selftest-pyc \
+  "$selftest_pyc_apk" \
+  arm64-v8a \
+  'APK contains a forbidden Cryptodome SelfTest artifact' \
+  'SELFTEST_PYC_CONTENT_MUST_NOT_BE_PRINTED' \
+  "$selftest_pyc_entry"
+
+flattened_selftest_native="$work_dir/cryptodome-flattened-selftest-native"
+copy_fixture "$base_arm64" "$flattened_selftest_native"
+flattened_selftest_native_entry='lib/arm64-v8a/LiBCryptodome_SeLfTeSt_Cipher_native.so'
+printf 'FLATTENED_SELFTEST_NATIVE_CONTENT_MUST_NOT_BE_PRINTED\n' > \
+  "$flattened_selftest_native/$flattened_selftest_native_entry"
+flattened_selftest_native_apk="$work_dir/cryptodome-flattened-selftest-native.apk"
+make_apk "$flattened_selftest_native" "$flattened_selftest_native_apk"
+expect_failure_without_diagnostic \
+  cryptodome-flattened-selftest-native \
+  "$flattened_selftest_native_apk" \
+  arm64-v8a \
+  'APK contains a forbidden Cryptodome SelfTest artifact' \
+  'FLATTENED_SELFTEST_NATIVE_CONTENT_MUST_NOT_BE_PRINTED' \
+  "$flattened_selftest_native_entry"
+
 der_noise="$work_dir/der-parser-noise"
 copy_fixture "$base_arm64" "$der_noise"
 python3 - "$der_noise/assets/cryptodome-der-parser-noise.bin" <<'PY'
