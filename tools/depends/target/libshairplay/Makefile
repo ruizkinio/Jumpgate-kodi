@@ -1,5 +1,5 @@
 include ../../Makefile.include
-DEPS = ../../Makefile.include Makefile 0001-configure-fix-dns-sd-check.patch ../../download-files.include
+PATCHES = 0001-configure-fix-dns-sd-check.patch
 
 # lib name, version
 LIBNAME=shairplay
@@ -13,8 +13,11 @@ include ../../download-files.include
 CONFIGURE=./configure --prefix=$(PREFIX)
 
 ifeq ($(OS),android)
+PATCHES += 0002-android-namespace-private-crypto.patch
 CONFIGURE += --disable-shared
 endif
+
+DEPS = ../../Makefile.include Makefile $(PATCHES) ../../download-files.include
 
 LIBDYLIB=$(PLATFORM)/src/lib/.libs/libshairplay.a
 
@@ -24,7 +27,7 @@ all: .installed-$(PLATFORM)
 $(PLATFORM): $(DEPS) | $(TARBALLS_LOCATION)/$(ARCHIVE).$(HASH_TYPE)
 	rm -rf $(PLATFORM); mkdir -p $(PLATFORM)
 	cd $(PLATFORM); $(ARCHIVE_TOOL) $(ARCHIVE_TOOL_FLAGS) $(TARBALLS_LOCATION)/$(ARCHIVE)
-	cd $(PLATFORM); patch -p1 -i ../0001-configure-fix-dns-sd-check.patch
+	cd $(PLATFORM); for patch_file in $(PATCHES); do patch -p1 -i ../$$patch_file || exit 1; done
 	cd $(PLATFORM); $(AUTORECONF) -vif
 	cd $(PLATFORM); $(CONFIGURE)
 

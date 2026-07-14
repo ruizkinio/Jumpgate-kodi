@@ -150,9 +150,11 @@ jobs:
           echo "$build_tools_root" >> "$GITHUB_PATH"
           echo "$ANDROID_SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
 
-      - name: Run APK verifier real-tool and adversarial tests
+      - name: Run static symbol and APK verifier tests
         if: ${{ matrix.cache_id == 'arm64' }}
-        run: bash tools/ci/jumpgate/test-verify-android-apk.sh
+        run: |
+          bash tools/ci/jumpgate/test-verify-shairplay-crypto-symbols.sh
+          bash tools/ci/jumpgate/test-verify-android-apk.sh
 
       - name: Derive tracked-source cache keys
         id: source-keys
@@ -349,10 +351,12 @@ jobs:
             'Configured target platform mismatch'
           echo "Validated dependency platforms: native=$native_platform target=$target_platform"
           shairplay_archive="$DEPENDS_PREFIX/$target_platform/lib/libshairplay.a"
+          crypto_archive="$DEPENDS_PREFIX/$target_platform/lib/libcrypto.a"
           shairplay_lib_dir="$(dirname "$shairplay_archive")"
           llvm_ar="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
           llvm_nm="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
           require_nonempty "$shairplay_archive" 'Static Shairplay archive is missing or empty'
+          require_nonempty "$crypto_archive" 'Static OpenSSL crypto archive is missing or empty'
           require_executable "$llvm_ar" 'NDK llvm-ar is unavailable'
           require_executable "$llvm_nm" 'NDK llvm-nm is unavailable'
 
@@ -367,6 +371,11 @@ jobs:
               -name 'libshairplay.so*' -print >&2
             exit 1
           fi
+
+          bash tools/ci/jumpgate/verify-shairplay-crypto-symbols.sh \
+            "$llvm_nm" \
+            "$shairplay_archive" \
+            "$crypto_archive"
 
           cat > "$RUNNER_TEMP/shairplay-expected-symbol-owners.txt" <<'EOF'
           dnssd_destroy libshairplay_la-dnssd.o
