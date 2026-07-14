@@ -33,6 +33,8 @@ set(SOURCES TestAlarmClock.cpp
             TestJumpgatePlaybackRetry.cpp
             TestJumpgatePlaybackClaimClient.cpp
             TestJumpgatePlaybackClaimCoordinator.cpp
+            TestJumpgateSubtitleClient.cpp
+            TestJumpgateSubtitleCoordinator.cpp
             TestJumpgatePlaybackContext.cpp
             TestJumpgatePlaybackAuthority.cpp
             TestJumpgateScrobbleStartCoordinator.cpp
