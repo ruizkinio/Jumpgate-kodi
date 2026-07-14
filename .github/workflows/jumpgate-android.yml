@@ -153,6 +153,7 @@ jobs:
       - name: Run static symbol and APK verifier tests
         if: ${{ matrix.cache_id == 'arm64' }}
         run: |
+          python3 tools/ci/jumpgate/test-manager-addon.py
           bash tools/ci/jumpgate/test-verify-shairplay-crypto-symbols.sh
           bash tools/ci/jumpgate/test-verify-android-apk.sh
 

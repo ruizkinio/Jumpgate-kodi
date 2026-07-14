@@ -1,9 +1,7 @@
-"""Open the native Jumpgate profile manager."""
+"""Open the Jumpgate Manager configuration screen."""
 
-import xbmc
+import xbmcaddon
 
 
 if __name__ == "__main__":
-    # The addon has no privileged command channel. Native foreground UI owns
-    # every profile mutation and confirmation.
-    xbmc.executebuiltin("JumpgateManager", True)
+    xbmcaddon.Addon().openSettings()
