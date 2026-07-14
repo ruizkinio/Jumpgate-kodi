@@ -148,6 +148,7 @@ try:
             if (
                 not trimmed_name
                 or any(part in {'', '.', '..'} for part in parts)
+                or any(':' in part for part in parts)
                 or re.match(r'^[A-Za-z]:', parts[0])
             ):
                 reject()
@@ -210,7 +211,7 @@ while IFS= read -r entry; do
     fail 'APK contains an unsafe entry name'
   fi
   case "$entry" in
-    /* | .. | ../* | */.. | */../* | *\\*)
+    /* | .. | ../* | */.. | */../* | *\\* | *:*)
       fail 'APK contains an unsafe entry path'
       ;;
   esac
@@ -359,10 +360,1258 @@ for shared_library in "${shared_libraries[@]}"; do
   fi
 done
 
-private_material_pattern='-----BEGIN ([A-Z0-9]+ )?PRIVATE KEY-----|(FLY_API_TOKEN|JUMPGATE_ENCRYPTION_KEY|KODI_ANDROID_STORE_PASSWORD|KODI_ANDROID_KEY_PASSWORD)[[:space:]]*[:=][[:space:]]*[^[:space:]]{8,}'
-if LC_ALL=C grep -aErIq -- "$private_material_pattern" "$extract_dir"; then
+if ! python3 - "$extract_dir" "$expected_abi" <<'PY'
+import base64
+import binascii
+import codecs
+import contextlib
+import hashlib
+import json
+import mmap
+import os
+import pathlib
+import re
+import stat
+import sys
+import unicodedata
+
+root = pathlib.Path(sys.argv[1])
+expected_abi = sys.argv[2]
+allowed_path = pathlib.PurePosixPath('lib') / expected_abi / 'libkodi.so'
+allowed_der_sha256 = '8959c62b4351cbaa702942f4572d37335a7a3dfdcc6f0d2763a2afb486e3ac8f'
+MAX_FILES = 100_000
+MAX_FILE_BYTES = 512 * 1024 * 1024
+MAX_TOTAL_BYTES = 1024 * 1024 * 1024
+MAX_DECODE_WORK_BYTES = 5 * MAX_TOTAL_BYTES
+CHUNK_BYTES = 1024 * 1024
+MAX_DER_BYTES = 128 * 1024
+MAX_DER_ATTEMPTS = 500_000
+MAX_BASE64_CHARACTERS = 192 * 1024
+MAX_BASE64_ATTEMPTS = 100_000
+MAX_BASE64_DECODE_BYTES = 64 * 1024 * 1024
+MAX_ARMOR_CHARACTERS = 256 * 1024
+MAX_ASSIGNMENT_LINE = 64 * 1024
+MAX_JSON_BYTES = 32 * 1024 * 1024
+MAX_HINT_WINDOWS = 100_000
+CANONICAL_BLOCK = re.compile(
+    rb'(?<!-)-----BEGIN RSA PRIVATE KEY-----'
+    rb'(?P<body>[A-Za-z0-9+/=]{1,16384})'
+    rb'-----END RSA PRIVATE KEY-----(?!-)'
+)
+DER_PRIVATE_CANDIDATE = re.compile(
+    rb'(?:'
+    rb'\x30[\x0b-\x7f]|'
+    rb'\x30\x81[\x80-\xff]|'
+    rb'\x30\x82[\x01-\xff][\x00-\xff]|'
+    rb'\x30\x83[\x01-\xff][\x00-\xff]{2}|'
+    rb'\x30\x84[\x01-\xff][\x00-\xff]{3}'
+    rb')\x02\x01[\x00\x01]'
+)
+ARMOR_MARKER = re.compile(
+    r'-+[ \t\r\n\x00]*'
+    r'(b[ \t\r\n\x00]*e[ \t\r\n\x00]*g[ \t\r\n\x00]*i[ \t\r\n\x00]*n|'
+    r'e[ \t\r\n\x00]*n[ \t\r\n\x00]*d)[ \t\r\n\x00]*'
+    r'((?:[a-z0-9][ \t\r\n\x00]*){1,96})-+',
+    re.IGNORECASE,
+)
+NAMED_SECRET = (
+    r'(?:FLY_API_TOKEN|JUMPGATE_ENCRYPTION_KEY|'
+    r'KODI_ANDROID_STORE_PASSWORD|KODI_ANDROID_KEY_PASSWORD)'
+)
+NAMED_ASSIGNMENT = re.compile(
+    rf'(?<![A-Za-z0-9_])(?:export +)?'
+    rf'(?:(?:"{NAMED_SECRET}")|(?:\'{NAMED_SECRET}\')|(?:{NAMED_SECRET}))'
+    rf'(?![A-Za-z0-9_]) *(?:\+=|[:=]) *',
+    re.IGNORECASE,
+)
+BASE64_CHARACTERS = frozenset(
+    'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=_-'
+)
+PRIVATE_LABELS = {
+    'privatekey', 'rsaprivatekey', 'ecprivatekey', 'dsaprivatekey',
+    'encryptedprivatekey', 'opensshprivatekey', 'pgpprivatekeyblock',
+}
+OPENSSH_MAGIC = b'openssh-key-v1\0'
+OPENPGP_SECRET_HEADERS = bytes((
+    0xC5, 0xC7, 0x94, 0x95, 0x96, 0x97, 0x9C, 0x9D, 0x9E, 0x9F,
+))
+BASE64_BYTES = frozenset(b'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=_-')
+UNICODE_WHITESPACE_CODEPOINTS = (
+    *range(0x09, 0x0E), 0x20, 0x85, 0xA0, 0x1680,
+    *range(0x2000, 0x200B), 0x2028, 0x2029, 0x202F, 0x205F, 0x3000,
+)
+UTF8_WHITESPACE_BYTES = tuple(sorted(
+    {chr(value).encode('utf-8') for value in UNICODE_WHITESPACE_CODEPOINTS},
+    key=len,
+    reverse=True,
+))
+
+
+def fail() -> None:
+    raise ValueError('private key material rejected')
+
+
+def collect_regular_files() -> list[tuple[pathlib.Path, pathlib.PurePosixPath, int]]:
+    root_info = root.stat(follow_symlinks=False)
+    if not stat.S_ISDIR(root_info.st_mode) or root.is_symlink():
+        fail()
+    files = []
+    total_bytes = 0
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        with os.scandir(directory) as iterator:
+            entries = sorted(iterator, key=lambda entry: entry.name)
+        for entry in entries:
+            if (
+                not entry.name
+                or entry.name in {'.', '..'}
+                or '/' in entry.name
+                or '\\' in entry.name
+                or ':' in entry.name
+                or any(ord(character) < 32 or ord(character) == 127 for character in entry.name)
+                or entry.is_symlink()
+            ):
+                fail()
+            info = entry.stat(follow_symlinks=False)
+            path = pathlib.Path(entry.path)
+            if stat.S_ISDIR(info.st_mode):
+                pending.append(path)
+                continue
+            if not stat.S_ISREG(info.st_mode) or info.st_size < 0:
+                fail()
+            relative = pathlib.PurePosixPath(path.relative_to(root).as_posix())
+            if relative.is_absolute() or any(part in {'', '.', '..'} for part in relative.parts):
+                fail()
+            if info.st_size > MAX_FILE_BYTES:
+                fail()
+            total_bytes += info.st_size
+            files.append((path, relative, info.st_size))
+            if len(files) > MAX_FILES or total_bytes > MAX_TOTAL_BYTES:
+                fail()
+    files.sort(key=lambda record: record[1].as_posix())
+    if total_bytes * 5 > MAX_DECODE_WORK_BYTES:
+        fail()
+    return files
+
+
+@contextlib.contextmanager
+def mapped_file(record):
+    path, _, expected_size = record
+    flags = os.O_RDONLY | getattr(os, 'O_BINARY', 0) | getattr(os, 'O_NOFOLLOW', 0)
+    descriptor = os.open(path, flags)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_size != expected_size:
+            fail()
+        if expected_size == 0:
+            yield None
+        else:
+            with mmap.mmap(descriptor, length=0, access=mmap.ACCESS_READ) as data:
+                yield data
+    finally:
+        os.close(descriptor)
+
+
+class WorkBudget:
+    def __init__(self):
+        self.der_attempts = 0
+        self.base64_attempts = 0
+        self.base64_decoded_bytes = 0
+        self.text_bytes = 0
+
+    def der(self) -> None:
+        self.der_attempts += 1
+        if self.der_attempts > MAX_DER_ATTEMPTS:
+            fail()
+
+    def base64(self, decoded_bytes: int) -> None:
+        self.base64_attempts += 1
+        self.base64_decoded_bytes += decoded_bytes
+        if (
+            self.base64_attempts > MAX_BASE64_ATTEMPTS
+            or self.base64_decoded_bytes > MAX_BASE64_DECODE_BYTES
+        ):
+            fail()
+
+    def text(self, encoded_bytes: int) -> None:
+        self.text_bytes += encoded_bytes
+        if self.text_bytes > MAX_DECODE_WORK_BYTES:
+            fail()
+
+
+def read_der_tlv(data, offset: int, limit: int):
+    if offset < 0 or offset + 2 > limit:
+        return None
+    tag = data[offset]
+    first_length = data[offset + 1]
+    cursor = offset + 2
+    if first_length < 0x80:
+        length = first_length
+    else:
+        length_bytes = first_length & 0x7F
+        if length_bytes == 0 or length_bytes > 4 or cursor + length_bytes > limit:
+            return None
+        encoded_length = bytes(data[cursor:cursor + length_bytes])
+        if encoded_length[0] == 0:
+            return None
+        length = int.from_bytes(encoded_length, 'big')
+        if length < 0x80:
+            return None
+        cursor += length_bytes
+    end = cursor + length
+    if length > MAX_DER_BYTES or end > limit:
+        return None
+    return tag, cursor, end
+
+
+def der_children(data, start: int, end: int):
+    children = []
+    cursor = start
+    while cursor < end and len(children) <= 32:
+        child = read_der_tlv(data, cursor, end)
+        if child is None:
+            return None
+        children.append(child)
+        cursor = child[2]
+    return children if cursor == end and len(children) <= 32 else None
+
+
+def der_integer(data, item):
+    if item[0] != 0x02 or item[2] <= item[1]:
+        return None
+    value = bytes(data[item[1]:item[2]])
+    if value[0] & 0x80 or (len(value) > 1 and value[0] == 0 and not value[1] & 0x80):
+        return None
+    return value
+
+
+def valid_der_oid(data, item) -> bool:
+    if item[0] != 0x06 or item[2] <= item[1]:
+        return False
+    cursor = item[1]
+    subidentifiers = 0
+    first_group = True
+    while cursor < item[2]:
+        value = data[cursor]
+        if first_group and value == 0x80:
+            return False
+        cursor += 1
+        if value & 0x80:
+            first_group = False
+            continue
+        subidentifiers += 1
+        first_group = True
+    return subidentifiers >= 1 and first_group
+
+
+def valid_algorithm_identifier(data, item) -> bool:
+    if item[0] != 0x30:
+        return False
+    children = der_children(data, item[1], item[2])
+    return bool(
+        children
+        and len(children) in {1, 2}
+        and valid_der_oid(data, children[0])
+    )
+
+
+def is_der_private_key(data, offset: int = 0, require_end: bool = False) -> bool:
+    top = read_der_tlv(data, offset, len(data))
+    if top is None or top[0] != 0x30 or top[2] - offset < 13:
+        return False
+    if require_end and top[2] != len(data):
+        return False
+    children = der_children(data, top[1], top[2])
+    if not children:
+        return False
+    integers = [der_integer(data, child) for child in children]
+
+    # PKCS#1 RSAPrivateKey.
+    if (
+        len(children) in {9, 10}
+        and all(value is not None for value in integers[:9])
+        and int.from_bytes(integers[0], 'big') in {0, 1}
+        and len(integers[1]) >= 64
+        and 1 <= len(integers[2]) <= 8
+        and len(integers[3]) >= 32
+        and len(integers[4]) >= 16
+        and len(integers[5]) >= 16
+    ):
+        return True
+
+    # Traditional OpenSSL DSA private key.
+    if (
+        len(children) == 6
+        and all(value is not None for value in integers)
+        and int.from_bytes(integers[0], 'big') == 0
+        and len(integers[1]) >= 64
+        and len(integers[2]) >= 16
+        and len(integers[5]) >= 16
+    ):
+        return True
+
+    # SEC1 ECPrivateKey.
+    if (
+        len(children) >= 2
+        and integers[0] is not None
+        and int.from_bytes(integers[0], 'big') == 1
+        and children[1][0] == 0x04
+        and 16 <= children[1][2] - children[1][1] <= 80
+        and all(child[0] in {0xA0, 0xA1} for child in children[2:])
+    ):
+        return True
+
+    # PKCS#8 PrivateKeyInfo / RFC 5958 OneAsymmetricKey. AlgorithmIdentifier
+    # identifies an open set, so structural validity is the security boundary.
+    if (
+        len(children) >= 3
+        and integers[0] is not None
+        and int.from_bytes(integers[0], 'big') in {0, 1}
+        and valid_algorithm_identifier(data, children[1])
+        and children[2][0] == 0x04
+        and 1 <= children[2][2] - children[2][1] <= MAX_DER_BYTES
+        and all(child[0] in {0xA0, 0xA1} for child in children[3:])
+    ):
+        return True
+    return False
+
+
+def is_encrypted_private_key_info(data) -> bool:
+    top = read_der_tlv(data, 0, len(data))
+    if top is None or top[0] != 0x30 or top[2] != len(data):
+        return False
+    children = der_children(data, top[1], top[2])
+    return bool(
+        children
+        and len(children) == 2
+        and children[0][0] == 0x30
+        and children[1][0] == 0x04
+        and children[1][2] - children[1][1] >= 16
+    )
+
+
+def read_ssh_string(data, offset: int):
+    if offset + 4 > len(data):
+        return None
+    length = int.from_bytes(data[offset:offset + 4], 'big')
+    end = offset + 4 + length
+    if length > MAX_DER_BYTES or end > len(data):
+        return None
+    return bytes(data[offset + 4:end]), end
+
+
+def is_openssh_private_key(data) -> bool:
+    if not bytes(data[:len(OPENSSH_MAGIC)]) == OPENSSH_MAGIC:
+        return False
+    offset = len(OPENSSH_MAGIC)
+    values = []
+    for _ in range(3):
+        item = read_ssh_string(data, offset)
+        if item is None:
+            return False
+        values.append(item[0])
+        offset = item[1]
+    if offset + 4 > len(data):
+        return False
+    key_count = int.from_bytes(data[offset:offset + 4], 'big')
+    offset += 4
+    if not 1 <= key_count <= 32 or len(values[0]) > 64 or len(values[1]) > 64:
+        return False
+    for _ in range(key_count + 1):
+        item = read_ssh_string(data, offset)
+        if item is None:
+            return False
+        offset = item[1]
+    return True
+
+
+def read_openpgp_mpi(data, cursor: int, end: int):
+    if cursor + 2 > end:
+        return None
+    bits = int.from_bytes(data[cursor:cursor + 2], 'big')
+    length = (bits + 7) // 8
+    finish = cursor + 2 + length
+    if bits == 0 or length > MAX_DER_BYTES or finish > end:
+        return None
+    value = data[cursor + 2:finish]
+    if not value or value[0].bit_length() + (len(value) - 1) * 8 != bits:
+        return None
+    return bits, finish
+
+
+MAX_OPENPGP_PARTIAL_CHUNKS = 128
+
+
+def read_openpgp_new_length(data, cursor: int):
+    if cursor >= len(data):
+        return None
+    first = data[cursor]
+    cursor += 1
+    if first < 192:
+        return 'fixed', first, cursor
+    if first < 224:
+        if cursor >= len(data):
+            return None
+        return 'fixed', ((first - 192) << 8) + data[cursor] + 192, cursor + 1
+    if first < 255:
+        return 'partial', 1 << (first & 0x1F), cursor
+    if cursor + 4 > len(data):
+        return None
+    return 'fixed', int.from_bytes(data[cursor:cursor + 4], 'big'), cursor + 4
+
+
+def openpgp_packet_body(data, offset: int):
+    if offset >= len(data) or not data[offset] & 0x80:
+        return None
+    header = data[offset]
+    cursor = offset + 1
+    if header & 0x40:
+        tag = header & 0x3F
+        parsed_length = read_openpgp_new_length(data, cursor)
+        if parsed_length is None:
+            return tag, b'', None, True
+        kind, length, cursor = parsed_length
+        if kind == 'fixed':
+            end = cursor + length
+            available = bytes(data[cursor:min(end, len(data), cursor + MAX_DER_BYTES)])
+            malformed = length > MAX_DER_BYTES or end > len(data)
+            return tag, available, end if not malformed else None, malformed
+
+        body = bytearray()
+        for _ in range(MAX_OPENPGP_PARTIAL_CHUNKS):
+            if length > MAX_DER_BYTES - len(body) or cursor + length > len(data):
+                available = min(len(data) - cursor, MAX_DER_BYTES - len(body))
+                if available > 0:
+                    body.extend(data[cursor:cursor + available])
+                return tag, bytes(body), None, True
+            body.extend(data[cursor:cursor + length])
+            cursor += length
+            parsed_length = read_openpgp_new_length(data, cursor)
+            if parsed_length is None:
+                return tag, bytes(body), None, True
+            kind, length, cursor = parsed_length
+            if kind == 'partial':
+                continue
+            end = cursor + length
+            if length > MAX_DER_BYTES - len(body) or end > len(data):
+                available = min(len(data) - cursor, MAX_DER_BYTES - len(body))
+                if available > 0:
+                    body.extend(data[cursor:cursor + available])
+                return tag, bytes(body), None, True
+            body.extend(data[cursor:end])
+            return tag, bytes(body), end, False
+        return tag, bytes(body), None, True
+
+    tag = (header >> 2) & 0x0F
+    length_type = header & 0x03
+    if length_type == 3:
+        length = len(data) - cursor
+        body = bytes(data[cursor:min(len(data), cursor + MAX_DER_BYTES)])
+        return tag, body, len(data) if length <= MAX_DER_BYTES else None, length > MAX_DER_BYTES
+    length_bytes = (1, 2, 4)[length_type]
+    if cursor + length_bytes > len(data):
+        return tag, b'', None, True
+    length = int.from_bytes(data[cursor:cursor + length_bytes], 'big')
+    cursor += length_bytes
+    end = cursor + length
+    body = bytes(data[cursor:min(end, len(data), cursor + MAX_DER_BYTES)])
+    malformed = length > MAX_DER_BYTES or end > len(data)
+    return tag, body, end if not malformed else None, malformed
+
+
+def openpgp_public_layout(data):
+    end = len(data)
+    if end < 10 or data[0] != 4:
+        return None
+    algorithm = data[5]
+    cursor = 6
+    secret_mpi_count = 0
+    if algorithm in {1, 2, 3}:  # RSA
+        public = []
+        for _ in range(2):
+            item = read_openpgp_mpi(data, cursor, end)
+            if item is None:
+                return None
+            public.append(item[0])
+            cursor = item[1]
+        if public[0] < 512 or not 2 <= public[1] <= 64:
+            return None
+        secret_mpi_count = 4
+    elif algorithm == 17:  # DSA
+        public = []
+        for _ in range(4):
+            item = read_openpgp_mpi(data, cursor, end)
+            if item is None:
+                return None
+            public.append(item[0])
+            cursor = item[1]
+        if public[0] < 512 or public[1] < 160:
+            return None
+        secret_mpi_count = 1
+    elif algorithm == 16:  # ElGamal
+        for _ in range(3):
+            item = read_openpgp_mpi(data, cursor, end)
+            if item is None or item[0] < 512:
+                return None
+            cursor = item[1]
+        secret_mpi_count = 1
+    elif algorithm in {18, 19, 22}:  # ECDH/ECDSA/legacy EdDSA
+        if cursor >= end or not 5 <= data[cursor] <= 32:
+            return None
+        oid_length = data[cursor]
+        if cursor + 1 + oid_length > end:
+            return None
+        cursor += 1 + oid_length
+        point = read_openpgp_mpi(data, cursor, end)
+        if point is None or point[0] < 200:
+            return None
+        cursor = point[1]
+        if algorithm == 18:
+            if cursor >= end or not 3 <= data[cursor] <= 16:
+                return None
+            kdf_length = data[cursor]
+            if cursor + 1 + kdf_length > end:
+                return None
+            cursor += 1 + kdf_length
+        secret_mpi_count = 1
+    else:
+        return None
+    return cursor, secret_mpi_count
+
+
+def is_openpgp_secret_body(data) -> bool:
+    layout = openpgp_public_layout(data)
+    if layout is None:
+        return False
+    cursor, secret_mpi_count = layout
+    end = len(data)
+
+    if cursor >= end:
+        return False
+    protection = data[cursor]
+    cursor += 1
+    if protection == 0:
+        for _ in range(secret_mpi_count):
+            item = read_openpgp_mpi(data, cursor, end)
+            if item is None:
+                return False
+            cursor = item[1]
+        if cursor + 2 != end:
+            return False
+    elif protection in {254, 255}:
+        if end - cursor < 16:
+            return False
+    elif not 1 <= protection <= 13 or end - cursor < 16:
+        return False
+    return True
+
+
+def openpgp_secret_packet_end(data, offset: int):
+    packet = openpgp_packet_body(data, offset)
+    if packet is None:
+        return None
+    tag, body, packet_end, malformed = packet
+    if tag not in {5, 7}:
+        return None
+    if malformed:
+        # Random packet-tag bytes are common in binaries. A malformed bounded
+        # chain is private-key-like only after its public key section parses.
+        if openpgp_public_layout(body) is not None:
+            fail()
+        return None
+    if is_openpgp_secret_body(body):
+        return packet_end
+    return None
+
+
+def contains_private_binary(data) -> bool:
+    return (
+        is_der_private_key(data, 0, require_end=True)
+        or is_openssh_private_key(data)
+        or openpgp_secret_packet_end(data, 0) is not None
+    )
+
+
+def private_binary_prefix(compact: str, altchars) -> bool:
+    prefix_text = compact.rstrip('=')[:32]
+    prefix_text += '=' * (-len(prefix_text) % 4)
+    try:
+        prefix = base64.b64decode(
+            prefix_text.encode('ascii'), altchars=altchars, validate=True
+        )
+    except (UnicodeError, binascii.Error, ValueError):
+        return False
+    return bool(
+        prefix
+        and (
+            prefix[0] == 0x30
+            or prefix.startswith(OPENSSH_MAGIC)
+            or prefix[0] in OPENPGP_SECRET_HEADERS
+        )
+    )
+
+
+def decode_base64_candidate(
+    candidate: str, budget: WorkBudget, semantic_prefix_only: bool = False
+):
+    compact = ''.join(character for character in candidate if not character.isspace())
+    if not 16 <= len(compact) <= MAX_BASE64_CHARACTERS or len(compact) % 4 == 1:
+        return []
+    decoded_values = []
+    for altchars in (None, b'-_'):
+        if altchars is None and any(character in compact for character in '-_'):
+            continue
+        if semantic_prefix_only and not private_binary_prefix(compact, altchars):
+            continue
+        padded = compact.rstrip('=') + '=' * (-len(compact.rstrip('=')) % 4)
+        try:
+            decoded = base64.b64decode(
+                padded.encode('ascii'), altchars=altchars, validate=True
+            )
+        except (UnicodeError, binascii.Error, ValueError):
+            continue
+        if decoded not in decoded_values:
+            budget.base64(len(decoded))
+            decoded_values.append(decoded)
+    return decoded_values
+
+
+def plausible_private_body(decoded: bytes) -> bool:
+    if len(decoded) < 48 or len(set(decoded)) < 16:
+        return False
+    printable = sum(32 <= value < 127 for value in decoded)
+    return printable * 4 < len(decoded) * 3
+
+
+def private_label(label: str) -> bool:
+    compact = ''.join(character for character in label.casefold() if character.isalnum())
+    return compact in PRIVATE_LABELS or 'privatekey' in compact
+
+
+def armor_candidates(label: str, body: str, budget: WorkBudget):
+    compact_label = ''.join(character for character in label.casefold() if character.isalnum())
+    lines = body.splitlines()
+    if compact_label == 'pgpprivatekeyblock':
+        while lines and (not lines[0].strip() or ':' in lines[0]):
+            lines.pop(0)
+        lines = [line for line in lines if not line.strip().startswith('=')]
+    compact = ''.join(character for character in ''.join(lines) if not character.isspace())
+    values = decode_base64_candidate(compact, budget)
+    if values:
+        return values
+    values = []
+    for match in re.finditer(r'[A-Za-z0-9+/_=-]{32,}', body):
+        values.extend(decode_base64_candidate(match.group(0), budget))
+    return values
+
+
+def inspect_armor(label: str, body: str, paired: bool, budget: WorkBudget) -> None:
+    compact_label = ''.join(character for character in label.casefold() if character.isalnum())
+    decoded_values = armor_candidates(label, body, budget)
+    for decoded in decoded_values:
+        if contains_private_binary(decoded):
+            fail()
+        if compact_label == 'encryptedprivatekey' and is_encrypted_private_key_info(decoded):
+            fail()
+        if plausible_private_body(decoded):
+            fail()
+    if paired and compact_label == 'opensshprivatekey':
+        # A paired OpenSSH label with no decodable body is malformed, not a key.
+        return
+
+
+class ArmorDetector:
+    def __init__(self, budget: WorkBudget):
+        self.budget = budget
+        self.buffer = ''
+        self.active = None
+
+    def append_body(self, text: str) -> None:
+        if self.active is None:
+            return
+        if '\x00' in text:
+            prefix = text.split('\x00', 1)[0]
+            self.active['body'] += prefix
+            inspect_armor(self.active['label'], self.active['body'], False, self.budget)
+            self.active = None
+            return
+        self.active['body'] += text
+        if len(self.active['body']) > MAX_ARMOR_CHARACTERS:
+            inspect_armor(self.active['label'], self.active['body'], False, self.budget)
+            self.active = None
+
+    def handle_marker(self, kind: str, label: str) -> None:
+        compact_kind = ''.join(character for character in kind.casefold() if character.isalpha())
+        if compact_kind == 'begin' and private_label(label):
+            if self.active is not None:
+                inspect_armor(self.active['label'], self.active['body'], False, self.budget)
+            self.active = {'label': label, 'body': ''}
+        elif compact_kind == 'end' and self.active is not None:
+            paired = private_label(label)
+            inspect_armor(self.active['label'], self.active['body'], paired, self.budget)
+            self.active = None
+
+    def feed(self, text: str) -> None:
+        self.buffer += text
+        while True:
+            match = ARMOR_MARKER.search(self.buffer)
+            if match is None:
+                break
+            self.append_body(self.buffer[:match.start()])
+            self.handle_marker(match.group(1), match.group(2))
+            self.buffer = self.buffer[match.end():]
+        if len(self.buffer) > 512:
+            self.append_body(self.buffer[:-512])
+            self.buffer = self.buffer[-512:]
+
+    def finish(self) -> None:
+        self.append_body(self.buffer)
+        if self.active is not None:
+            inspect_armor(self.active['label'], self.active['body'], False, self.budget)
+
+
+class Base64Detector:
+    def __init__(self, budget: WorkBudget):
+        self.budget = budget
+        self.candidate = []
+        self.oversized = False
+
+    def evaluate(self) -> None:
+        if not self.oversized and len(self.candidate) >= 32:
+            for decoded in decode_base64_candidate(
+                ''.join(self.candidate), self.budget, semantic_prefix_only=True
+            ):
+                if contains_private_binary(decoded):
+                    fail()
+        self.candidate = []
+        self.oversized = False
+
+    def feed(self, text: str) -> None:
+        for match in re.finditer(r'[A-Za-z0-9+/=_-]+|[^\sA-Za-z0-9+/=_-]+', text):
+            token = match.group(0)
+            if token[0] in BASE64_CHARACTERS:
+                if self.oversized:
+                    continue
+                self.candidate.extend(token)
+                if len(self.candidate) > MAX_BASE64_CHARACTERS:
+                    self.candidate = []
+                    self.oversized = True
+            else:
+                self.evaluate()
+
+    def finish(self) -> None:
+        self.evaluate()
+
+
+PLACEHOLDER_LITERALS = {
+    'change_me', 'changeme', 'dummy', 'example', 'example_encryption_key',
+    'fake', 'masked', 'mock', 'nil', 'none', 'not_set', 'not-set', 'null',
+    'placeholder', 'redacted', 'replace_me', 'sample', 'test', 'todo',
+    'undefined', 'your_api_key',
+}
+
+
+def is_placeholder(value: object) -> bool:
+    if value is None or isinstance(value, bool):
+        return True
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    if not text:
+        return True
+    if text.casefold() in PLACEHOLDER_LITERALS:
+        return True
+    if re.fullmatch(
+        r'\$\{[A-Z_][A-Z0-9_]*\}|\$[A-Z_][A-Z0-9_]*|%[A-Z_][A-Z0-9_]*%',
+        text,
+    ):
+        return True
+    return bool(re.fullmatch(r'\{\{\s*[A-Z_][A-Z0-9_]*\s*\}\}', text))
+
+
+def strip_assignment_comment(value: str) -> str:
+    quote = None
+    escaped = False
+    for index, character in enumerate(value):
+        if escaped:
+            escaped = False
+        elif character == '\\' and quote:
+            escaped = True
+        elif quote:
+            if character == quote:
+                quote = None
+        elif character in {'"', "'"}:
+            quote = character
+        elif character == '#' and (index == 0 or value[index - 1].isspace()):
+            return value[:index].rstrip()
+    return value.strip()
+
+
+def assignment_value(text: str) -> str:
+    value = strip_assignment_comment(text.strip())
+    if not value:
+        return ''
+    if value[0] in {'"', "'"}:
+        quote = value[0]
+        escaped = False
+        for index in range(1, len(value)):
+            if escaped:
+                escaped = False
+            elif value[index] == '\\':
+                escaped = True
+            elif value[index] == quote:
+                if index == len(value) - 1:
+                    return value[1:index]
+                return value
+    return value
+
+
+class AssignmentDetector:
+    def __init__(self):
+        self.buffer = ''
+        self.logical_line = ''
+
+    def inspect_line(self, line: str) -> None:
+        for match in NAMED_ASSIGNMENT.finditer(line):
+            if not is_placeholder(assignment_value(line[match.end():])):
+                fail()
+
+    def feed(self, text: str) -> None:
+        self.buffer += text
+        while '\n' in self.buffer:
+            line, self.buffer = self.buffer.split('\n', 1)
+            if len(line) + len(self.logical_line) > MAX_ASSIGNMENT_LINE:
+                if NAMED_ASSIGNMENT.search(self.logical_line + line):
+                    fail()
+                line = line[-1024:]
+                self.logical_line = ''
+            stripped = line.rstrip()
+            if stripped.endswith('\\'):
+                self.logical_line += stripped[:-1] + ' '
+            else:
+                self.inspect_line(self.logical_line + line)
+                self.logical_line = ''
+        if len(self.buffer) + len(self.logical_line) > MAX_ASSIGNMENT_LINE:
+            if NAMED_ASSIGNMENT.search(self.logical_line + self.buffer):
+                fail()
+            self.buffer = self.buffer[-1024:]
+            self.logical_line = ''
+
+    def finish(self) -> None:
+        self.inspect_line(self.logical_line + self.buffer)
+
+
+class SecurityTextDetector:
+    def __init__(self, budget: WorkBudget):
+        self.armor = ArmorDetector(budget)
+        self.base64 = Base64Detector(budget)
+        self.assignments = AssignmentDetector()
+
+    def feed(self, text: str) -> None:
+        normalized = []
+        for source_character in text:
+            for character in unicodedata.normalize('NFKC', source_character):
+                category = unicodedata.category(character)
+                if character in {'\r', '\n'}:
+                    character = '\n'
+                elif category.startswith('C'):
+                    character = '\x00'
+                elif character.isspace():
+                    character = ' '
+                elif category == 'Pd':
+                    character = '-'
+                normalized.append(character)
+        normalized_text = ''.join(normalized)
+        self.base64.feed(normalized_text)
+        self.armor.feed(normalized_text)
+        self.assignments.feed(normalized_text)
+
+    def finish(self) -> None:
+        self.armor.finish()
+        self.base64.finish()
+        self.assignments.finish()
+
+
+def scan_raw_private_formats(data, budget: WorkBudget) -> None:
+    # Supported private DER structures all begin with a canonical version 0/1
+    # INTEGER, so locate those bounded semantic offsets without walking every
+    # generic ASN.1 SEQUENCE byte in large native libraries.
+    for match in DER_PRIVATE_CANDIDATE.finditer(data):
+        offset = match.start()
+        item = read_der_tlv(data, offset, len(data))
+        if item is not None and item[0] == 0x30 and item[2] - offset >= 13:
+            version_item = read_der_tlv(data, item[1], item[2])
+            version = der_integer(data, version_item) if version_item is not None else None
+            if version is not None and len(version) == 1 and version[0] in {0, 1}:
+                budget.der()
+                if is_der_private_key(data, offset):
+                    fail()
+
+    offset = data.find(OPENSSH_MAGIC)
+    while offset >= 0:
+        candidate = bytes(data[offset:min(len(data), offset + MAX_DER_BYTES)])
+        if is_openssh_private_key(candidate):
+            fail()
+        offset = data.find(OPENSSH_MAGIC, offset + 1)
+
+    for header in OPENPGP_SECRET_HEADERS:
+        needle = bytes([header])
+        offset = data.find(needle)
+        while offset >= 0:
+            if openpgp_secret_packet_end(data, offset) is not None:
+                fail()
+            offset = data.find(needle, offset + 1)
+
+
+def utf8_whitespace_width(data, offset: int) -> int:
+    for encoded in UTF8_WHITESPACE_BYTES:
+        if bytes(data[offset:offset + len(encoded)]) == encoded:
+            return len(encoded)
+    return 0
+
+
+def utf8_base64_candidate(data, offset: int):
+    characters = []
+    cursor = offset
+    scan_limit = min(len(data), offset + MAX_BASE64_CHARACTERS * 8)
+    while cursor < scan_limit:
+        value = data[cursor]
+        if value in BASE64_BYTES:
+            characters.append(chr(value))
+            if len(characters) > MAX_BASE64_CHARACTERS:
+                return None
+            cursor += 1
+            continue
+        width = utf8_whitespace_width(data, cursor)
+        if not width:
+            break
+        cursor += width
+    return ''.join(characters)
+
+
+def utf16_base64_candidate(data, offset: int, encoding: str):
+    characters = []
+    cursor = offset
+    scan_limit = min(len(data), offset + MAX_BASE64_CHARACTERS * 16)
+    byteorder = 'little' if encoding == 'utf-16le' else 'big'
+    while cursor + 2 <= scan_limit:
+        value = int.from_bytes(data[cursor:cursor + 2], byteorder)
+        if value < 128 and value in BASE64_BYTES:
+            characters.append(chr(value))
+            if len(characters) > MAX_BASE64_CHARACTERS:
+                return None
+        elif value not in UNICODE_WHITESPACE_CODEPOINTS:
+            break
+        cursor += 2
+    return ''.join(characters)
+
+
+def scan_encoded_base64_formats(data, excluded_span, budget: WorkBudget) -> None:
+    for match in UTF8_BASE64_START.finditer(data):
+        if excluded_span is not None and excluded_span[0] <= match.start() < excluded_span[1]:
+            continue
+        candidate = utf8_base64_candidate(data, match.start())
+        if candidate is None:
+            continue
+        for decoded in decode_base64_candidate(
+            candidate, budget, semantic_prefix_only=True
+        ):
+            if contains_private_binary(decoded):
+                fail()
+
+    for encoding, pattern in UTF16_BASE64_STARTS.items():
+        for match in pattern.finditer(data):
+            candidate = utf16_base64_candidate(data, match.start(), encoding)
+            if candidate is None:
+                continue
+            for decoded in decode_base64_candidate(
+                candidate, budget, semantic_prefix_only=True
+            ):
+                if contains_private_binary(decoded):
+                    fail()
+
+
+def unique_json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError('duplicate JSON key')
+        result[key] = value
+    return result
+
+
+def inspect_jwk(node) -> None:
+    if isinstance(node, dict):
+        kty = node.get('kty')
+        if isinstance(kty, str):
+            private_names = set()
+            normalized_kty = kty.upper()
+            if normalized_kty == 'RSA':
+                private_names = {'d', 'p', 'q', 'dp', 'dq', 'qi', 'oth'}
+            elif normalized_kty in {'EC', 'OKP'}:
+                private_names = {'d'}
+            for name in private_names:
+                # A private JWK member is key syntax, not a config placeholder.
+                if name in node:
+                    fail()
+            if normalized_kty == 'OCT' and 'k' in node:
+                key = node['k']
+                if not isinstance(key, str) or key:
+                    fail()
+        for value in node.values():
+            inspect_jwk(value)
+    elif isinstance(node, list):
+        for value in node:
+            inspect_jwk(value)
+
+
+def scan_json_jwk(record, data) -> None:
+    path = record[0]
+    if len(data) > MAX_JSON_BYTES:
+        if path.suffix.lower() in {'.json', '.jwk'}:
+            fail()
+        return
+    raw = bytes(data)
+    views = []
+    for encoding in ('utf-8-sig', 'utf-16le', 'utf-16be'):
+        try:
+            text = raw.decode(encoding)
+        except UnicodeError:
+            continue
+        stripped = text.lstrip('\ufeff \t\r\n')
+        if stripped.startswith(('{', '[')) and stripped.rstrip().endswith(('}', ']')):
+            views.append(stripped)
+    for text in dict.fromkeys(views):
+        try:
+            document = json.loads(text, object_pairs_hook=unique_json_object)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            if path.suffix.lower() in {'.json', '.jwk'}:
+                fail()
+            continue
+        inspect_jwk(document)
+
+
+def scan_segment(data, start: int, end: int, encoding: str, budget: WorkBudget) -> None:
+    budget.text(end - start)
+    decoder = codecs.getincrementaldecoder(encoding)(errors='ignore')
+    detector = SecurityTextDetector(budget)
+    offset = start
+    while offset < end:
+        limit = min(offset + CHUNK_BYTES, end)
+        detector.feed(decoder.decode(data[offset:limit], final=False))
+        offset = limit
+    detector.feed(decoder.decode(b'', final=True))
+    detector.finish()
+
+
+def byte_alternation(values) -> bytes:
+    return b'(?:' + b'|'.join(re.escape(value) for value in values) + b')'
+
+
+UTF8_WHITESPACE_PATTERN = byte_alternation(UTF8_WHITESPACE_BYTES)
+UTF8_SEPARATOR_PATTERN = (
+    b'(?:[\x00-\x20]|'
+    + b'|'.join(
+        re.escape(value) for value in UTF8_WHITESPACE_BYTES if len(value) > 1
+    )
+    + b'){0,4}'
+)
+
+
+def utf16_whitespace_pattern(encoding: str) -> bytes:
+    values = [chr(value).encode(encoding) for value in UNICODE_WHITESPACE_CODEPOINTS]
+    return byte_alternation(values)
+
+
+def utf16_word_pattern(word: str, encoding: str):
+    pieces = []
+    whitespace = utf16_whitespace_pattern(encoding)
+    if encoding == 'utf-16le':
+        separator = rb'(?:(?:[\x00-\x1f]\x00)|' + whitespace + rb'){0,4}'
+        for character in word:
+            letters = bytes(sorted({ord(character.lower()), ord(character.upper())}))
+            pieces.append(b'[' + letters + b']\x00')
+            pieces.append(separator)
+    else:
+        separator = rb'(?:(?:\x00[\x00-\x1f])|' + whitespace + rb'){0,4}'
+        for character in word:
+            letters = bytes(sorted({ord(character.lower()), ord(character.upper())}))
+            pieces.append(b'\x00[' + letters + b']')
+            pieces.append(separator)
+    return re.compile(b''.join(pieces))
+
+
+def byte_word_pattern(word: str):
+    pieces = []
+    for character in word:
+        letters = bytes(sorted({ord(character.lower()), ord(character.upper())}))
+        pieces.append(b'[' + letters + b']')
+        pieces.append(UTF8_SEPARATOR_PATTERN)
+    return re.compile(b''.join(pieces))
+
+
+NAMED_SECRET_NAMES = (
+    'FLY_API_TOKEN', 'JUMPGATE_ENCRYPTION_KEY',
+    'KODI_ANDROID_STORE_PASSWORD', 'KODI_ANDROID_KEY_PASSWORD',
+)
+UTF8_TEXT_HINTS = [
+    (byte_word_pattern('BEGIN'), 512, MAX_ARMOR_CHARACTERS * 4),
+] + [
+    (byte_word_pattern(name), 1024, MAX_ASSIGNMENT_LINE * 4)
+    for name in NAMED_SECRET_NAMES
+]
+UTF16_TEXT_HINTS = {
+    encoding: [
+        (utf16_word_pattern('BEGIN', encoding), 1024, MAX_ARMOR_CHARACTERS * 2),
+    ] + [
+        (utf16_word_pattern(name, encoding), 2048, MAX_ASSIGNMENT_LINE * 2)
+        for name in NAMED_SECRET_NAMES
+    ]
+    for encoding in ('utf-16le', 'utf-16be')
+}
+
+
+def utf16_ascii_unit(character: str, encoding: str) -> bytes:
+    return character.encode(encoding)
+
+
+def utf16_ascii_class(byte_class: bytes, encoding: str) -> bytes:
+    if encoding == 'utf-16le':
+        return byte_class + b'\x00'
+    return b'\x00' + byte_class
+
+
+UTF8_BASE64_UNIT = rb'[A-Za-z0-9+/=_-]'
+UTF8_BASE64_SPACE = rb'(?:' + UTF8_WHITESPACE_PATTERN + rb'){0,16}'
+UTF8_BASE64_START = re.compile(
+    rb'(?<![A-Za-z0-9+/=_-])(?:'
+    rb'M' + UTF8_BASE64_SPACE + rb'[A-I]|'
+    rb'b' + UTF8_BASE64_SPACE + rb'3' + UTF8_BASE64_SPACE + rb'B'
+    + UTF8_BASE64_SPACE + rb'l|'
+    rb'[xln]' + UTF8_BASE64_SPACE + UTF8_BASE64_UNIT
+    + rb')'
+)
+
+
+def utf16_base64_start_pattern(encoding: str):
+    unit = utf16_ascii_class(rb'[A-Za-z0-9+/=_-]', encoding)
+    der_length = utf16_ascii_class(rb'[A-I]', encoding)
+    pgp_start = utf16_ascii_class(rb'[xln]', encoding)
+    whitespace = rb'(?:' + utf16_whitespace_pattern(encoding) + rb'){0,16}'
+    encoded = lambda character: re.escape(utf16_ascii_unit(character, encoding))
+    previous = (
+        rb'(?<![A-Za-z0-9+/=_-]\x00)'
+        if encoding == 'utf-16le'
+        else rb'(?<!\x00[A-Za-z0-9+/=_-])'
+    )
+    return re.compile(
+        previous + rb'(?:'
+        + encoded('M') + whitespace + der_length + rb'|'
+        + encoded('b') + whitespace + encoded('3') + whitespace
+        + encoded('B') + whitespace + encoded('l') + rb'|'
+        + pgp_start + whitespace + unit + rb')'
+    )
+
+
+UTF16_BASE64_STARTS = {
+    encoding: utf16_base64_start_pattern(encoding)
+    for encoding in ('utf-16le', 'utf-16be')
+}
+
+
+def hint_windows(data, hints, encoded_scale: int = 1):
+    windows = []
+    for pattern, before, after in hints:
+        for match in pattern.finditer(data):
+            if len(windows) >= MAX_HINT_WINDOWS:
+                fail()
+            phase = match.start() % encoded_scale
+            start = max(0, match.start() - before)
+            start += (phase - start) % encoded_scale
+            end = min(len(data), match.end() + after)
+            windows.append((start, end))
+    windows.sort()
+    merged = []
+    for start, end in windows:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def exclude_window_span(windows, excluded_span):
+    if excluded_span is None:
+        return windows
+    result = []
+    for start, end in windows:
+        if start < excluded_span[0]:
+            result.append((start, min(end, excluded_span[0])))
+        if end > excluded_span[1]:
+            result.append((max(start, excluded_span[1]), end))
+    return [(start, end) for start, end in result if start < end]
+
+
+def scan_known_encodings(record, data, accepted_span, budget: WorkBudget) -> None:
+    utf8_windows = hint_windows(data, UTF8_TEXT_HINTS)
+    for start, end in exclude_window_span(utf8_windows, accepted_span):
+        scan_segment(data, start, end, 'utf-8', budget)
+    for encoding in ('utf-16le', 'utf-16be'):
+        for start, end in hint_windows(data, UTF16_TEXT_HINTS[encoding], encoded_scale=2):
+            scan_segment(data, start, end, encoding, budget)
+
+
+def main() -> None:
+    if os.environ.get('JUMPGATE_TEST_FORCE_SECRET_SCANNER_ERROR') == '1':
+        raise RuntimeError('forced scanner error')
+    files = collect_regular_files()
+    budget = WorkBudget()
+    expected_record = next((record for record in files if record[1] == allowed_path), None)
+    if expected_record is None:
+        fail()
+
+    with mapped_file(expected_record) as data:
+        if data is None:
+            fail()
+        candidates = list(CANONICAL_BLOCK.finditer(data))
+        if len(candidates) != 1:
+            fail()
+        accepted = candidates[0]
+        allowed_body = accepted.group('body')
+        try:
+            allowed_der = base64.b64decode(allowed_body, validate=True)
+        except (binascii.Error, ValueError):
+            fail()
+        if (
+            base64.b64encode(allowed_der) != allowed_body
+            or hashlib.sha256(allowed_der).hexdigest() != allowed_der_sha256
+        ):
+            fail()
+        accepted_span = accepted.span()
+
+    # Known plaintext encodings and normalizations are covered. Compression,
+    # encryption, and arbitrary cryptographic obfuscation are intentionally out of scope.
+    for record in files:
+        with mapped_file(record) as data:
+            if data is None:
+                continue
+            scan_raw_private_formats(data, budget)
+            scan_json_jwk(record, data)
+            record_span = accepted_span if record[1] == allowed_path else None
+            scan_encoded_base64_formats(data, record_span, budget)
+            scan_known_encodings(record, data, record_span, budget)
+
+
+try:
+    main()
+except BaseException:
+    raise SystemExit(1)
+PY
+then
   fail 'APK contains apparent private signing, deployment, or runtime secret material'
 fi
+
 if ! python3 - "$extract_dir" <<'PY'
 import json
 import pathlib
@@ -425,6 +1674,14 @@ def is_high_risk_key(key: object) -> bool:
     )
 
 
+PLACEHOLDER_LITERALS = {
+    'change_me', 'changeme', 'dummy', 'example', 'example_encryption_key',
+    'fake', 'masked', 'mock', 'nil', 'none', 'not_set', 'not-set', 'null',
+    'placeholder', 'redacted', 'replace_me', 'sample', 'test', 'todo',
+    'undefined', 'your_api_key',
+}
+
+
 def is_placeholder(value: object, seen: set[int] | None = None) -> bool:
     if seen is None:
         seen = set()
@@ -446,29 +1703,14 @@ def is_placeholder(value: object, seen: set[int] | None = None) -> bool:
     text = value.strip()
     if not text:
         return True
-    lowered = text.lower()
-    if lowered in {
-        'change_me', 'changeme', 'dummy', 'example', 'fake', 'masked', 'mock',
-        'nil', 'none', 'not_set', 'not-set', 'null', 'placeholder', 'redacted',
-        'replace_me', 'sample', 'test', 'todo', 'undefined',
-    }:
-        return True
-    if len(set(text)) == 1 and text[0] in '*#xX0._-':
-        return True
-    if re.fullmatch(r'\$\{[^{}]+\}|\$[A-Z_][A-Z0-9_]*|%[A-Z_][A-Z0-9_]*%', text):
-        return True
-    if re.fullmatch(r'\{\{.+\}\}|<[^<>]+>', text):
+    if text.casefold() in PLACEHOLDER_LITERALS:
         return True
     if re.fullmatch(
-        r'(?i)(?:your|example|dummy|sample|fake|mock|redacted|masked|placeholder|'
-        r'replace(?:_me)?|change(?:_me)?|changeme|not[-_ ]?a[-_ ]?real|test)'
-        r'(?:[-_ ].*)?',
+        r'\$\{[A-Z_][A-Z0-9_]*\}|\$[A-Z_][A-Z0-9_]*|%[A-Z_][A-Z0-9_]*%',
         text,
     ):
         return True
-    if 'example.com' in lowered or 'example.org' in lowered or 'example.net' in lowered:
-        return True
-    return lowered in {'localhost', '127.0.0.1', '::1'}
+    return bool(re.fullmatch(r'\{\{\s*[A-Z_][A-Z0-9_]*\s*\}\}', text))
 
 
 def inspect_structure(node: object, seen: set[int] | None = None) -> None:

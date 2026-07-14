@@ -13,6 +13,7 @@ expected_target_sdk='36'
 expected_version_name='22.0-ALPHA2'
 expected_version_code='2190702'
 mock_signer_sha256='abababababababababababababababababababababababababababababababab'
+allowed_rsa_der_sha256='8959c62b4351cbaa702942f4572d37335a7a3dfdcc6f0d2763a2afb486e3ac8f'
 
 command -v python3 >/dev/null
 command -v sha256sum >/dev/null
@@ -284,6 +285,145 @@ copy_fixture() {
   cp -R "$source"/. "$destination"/
 }
 
+append_allowed_rsa_key() {
+  printf '\0' >> "$1"
+  cat "$allowed_rsa_pem" >> "$1"
+  printf '\0' >> "$1"
+}
+
+remove_allowed_rsa_key() {
+  python3 - "$1" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+data = path.read_bytes()
+begin = b'-----BEGIN RSA PRIVATE KEY-----'
+end = b'-----END RSA PRIVATE KEY-----'
+start = data.find(begin)
+finish = data.find(end, start) + len(end)
+if start < 0 or finish < len(end) or data.find(begin, finish) >= 0:
+    raise SystemExit(1)
+path.write_bytes(data[:start] + data[finish:])
+PY
+}
+
+mutate_allowed_rsa_key() {
+  local path="$1"
+  local replacement="$2"
+  python3 - "$path" "$replacement" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+replacement = sys.argv[2].encode('ascii')
+data = bytearray(path.read_bytes())
+begin = b'-----BEGIN RSA PRIVATE KEY-----'
+end = b'-----END RSA PRIVATE KEY-----'
+body_start = data.find(begin) + len(begin)
+body_end = data.find(end, body_start)
+if body_start < len(begin) or body_end < 0 or len(replacement) != 1:
+    raise SystemExit(1)
+for index in range(body_start, body_end):
+    if data[index] in b'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/':
+        if data[index] == replacement[0]:
+            continue
+        data[index] = replacement[0]
+        path.write_bytes(data)
+        break
+else:
+    raise SystemExit(1)
+PY
+}
+
+write_marker_variant() {
+  local output="$1"
+  local variant="$2"
+  python3 - "$output" "$variant" "$allowed_rsa_body" <<'PY'
+import pathlib
+import sys
+
+output = pathlib.Path(sys.argv[1])
+variant = sys.argv[2]
+body = pathlib.Path(sys.argv[3]).read_text(encoding='ascii')
+variants = {
+    'ascii': f'-----BEGIN PRIVATE KEY-----\n{body}\n-----END PRIVATE KEY-----'.encode(),
+    'missing-space': f'-----BEGINRSAPRIVATEKEY-----\n{body}\n-----ENDRSAPRIVATEKEY-----'.encode(),
+    'mixed-case': f'-----bEgIn RsA pRiVaTe KeY-----\n{body}\n-----eNd RsA pRiVaTe KeY-----'.encode(),
+    'single-hyphen': f'-BEGIN RSA PRIVATE KEY-\n{body}\n-END RSA PRIVATE KEY-'.encode(),
+    'nul-control': (
+        b'-----B\0E\x01GIN R\0SA PRI\x02VATE K\0EY-----\nMAA=\n'
+        b'-----E\0ND R\x03SA PRI\0VATE K\x04EY-----'
+    ).replace(b'MAA=', body.encode()),
+    'nbsp-utf8': (
+        f'-----BEGIN\u00a0RSA\u00a0PRIVATE\u00a0KEY-----\n{body}\n'
+        '-----END\u00a0RSA\u00a0PRIVATE\u00a0KEY-----'
+    ).encode('utf-8'),
+    'utf16le': (f'\ufeff-----BEGIN RSA PRIVATE KEY-----\n{body}\n'
+                '-----END RSA PRIVATE KEY-----').encode('utf-16le'),
+    'utf16be': (f'\ufeff-----BEGIN RSA PRIVATE KEY-----\n{body}\n'
+                '-----END RSA PRIVATE KEY-----').encode('utf-16be'),
+}
+try:
+    payload = variants[variant]
+except KeyError:
+    raise SystemExit(1)
+output.write_bytes(b'\0' + payload + b'\0')
+PY
+}
+
+write_private_armor() {
+  local output="$1"
+  local label="$2"
+  local body_file="$3"
+  python3 - "$output" "$label" "$body_file" <<'PY'
+import base64
+import pathlib
+import sys
+
+output = pathlib.Path(sys.argv[1])
+label = sys.argv[2]
+body = pathlib.Path(sys.argv[3]).read_bytes()
+try:
+    body.decode('ascii')
+    encoded = body
+except UnicodeDecodeError:
+    encoded = base64.b64encode(body)
+lines = [encoded[index:index + 64] for index in range(0, len(encoded), 64)]
+output.write_bytes(b'-----BEGIN ' + label.encode() + b'-----\n' +
+                   b'\n'.join(lines) + b'\n-----END ' + label.encode() + b'-----\n')
+PY
+}
+
+write_named_assignment_variant() {
+  local output="$1"
+  local variant="$2"
+  python3 - "$output" "$variant" <<'PY'
+import pathlib
+import sys
+
+output = pathlib.Path(sys.argv[1])
+variant = sys.argv[2]
+values = {
+    'spaced-quoted': 'KODI_ANDROID_STORE_PASSWORD = "a b c d e f g h"\n'.encode(),
+    'utf16le': ('\ufeffJUMPGATE_ENCRYPTION_KEY : "little endian secret value"\n'
+                ).encode('utf-16le'),
+    'utf16be': ('\ufeffKODI_ANDROID_KEY_PASSWORD = \'big endian secret value\'\n'
+                ).encode('utf-16be'),
+    'quoted-key': '"FLY_API_TOKEN" = "quoted key secret value"\n'.encode(),
+    'append': 'FLY_API_TOKEN += "appended live secret value"\n'.encode(),
+    'quoted-suffix': 'FLY_API_TOKEN="REDACTED" trailing-live-secret\n'.encode(),
+    'sentinel-prefix': 'JUMPGATE_ENCRYPTION_KEY=EXAMPLE_live_secret\n'.encode(),
+    'continuation': ('JUMPGATE_ENCRYPTION_KEY="continued shell \\\n+secret value"\n').encode(),
+}
+try:
+    payload = values[variant]
+except KeyError:
+    raise SystemExit(1)
+output.write_bytes(payload)
+PY
+}
+
 verify_apk() {
   local apk="$1"
   local abi="$2"
@@ -375,10 +515,123 @@ expect_failure_without_value() {
 
 base_arm64="$work_dir/base-arm64"
 base_armv7="$work_dir/base-armv7"
+allowed_rsa_pem="$work_dir/allowed-rsa-key.pem"
+allowed_rsa_der="$work_dir/allowed-rsa-key.der"
+allowed_rsa_body="$work_dir/allowed-rsa-key.b64"
+airtunes_source="$script_dir/../../../xbmc/network/AirTunesServer.cpp"
+python3 - \
+  "$airtunes_source" \
+  "$allowed_rsa_pem" \
+  "$allowed_rsa_der" \
+  "$allowed_rsa_body" \
+  "$allowed_rsa_der_sha256" <<'PY'
+import base64
+import hashlib
+import pathlib
+import re
+import sys
+
+source = pathlib.Path(sys.argv[1]).read_bytes()
+pem_output = pathlib.Path(sys.argv[2])
+der_output = pathlib.Path(sys.argv[3])
+body_output = pathlib.Path(sys.argv[4])
+expected_digest = sys.argv[5]
+begin = b'-----BEGIN RSA PRIVATE KEY-----'
+end = b'-----END RSA PRIVATE KEY-----'
+start = source.find(begin)
+finish = source.find(end, start) + len(end)
+if start < 0 or finish < len(end) or source.find(begin, finish) >= 0:
+    raise SystemExit(1)
+pem = source[start:finish].replace(b'\\\r\n', b'').replace(b'\\\n', b'')
+match = re.fullmatch(
+    rb'-----BEGIN RSA PRIVATE KEY-----(?P<body>[A-Za-z0-9+/=]+)'
+    rb'-----END RSA PRIVATE KEY-----',
+    pem,
+)
+if not match:
+    raise SystemExit(1)
+der = base64.b64decode(match.group('body'), validate=True)
+if hashlib.sha256(der).hexdigest() != expected_digest:
+    raise SystemExit(1)
+pem_output.write_bytes(pem)
+der_output.write_bytes(der)
+body_output.write_bytes(match.group('body'))
+PY
+private_format_dir="$work_dir/private-formats"
+mkdir -p "$private_format_dir"
+python3 - "$allowed_rsa_der" "$private_format_dir" <<'PY'
+import pathlib
+import sys
+
+allowed_rsa = pathlib.Path(sys.argv[1]).read_bytes()
+root = pathlib.Path(sys.argv[2])
+
+
+def length(value: int) -> bytes:
+    if value < 0x80:
+        return bytes([value])
+    encoded = value.to_bytes((value.bit_length() + 7) // 8, 'big')
+    return bytes([0x80 | len(encoded)]) + encoded
+
+
+def tlv(tag: int, value: bytes) -> bytes:
+    return bytes([tag]) + length(len(value)) + value
+
+
+def ssh_string(value: bytes) -> bytes:
+    return len(value).to_bytes(4, 'big') + value
+
+
+rsa_algorithm = tlv(0x30, tlv(0x06, bytes.fromhex('2a864886f70d010101')) + b'\x05\x00')
+pkcs8 = tlv(0x30, b'\x02\x01\x00' + rsa_algorithm + tlv(0x04, allowed_rsa))
+dh_parameters = tlv(0x30, tlv(0x02, b'\x01' * 64) + tlv(0x02, b'\x02'))
+dh_algorithm = tlv(
+    0x30,
+    tlv(0x06, bytes.fromhex('2a864886f70d010301')) + dh_parameters,
+)
+dh_pkcs8 = tlv(
+    0x30,
+    b'\x02\x01\x00' + dh_algorithm + tlv(0x04, tlv(0x02, b'\x07')),
+)
+compact_pkcs8 = tlv(
+    0x30,
+    b'\x02\x01\x00' + tlv(0x30, tlv(0x06, b'\x2a')) + tlv(0x04, b'\x01'),
+)
+pkcs8_public_control = tlv(
+    0x30,
+    b'\x02\x01\x00' + dh_algorithm + tlv(0x03, b'\x00public-key-bits'),
+)
+sec1 = tlv(0x30, b'\x02\x01\x01' + tlv(0x04, bytes(range(1, 33))))
+dsa_values = [b'\x00', b'\x01' * 64, b'\x02' * 20, b'\x03' * 64,
+              b'\x04' * 64, b'\x05' * 20]
+dsa = tlv(0x30, b''.join(tlv(0x02, value) for value in dsa_values))
+openssh = (
+    b'openssh-key-v1\0'
+    + ssh_string(b'none')
+    + ssh_string(b'none')
+    + ssh_string(b'')
+    + (1).to_bytes(4, 'big')
+    + ssh_string(b'public-key-fixture')
+    + ssh_string(b'private-key-fixture-data')
+)
+
+for name, value in {
+    'pkcs8.der': pkcs8,
+    'dh-pkcs8.der': dh_pkcs8,
+    'compact-pkcs8.der': compact_pkcs8,
+    'pkcs8-public-control.der': pkcs8_public_control,
+    'sec1.der': sec1,
+    'dsa.der': dsa,
+    'openssh.bin': openssh,
+}.items():
+    (root / name).write_bytes(value)
+PY
 compile_shared "$base_arm64/lib/arm64-v8a/libkodi.so" arm64-v8a
 compile_shared "$base_arm64/lib/arm64-v8a/libhelper.so" arm64-v8a
 compile_shared "$base_armv7/lib/armeabi-v7a/libkodi.so" armeabi-v7a
 compile_shared "$base_armv7/lib/armeabi-v7a/libhelper.so" armeabi-v7a
+append_allowed_rsa_key "$base_arm64/lib/arm64-v8a/libkodi.so"
+append_allowed_rsa_key "$base_armv7/lib/armeabi-v7a/libkodi.so"
 mkdir -p "$base_arm64/assets" "$base_armv7/assets"
 cat > "$base_arm64/assets/placeholders.json" <<'JSON'
 {"auth":{"accessToken":"${JUMPGATE_ACCESS_TOKEN}"},"api_key":"YOUR_API_KEY","client_secret":"REDACTED","password":"","oauth_metadata":{"token_type":"Bearer","token_endpoint":"https://example.com/oauth/token","token_expiry":3600}}
@@ -394,6 +647,32 @@ PROPERTIES
 cat > "$base_arm64/assets/.env.example" <<'ENV_FILE'
 API_KEY=${JUMPGATE_API_KEY}
 ENV_FILE
+cat > "$base_arm64/assets/secret-scan-controls.dat" <<'CONTROLS'
+KODI_ANDROID_STORE_PASSWORD is injected by CI
+KODI_ANDROID_STORE_PASSWORD_LENGTH=32
+FLY_API_TOKEN is an environment variable name
+"KODI_ANDROID_STORE_PASSWORD" = "${KODI_ANDROID_STORE_PASSWORD}"
+export FLY_API_TOKEN=$FLY_API_TOKEN
+JUMPGATE_ENCRYPTION_KEY += "${JUMPGATE_ENCRYPTION_KEY}" # injected by CI
+CONTROLS
+python3 - "$base_arm64/assets/cryptodome-ecc-parser-constants.bin" <<'PY'
+import pathlib
+import sys
+
+# Representative parser constants contain labels but no plausible key body.
+constants = (
+    b'-----BEGIN PRIVATE KEY-----\0-----END PRIVATE KEY-----\0'
+    b'-----BEGIN EC PRIVATE KEY-----\0-----END EC PRIVATE KEY-----\0'
+    b'-----BEGIN PUBLIC KEY-----\0-----END PUBLIC KEY-----\0'
+)
+pathlib.Path(sys.argv[1]).write_bytes(constants)
+PY
+cat > "$base_arm64/assets/public-jwk-controls.json" <<'JSON'
+{"keys":[{"kty":"RSA","n":"public-modulus","e":"AQAB"},{"kty":"EC","crv":"P-256","x":"public-x","y":"public-y"},{"kty":"OKP","crv":"Ed25519","x":"public-x"}],"unrelated":{"kty":"custom","d":"description"}}
+JSON
+cp "$private_format_dir/pkcs8-public-control.der" \
+  "$base_arm64/assets/pkcs8-public-control.der"
+printf 'safe path component\n' > "$base_arm64/assets/stream_secret.txt"
 cp -R "$base_arm64/assets"/. "$base_armv7/assets"/
 
 arm64_apk="$work_dir/valid-arm64.apk"
@@ -414,6 +693,20 @@ verify_apk "$armv7_apk" armeabi-v7a >/dev/null
 grep -Fxq 'libhelper.so' "$readelf_log"
 grep -Fxq 'libkodi.so' "$readelf_log"
 test -s "$armv7_apk.sha256"
+
+der_noise="$work_dir/der-parser-noise"
+copy_fixture "$base_arm64" "$der_noise"
+python3 - "$der_noise/assets/cryptodome-der-parser-noise.bin" <<'PY'
+import pathlib
+import sys
+
+# ASN.1-heavy parser/runtime binaries may exceed the global semantic-key budget;
+# only DER SEQUENCEs beginning with a private-key version are charged to it.
+pathlib.Path(sys.argv[1]).write_bytes((b'\x30\x18' + b'parser-constant-data-000') * 500_001)
+PY
+der_noise_apk="$work_dir/der-parser-noise.apk"
+make_apk "$der_noise" "$der_noise_apk"
+verify_apk "$der_noise_apk" arm64-v8a >/dev/null
 
 manifest="$work_dir/AndroidManifest.xml"
 cat > "$manifest" <<'MANIFEST'
@@ -620,6 +913,327 @@ missing_core_apk="$work_dir/missing-core.apk"
 make_apk "$missing_core" "$missing_core_apk"
 expect_failure missing-core "$missing_core_apk" arm64-v8a
 
+mutated_rsa_key="$work_dir/mutated-rsa-key"
+copy_fixture "$base_arm64" "$mutated_rsa_key"
+mutate_allowed_rsa_key "$mutated_rsa_key/lib/arm64-v8a/libkodi.so" A
+mutated_rsa_key_apk="$work_dir/mutated-rsa-key.apk"
+make_apk "$mutated_rsa_key" "$mutated_rsa_key_apk"
+expect_failure_reason mutated-rsa-key "$mutated_rsa_key_apk" arm64-v8a \
+  'private signing, deployment, or runtime secret material'
+
+raw_der_asset="$work_dir/raw-der-asset"
+copy_fixture "$base_arm64" "$raw_der_asset"
+cp "$allowed_rsa_der" "$raw_der_asset/assets/copied-key.der"
+raw_der_asset_apk="$work_dir/raw-der-asset.apk"
+make_apk "$raw_der_asset" "$raw_der_asset_apk"
+expect_failure_reason raw-der-asset "$raw_der_asset_apk" arm64-v8a \
+  'private signing, deployment, or runtime secret material'
+
+raw_der_expected_lib="$work_dir/raw-der-expected-lib"
+copy_fixture "$base_arm64" "$raw_der_expected_lib"
+cat "$allowed_rsa_der" >> "$raw_der_expected_lib/lib/arm64-v8a/libkodi.so"
+raw_der_expected_lib_apk="$work_dir/raw-der-expected-lib.apk"
+make_apk "$raw_der_expected_lib" "$raw_der_expected_lib_apk"
+expect_failure_reason raw-der-expected-lib "$raw_der_expected_lib_apk" arm64-v8a \
+  'private signing, deployment, or runtime secret material'
+
+for private_format in \
+  pkcs8.der dh-pkcs8.der compact-pkcs8.der sec1.der dsa.der openssh.bin; do
+  private_format_label="${private_format//./-}"
+  private_format_fixture="$work_dir/raw-$private_format_label"
+  copy_fixture "$base_arm64" "$private_format_fixture"
+  cp "$private_format_dir/$private_format" \
+    "$private_format_fixture/assets/$private_format"
+  private_format_apk="$work_dir/raw-$private_format_label.apk"
+  make_apk "$private_format_fixture" "$private_format_apk"
+  expect_failure_reason \
+    "raw-$private_format_label" \
+    "$private_format_apk" \
+    arm64-v8a \
+    'private signing, deployment, or runtime secret material'
+done
+
+base64url_pkcs8="$work_dir/base64url-pkcs8"
+copy_fixture "$base_arm64" "$base64url_pkcs8"
+python3 - "$private_format_dir/pkcs8.der" "$base64url_pkcs8/assets/key.txt" <<'PY'
+import base64
+import pathlib
+import sys
+
+encoded = base64.urlsafe_b64encode(pathlib.Path(sys.argv[1]).read_bytes()).rstrip(b'=')
+pathlib.Path(sys.argv[2]).write_bytes(b' \n'.join(
+    encoded[index:index + 17] for index in range(0, len(encoded), 17)
+))
+PY
+base64url_pkcs8_apk="$work_dir/base64url-pkcs8.apk"
+make_apk "$base64url_pkcs8" "$base64url_pkcs8_apk"
+expect_failure_reason base64url-pkcs8 "$base64url_pkcs8_apk" arm64-v8a \
+  'private signing, deployment, or runtime secret material'
+
+openssh_armor="$work_dir/openssh-armor"
+copy_fixture "$base_arm64" "$openssh_armor"
+write_private_armor \
+  "$openssh_armor/assets/id_test" \
+  'OPENSSH PRIVATE KEY' \
+  "$private_format_dir/openssh.bin"
+openssh_armor_apk="$work_dir/openssh-armor.apk"
+make_apk "$openssh_armor" "$openssh_armor_apk"
+expect_failure_reason openssh-armor "$openssh_armor_apk" arm64-v8a \
+  'private signing, deployment, or runtime secret material'
+
+semantic_base64_copy="$work_dir/semantic-base64-copy"
+copy_fixture "$base_arm64" "$semantic_base64_copy"
+python3 - "$allowed_rsa_body" "$semantic_base64_copy/assets/copied-key.bin" <<'PY'
+import pathlib
+import sys
+
+body = pathlib.Path(sys.argv[1]).read_bytes()
+pathlib.Path(sys.argv[2]).write_bytes(b' \n'.join(bytes([value]) for value in body))
+PY
+semantic_base64_copy_apk="$work_dir/semantic-base64-copy.apk"
+make_apk "$semantic_base64_copy" "$semantic_base64_copy_apk"
+expect_failure_reason semantic-base64-copy "$semantic_base64_copy_apk" arm64-v8a \
+  'private signing, deployment, or runtime secret material'
+
+wrong_path_rsa_key="$work_dir/wrong-path-rsa-key"
+copy_fixture "$base_arm64" "$wrong_path_rsa_key"
+remove_allowed_rsa_key "$wrong_path_rsa_key/lib/arm64-v8a/libkodi.so"
+append_allowed_rsa_key "$wrong_path_rsa_key/assets/copied-key.pem"
+wrong_path_rsa_key_apk="$work_dir/wrong-path-rsa-key.apk"
+make_apk "$wrong_path_rsa_key" "$wrong_path_rsa_key_apk"
+expect_failure_reason wrong-path-rsa-key "$wrong_path_rsa_key_apk" arm64-v8a \
+  'private signing, deployment, or runtime secret material'
+
+cross_file_duplicate="$work_dir/cross-file-duplicate"
+copy_fixture "$base_arm64" "$cross_file_duplicate"
+append_allowed_rsa_key "$cross_file_duplicate/assets/copied-key.pem"
+cross_file_duplicate_apk="$work_dir/cross-file-duplicate.apk"
+make_apk "$cross_file_duplicate" "$cross_file_duplicate_apk"
+expect_failure_reason cross-file-duplicate "$cross_file_duplicate_apk" arm64-v8a \
+  'private signing, deployment, or runtime secret material'
+
+duplicate_rsa_key="$work_dir/duplicate-rsa-key"
+copy_fixture "$base_arm64" "$duplicate_rsa_key"
+append_allowed_rsa_key "$duplicate_rsa_key/lib/arm64-v8a/libkodi.so"
+duplicate_rsa_key_apk="$work_dir/duplicate-rsa-key.apk"
+make_apk "$duplicate_rsa_key" "$duplicate_rsa_key_apk"
+expect_failure_reason duplicate-rsa-key "$duplicate_rsa_key_apk" arm64-v8a \
+  'private signing, deployment, or runtime secret material'
+
+additional_private_key="$work_dir/additional-private-key"
+copy_fixture "$base_arm64" "$additional_private_key"
+write_private_armor \
+  "$work_dir/additional-private-key.pem" \
+  'PRIVATE KEY' \
+  "$allowed_rsa_body"
+cat "$work_dir/additional-private-key.pem" >> \
+  "$additional_private_key/lib/arm64-v8a/libkodi.so"
+additional_private_key_apk="$work_dir/additional-private-key.apk"
+make_apk "$additional_private_key" "$additional_private_key_apk"
+expect_failure_reason additional-private-key "$additional_private_key_apk" arm64-v8a \
+  'private signing, deployment, or runtime secret material'
+
+malformed_rsa_key="$work_dir/malformed-rsa-key"
+copy_fixture "$base_arm64" "$malformed_rsa_key"
+mutate_allowed_rsa_key "$malformed_rsa_key/lib/arm64-v8a/libkodi.so" '!'
+malformed_rsa_key_apk="$work_dir/malformed-rsa-key.apk"
+make_apk "$malformed_rsa_key" "$malformed_rsa_key_apk"
+expect_failure_reason malformed-rsa-key "$malformed_rsa_key_apk" arm64-v8a \
+  'private signing, deployment, or runtime secret material'
+
+unterminated_rsa_key="$work_dir/unterminated-rsa-key"
+copy_fixture "$base_arm64" "$unterminated_rsa_key"
+python3 - "$unterminated_rsa_key/lib/arm64-v8a/libkodi.so" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+data = bytearray(path.read_bytes())
+end = b'-----END RSA PRIVATE KEY-----'
+end_offset = data.find(end)
+if end_offset < 0:
+    raise SystemExit(1)
+data[end_offset + len(end) - 1] = ord('!')
+path.write_bytes(data)
+PY
+unterminated_rsa_key_apk="$work_dir/unterminated-rsa-key.apk"
+make_apk "$unterminated_rsa_key" "$unterminated_rsa_key_apk"
+expect_failure_reason unterminated-rsa-key "$unterminated_rsa_key_apk" arm64-v8a \
+  'private signing, deployment, or runtime secret material'
+
+four_hyphen_rsa_key="$work_dir/four-hyphen-rsa-key"
+copy_fixture "$base_arm64" "$four_hyphen_rsa_key"
+python3 - "$allowed_rsa_pem" "$four_hyphen_rsa_key/assets/recoverable-key.bin" <<'PY'
+import pathlib
+import sys
+
+source = pathlib.Path(sys.argv[1]).read_bytes()
+output = pathlib.Path(sys.argv[2])
+malformed = source.replace(
+    b'-----BEGIN RSA PRIVATE KEY-----',
+    b'----BEGIN RSA PRIVATE KEY----',
+).replace(
+    b'-----END RSA PRIVATE KEY-----',
+    b'----END RSA PRIVATE KEY----',
+)
+if malformed == source:
+    raise SystemExit(1)
+output.write_bytes(b'\0' + malformed + b'\0')
+PY
+four_hyphen_rsa_key_apk="$work_dir/four-hyphen-rsa-key.apk"
+make_apk "$four_hyphen_rsa_key" "$four_hyphen_rsa_key_apk"
+expect_failure_reason four-hyphen-rsa-key "$four_hyphen_rsa_key_apk" arm64-v8a \
+  'private signing, deployment, or runtime secret material'
+
+openpgp_private_key="$work_dir/openpgp-private-key"
+copy_fixture "$base_arm64" "$openpgp_private_key"
+openpgp_packet="$work_dir/openpgp-secret-key.pgp"
+openpgp_old_packet="$work_dir/openpgp-old-indeterminate.pgp"
+openpgp_partial_packet="$work_dir/openpgp-partial.pgp"
+openpgp_malformed_partial="$work_dir/openpgp-malformed-partial.pgp"
+openpgp_nonsecret_partial="$work_dir/openpgp-nonsecret-partial.pgp"
+python3 - \
+  "$openpgp_private_key/assets/private-key.asc" \
+  "$openpgp_packet" \
+  "$openpgp_old_packet" \
+  "$openpgp_partial_packet" \
+  "$openpgp_malformed_partial" \
+  "$openpgp_nonsecret_partial" <<'PY'
+import base64
+import pathlib
+import sys
+
+
+def mpi(value: int) -> bytes:
+    encoded = value.to_bytes((value.bit_length() + 7) // 8, 'big')
+    return value.bit_length().to_bytes(2, 'big') + encoded
+
+
+def crc24(data: bytes) -> int:
+    crc = 0xB704CE
+    for octet in data:
+        crc ^= octet << 16
+        for _ in range(8):
+            crc <<= 1
+            if crc & 0x1000000:
+                crc ^= 0x1864CFB
+    return crc & 0xFFFFFF
+
+
+def partial_packet(tag: int, value: bytes, chunk_size: int = 64) -> bytes:
+    exponent = chunk_size.bit_length() - 1
+    if chunk_size != 1 << exponent or not 0 <= tag <= 63:
+        raise ValueError('invalid partial-packet fixture')
+    output = bytearray([0xC0 | tag])
+    cursor = 0
+    while len(value) - cursor > chunk_size:
+        output.append(224 + exponent)
+        output.extend(value[cursor:cursor + chunk_size])
+        cursor += chunk_size
+    remaining = value[cursor:]
+    if len(remaining) >= 192:
+        raise ValueError('fixture final chunk is not one-octet length')
+    output.append(len(remaining))
+    output.extend(remaining)
+    return bytes(output)
+
+
+# Deterministic non-key MPIs create a structurally valid packet without sensitive data.
+n = (1 << 511) + 0x12345
+e = 65537
+d = (1 << 510) + 0x23457
+p = (1 << 255) + 0x34567
+q = (1 << 255) + 0x45679
+u = (1 << 254) + 0x56789
+public = b'\x04' + (0).to_bytes(4, 'big') + b'\x01' + mpi(n) + mpi(e)
+secret = mpi(d) + mpi(p) + mpi(q) + mpi(u)
+body = public + b'\x00' + secret + (sum(secret) & 0xFFFF).to_bytes(2, 'big')
+if len(body) < 192:
+    packet_length = bytes([len(body)])
+else:
+    adjusted_length = len(body) - 192
+    packet_length = bytes([192 + (adjusted_length >> 8), adjusted_length & 0xFF])
+packet = b'\xc5' + packet_length + body
+encoded = base64.b64encode(packet)
+lines = [encoded[index:index + 64] for index in range(0, len(encoded), 64)]
+checksum = base64.b64encode(crc24(packet).to_bytes(3, 'big'))
+armor = b'\n'.join([
+    b'-----BEGIN PGP PRIVATE KEY BLOCK-----',
+    b'',
+    *lines,
+    b'=' + checksum,
+    b'-----END PGP PRIVATE KEY BLOCK-----',
+    b'',
+])
+pathlib.Path(sys.argv[1]).write_bytes(armor)
+pathlib.Path(sys.argv[2]).write_bytes(packet)
+pathlib.Path(sys.argv[3]).write_bytes(b'\x97' + body)
+pathlib.Path(sys.argv[4]).write_bytes(partial_packet(5, body))
+pathlib.Path(sys.argv[5]).write_bytes(b'\xc5\xe7' + body[:128])
+pathlib.Path(sys.argv[6]).write_bytes(partial_packet(11, b'nonsecret-packet-data-' * 12))
+PY
+openpgp_private_key_apk="$work_dir/openpgp-private-key.apk"
+make_apk "$openpgp_private_key" "$openpgp_private_key_apk"
+expect_failure_reason openpgp-private-key "$openpgp_private_key_apk" arm64-v8a \
+  'private signing, deployment, or runtime secret material'
+
+openpgp_raw="$work_dir/openpgp-raw"
+copy_fixture "$base_arm64" "$openpgp_raw"
+cp "$openpgp_packet" "$openpgp_raw/assets/private-key.pgp"
+openpgp_raw_apk="$work_dir/openpgp-raw.apk"
+make_apk "$openpgp_raw" "$openpgp_raw_apk"
+expect_failure_reason openpgp-raw "$openpgp_raw_apk" arm64-v8a \
+  'private signing, deployment, or runtime secret material'
+
+for packet_variant in old-indeterminate partial malformed-partial; do
+  openpgp_variant="$work_dir/openpgp-$packet_variant"
+  copy_fixture "$base_arm64" "$openpgp_variant"
+  cp "$work_dir/openpgp-$packet_variant.pgp" \
+    "$openpgp_variant/assets/private-key.pgp"
+  openpgp_variant_apk="$work_dir/openpgp-$packet_variant.apk"
+  make_apk "$openpgp_variant" "$openpgp_variant_apk"
+  expect_failure_reason "openpgp-$packet_variant" "$openpgp_variant_apk" arm64-v8a \
+    'private signing, deployment, or runtime secret material'
+done
+
+openpgp_nonsecret="$work_dir/openpgp-nonsecret-control"
+copy_fixture "$base_arm64" "$openpgp_nonsecret"
+cp "$openpgp_nonsecret_partial" "$openpgp_nonsecret/assets/nonsecret-packet.pgp"
+openpgp_nonsecret_apk="$work_dir/openpgp-nonsecret-control.apk"
+make_apk "$openpgp_nonsecret" "$openpgp_nonsecret_apk"
+verify_apk "$openpgp_nonsecret_apk" arm64-v8a >/dev/null
+
+private_key_block="$work_dir/private-key-block"
+copy_fixture "$base_arm64" "$private_key_block"
+write_private_armor \
+  "$private_key_block/assets/private-key-block.asc" \
+  'VENDOR PRIVATE KEY BLOCK' \
+  "$allowed_rsa_body"
+private_key_block_apk="$work_dir/private-key-block.apk"
+make_apk "$private_key_block" "$private_key_block_apk"
+expect_failure_reason private-key-block "$private_key_block_apk" arm64-v8a \
+  'private signing, deployment, or runtime secret material'
+
+# Plain known encodings and conservative text normalization are in scope;
+# compression, encryption, and arbitrary cryptographic obfuscation are not.
+for marker_variant in \
+  ascii \
+  missing-space \
+  mixed-case \
+  single-hyphen \
+  nul-control \
+  nbsp-utf8 \
+  utf16le \
+  utf16be; do
+  marker_fixture="$work_dir/marker-$marker_variant"
+  copy_fixture "$base_arm64" "$marker_fixture"
+  write_marker_variant "$marker_fixture/assets/marker.bin" "$marker_variant"
+  marker_apk="$work_dir/marker-$marker_variant.apk"
+  make_apk "$marker_fixture" "$marker_apk"
+  expect_failure_reason "marker-$marker_variant" "$marker_apk" arm64-v8a \
+    'private signing, deployment, or runtime secret material'
+done
+
 nested_library="$work_dir/nested-library"
 copy_fixture "$base_arm64" "$nested_library"
 mkdir -p "$nested_library/lib/arm64-v8a/nested"
@@ -641,6 +1255,12 @@ expect_failure wrong-signer "$arm64_apk" arm64-v8a \
 expect_failure multiple-signers "$arm64_apk" arm64-v8a \
   MOCK_SECOND_SIGNER_DIGEST=cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd
 expect_failure signer-warning "$arm64_apk" arm64-v8a MOCK_APKSIGNER_FAIL=true
+expect_failure_reason \
+  scanner-forced-error \
+  "$arm64_apk" \
+  arm64-v8a \
+  'private signing, deployment, or runtime secret material' \
+  JUMPGATE_TEST_FORCE_SECRET_SCANNER_ERROR=1
 
 json_secret="$work_dir/json-secret"
 copy_fixture "$base_arm64" "$json_secret"
@@ -804,9 +1424,110 @@ with zipfile.ZipFile(pathlib.Path(sys.argv[1]), 'w') as archive:
 PY
 expect_failure symlink "$symlink_apk" arm64-v8a
 
+ads_path_apk="$work_dir/ntfs-ads-path.apk"
+python3 - "$arm64_apk" "$ads_path_apk" <<'PY'
+import pathlib
+import shutil
+import sys
+import zipfile
+
+source = pathlib.Path(sys.argv[1])
+output = pathlib.Path(sys.argv[2])
+shutil.copyfile(source, output)
+with zipfile.ZipFile(output, 'a', compression=zipfile.ZIP_DEFLATED) as archive:
+    archive.writestr('assets/runtime:secret.dat', b'not extracted on NTFS')
+PY
+expect_failure_reason ntfs-ads-path "$ads_path_apk" arm64-v8a \
+  'archive failed safe extraction checks'
+
+named_runtime_secret="$work_dir/named-runtime-secret"
+copy_fixture "$base_arm64" "$named_runtime_secret"
+named_runtime_secret_value='archive-runtime-secret-value'
+printf 'KODI_ANDROID_STORE_PASSWORD=%s\n' "$named_runtime_secret_value" > \
+  "$named_runtime_secret/assets/runtime.dat"
+named_runtime_secret_apk="$work_dir/named-runtime-secret.apk"
+make_apk "$named_runtime_secret" "$named_runtime_secret_apk"
+expect_failure_without_value named-runtime-secret "$named_runtime_secret_apk" arm64-v8a \
+  "$named_runtime_secret_value"
+
+for jwk_type in rsa ec okp; do
+  jwk_fixture="$work_dir/private-jwk-$jwk_type"
+  copy_fixture "$base_arm64" "$jwk_fixture"
+  case "$jwk_type" in
+    rsa)
+      printf '%s\n' \
+        '{"kty":"RSA","n":"public-modulus","e":"AQAB","d":"private-exponent","p":"prime-one","q":"prime-two","dp":"dp-value","dq":"dq-value","qi":"qi-value"}' \
+        > "$jwk_fixture/assets/private.jwk"
+      ;;
+    ec)
+      printf '%s\n' \
+        '{"kty":"EC","crv":"P-256","x":"public-x","y":"public-y","d":"private-scalar"}' \
+        > "$jwk_fixture/assets/private.jwk"
+      ;;
+    okp)
+      printf '%s\n' \
+        '{"kty":"OKP","crv":"Ed25519","x":"public-x","d":"private-seed"}' \
+        > "$jwk_fixture/assets/private.jwk"
+      ;;
+  esac
+  jwk_apk="$work_dir/private-jwk-$jwk_type.apk"
+  make_apk "$jwk_fixture" "$jwk_apk"
+  expect_failure_reason "private-jwk-$jwk_type" "$jwk_apk" arm64-v8a \
+    'private signing, deployment, or runtime secret material'
+done
+
+placeholder_private_jwk="$work_dir/placeholder-private-jwk"
+copy_fixture "$base_arm64" "$placeholder_private_jwk"
+printf '%s\n' \
+  '{"kty":"RSA","n":"public-modulus","e":"AQAB","d":"REDACTED"}' \
+  > "$placeholder_private_jwk/assets/private.jwk"
+placeholder_private_jwk_apk="$work_dir/placeholder-private-jwk.apk"
+make_apk "$placeholder_private_jwk" "$placeholder_private_jwk_apk"
+expect_failure_reason placeholder-private-jwk "$placeholder_private_jwk_apk" arm64-v8a \
+  'private signing, deployment, or runtime secret material'
+
+oct_private_jwk="$work_dir/oct-private-jwk"
+copy_fixture "$base_arm64" "$oct_private_jwk"
+printf '%s\n' \
+  '{"kty":"oct","k":"c3ltbWV0cmljLXNlY3JldA"}' \
+  > "$oct_private_jwk/assets/private.jwk"
+oct_private_jwk_apk="$work_dir/oct-private-jwk.apk"
+make_apk "$oct_private_jwk" "$oct_private_jwk_apk"
+expect_failure_reason oct-private-jwk "$oct_private_jwk_apk" arm64-v8a \
+  'private signing, deployment, or runtime secret material'
+
+for assignment_variant in \
+  spaced-quoted utf16le utf16be quoted-key continuation \
+  append quoted-suffix sentinel-prefix; do
+  assignment_fixture="$work_dir/named-assignment-$assignment_variant"
+  copy_fixture "$base_arm64" "$assignment_fixture"
+  write_named_assignment_variant \
+    "$assignment_fixture/assets/named-assignment.bin" \
+    "$assignment_variant"
+  assignment_apk="$work_dir/named-assignment-$assignment_variant.apk"
+  make_apk "$assignment_fixture" "$assignment_apk"
+  expect_failure_reason \
+    "named-assignment-$assignment_variant" \
+    "$assignment_apk" \
+    arm64-v8a \
+    'private signing, deployment, or runtime secret material'
+done
+
+sentinel_prefix_config="$work_dir/sentinel-prefix-config"
+copy_fixture "$base_arm64" "$sentinel_prefix_config"
+printf '%s\n' '{"api_key":"EXAMPLE_live_secret"}' \
+  > "$sentinel_prefix_config/assets/prefix-secret.json"
+sentinel_prefix_config_apk="$work_dir/sentinel-prefix-config.apk"
+make_apk "$sentinel_prefix_config" "$sentinel_prefix_config_apk"
+expect_failure_reason sentinel-prefix-config "$sentinel_prefix_config_apk" arm64-v8a \
+  'non-placeholder secret assignment in packaged configuration'
+
 private_key="$work_dir/private-key"
 copy_fixture "$base_arm64" "$private_key"
-printf '%s\n' '-----BEGIN PRIVATE KEY-----' > "$private_key/assets/private.txt"
+write_private_armor \
+  "$private_key/assets/private.txt" \
+  'PRIVATE KEY' \
+  "$allowed_rsa_body"
 private_key_apk="$work_dir/private-key.apk"
 make_apk "$private_key" "$private_key_apk"
 expect_failure private-key "$private_key_apk" arm64-v8a
