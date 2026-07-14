@@ -2254,11 +2254,10 @@ void CXBMCApp::QueueJumpgateSubtitles(uint64_t generation)
     return;
   }
 
-  KODI::JUMPGATE::JumpgateSubtitleRequest request;
-  request.binding = {generation, active.profileId, active.deviceId, active.bridgeOrigin, sessionId};
-  request.authority =
-      KODI::JUMPGATE::CJumpgateSubtitleBearerAuthority{std::move(active.deviceToken)};
-  request.languagePreferences = ParseJumpgateSubtitleLanguages(active.subtitleLanguages);
+  KODI::JUMPGATE::JumpgateSubtitleRequest request{
+      {generation, active.profileId, active.deviceId, active.bridgeOrigin, sessionId},
+      KODI::JUMPGATE::CJumpgateSubtitleBearerAuthority{std::move(active.deviceToken)},
+      ParseJumpgateSubtitleLanguages(active.subtitleLanguages)};
   active.ClearSecrets();
   ClearSensitiveString(sessionId);
   if (!m_jumpgateSubtitleController->Queue(std::move(request)))
