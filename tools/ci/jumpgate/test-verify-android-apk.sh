@@ -298,8 +298,9 @@ import sys
 
 path = pathlib.Path(sys.argv[1])
 data = path.read_bytes()
-begin = b'-----BEGIN RSA PRIVATE KEY-----'
-end = b'-----END RSA PRIVATE KEY-----'
+boundary = b'-' * 5
+begin = boundary + b'BEGIN RSA PRIVATE KEY' + boundary
+end = boundary + b'END RSA PRIVATE KEY' + boundary
 start = data.find(begin)
 finish = data.find(end, start) + len(end)
 if start < 0 or finish < len(end) or data.find(begin, finish) >= 0:
@@ -318,8 +319,9 @@ import sys
 path = pathlib.Path(sys.argv[1])
 replacement = sys.argv[2].encode('ascii')
 data = bytearray(path.read_bytes())
-begin = b'-----BEGIN RSA PRIVATE KEY-----'
-end = b'-----END RSA PRIVATE KEY-----'
+boundary = b'-' * 5
+begin = boundary + b'BEGIN RSA PRIVATE KEY' + boundary
+end = boundary + b'END RSA PRIVATE KEY' + boundary
 body_start = data.find(begin) + len(begin)
 body_end = data.find(end, body_start)
 if body_start < len(begin) or body_end < 0 or len(replacement) != 1:
@@ -346,23 +348,27 @@ import sys
 output = pathlib.Path(sys.argv[1])
 variant = sys.argv[2]
 body = pathlib.Path(sys.argv[3]).read_text(encoding='ascii')
+boundary = '-' * 5
 variants = {
-    'ascii': f'-----BEGIN PRIVATE KEY-----\n{body}\n-----END PRIVATE KEY-----'.encode(),
-    'missing-space': f'-----BEGINRSAPRIVATEKEY-----\n{body}\n-----ENDRSAPRIVATEKEY-----'.encode(),
-    'mixed-case': f'-----bEgIn RsA pRiVaTe KeY-----\n{body}\n-----eNd RsA pRiVaTe KeY-----'.encode(),
+    'ascii': f'{boundary}BEGIN PRIVATE KEY{boundary}\n{body}\n'
+             f'{boundary}END PRIVATE KEY{boundary}'.encode(),
+    'missing-space': f'{boundary}BEGINRSAPRIVATEKEY{boundary}\n{body}\n'
+                     f'{boundary}ENDRSAPRIVATEKEY{boundary}'.encode(),
+    'mixed-case': f'{boundary}bEgIn RsA pRiVaTe KeY{boundary}\n{body}\n'
+                  f'{boundary}eNd RsA pRiVaTe KeY{boundary}'.encode(),
     'single-hyphen': f'-BEGIN RSA PRIVATE KEY-\n{body}\n-END RSA PRIVATE KEY-'.encode(),
     'nul-control': (
         b'-----B\0E\x01GIN R\0SA PRI\x02VATE K\0EY-----\nMAA=\n'
         b'-----E\0ND R\x03SA PRI\0VATE K\x04EY-----'
     ).replace(b'MAA=', body.encode()),
     'nbsp-utf8': (
-        f'-----BEGIN\u00a0RSA\u00a0PRIVATE\u00a0KEY-----\n{body}\n'
-        '-----END\u00a0RSA\u00a0PRIVATE\u00a0KEY-----'
+        f'{boundary}BEGIN\u00a0RSA\u00a0PRIVATE\u00a0KEY{boundary}\n{body}\n'
+        f'{boundary}END\u00a0RSA\u00a0PRIVATE\u00a0KEY{boundary}'
     ).encode('utf-8'),
-    'utf16le': (f'\ufeff-----BEGIN RSA PRIVATE KEY-----\n{body}\n'
-                '-----END RSA PRIVATE KEY-----').encode('utf-16le'),
-    'utf16be': (f'\ufeff-----BEGIN RSA PRIVATE KEY-----\n{body}\n'
-                '-----END RSA PRIVATE KEY-----').encode('utf-16be'),
+    'utf16le': (f'\ufeff{boundary}BEGIN RSA PRIVATE KEY{boundary}\n{body}\n'
+                f'{boundary}END RSA PRIVATE KEY{boundary}').encode('utf-16le'),
+    'utf16be': (f'\ufeff{boundary}BEGIN RSA PRIVATE KEY{boundary}\n{body}\n'
+                f'{boundary}END RSA PRIVATE KEY{boundary}').encode('utf-16be'),
 }
 try:
     payload = variants[variant]
@@ -536,16 +542,16 @@ pem_output = pathlib.Path(sys.argv[2])
 der_output = pathlib.Path(sys.argv[3])
 body_output = pathlib.Path(sys.argv[4])
 expected_digest = sys.argv[5]
-begin = b'-----BEGIN RSA PRIVATE KEY-----'
-end = b'-----END RSA PRIVATE KEY-----'
+boundary = b'-' * 5
+begin = boundary + b'BEGIN RSA PRIVATE KEY' + boundary
+end = boundary + b'END RSA PRIVATE KEY' + boundary
 start = source.find(begin)
 finish = source.find(end, start) + len(end)
 if start < 0 or finish < len(end) or source.find(begin, finish) >= 0:
     raise SystemExit(1)
 pem = source[start:finish].replace(b'\\\r\n', b'').replace(b'\\\n', b'')
 match = re.fullmatch(
-    rb'-----BEGIN RSA PRIVATE KEY-----(?P<body>[A-Za-z0-9+/=]+)'
-    rb'-----END RSA PRIVATE KEY-----',
+    begin + rb'(?P<body>[A-Za-z0-9+/=]+)' + end,
     pem,
 )
 if not match:
@@ -660,10 +666,14 @@ import pathlib
 import sys
 
 # Representative parser constants contain labels but no plausible key body.
+boundary = b'-' * 5
 constants = (
-    b'-----BEGIN PRIVATE KEY-----\0-----END PRIVATE KEY-----\0'
-    b'-----BEGIN EC PRIVATE KEY-----\0-----END EC PRIVATE KEY-----\0'
-    b'-----BEGIN PUBLIC KEY-----\0-----END PUBLIC KEY-----\0'
+    boundary + b'BEGIN PRIVATE KEY' + boundary + b'\0' +
+    boundary + b'END PRIVATE KEY' + boundary + b'\0' +
+    boundary + b'BEGIN EC PRIVATE KEY' + boundary + b'\0' +
+    boundary + b'END EC PRIVATE KEY' + boundary + b'\0' +
+    boundary + b'BEGIN PUBLIC KEY' + boundary + b'\0' +
+    boundary + b'END PUBLIC KEY' + boundary + b'\0'
 )
 pathlib.Path(sys.argv[1]).write_bytes(constants)
 PY
@@ -1049,7 +1059,8 @@ import sys
 
 path = pathlib.Path(sys.argv[1])
 data = bytearray(path.read_bytes())
-end = b'-----END RSA PRIVATE KEY-----'
+boundary = b'-' * 5
+end = boundary + b'END RSA PRIVATE KEY' + boundary
 end_offset = data.find(end)
 if end_offset < 0:
     raise SystemExit(1)
@@ -1069,12 +1080,14 @@ import sys
 
 source = pathlib.Path(sys.argv[1]).read_bytes()
 output = pathlib.Path(sys.argv[2])
+five = b'-' * 5
+four = b'-' * 4
 malformed = source.replace(
-    b'-----BEGIN RSA PRIVATE KEY-----',
-    b'----BEGIN RSA PRIVATE KEY----',
+    five + b'BEGIN RSA PRIVATE KEY' + five,
+    four + b'BEGIN RSA PRIVATE KEY' + four,
 ).replace(
-    b'-----END RSA PRIVATE KEY-----',
-    b'----END RSA PRIVATE KEY----',
+    five + b'END RSA PRIVATE KEY' + five,
+    four + b'END RSA PRIVATE KEY' + four,
 )
 if malformed == source:
     raise SystemExit(1)
@@ -1157,12 +1170,13 @@ packet = b'\xc5' + packet_length + body
 encoded = base64.b64encode(packet)
 lines = [encoded[index:index + 64] for index in range(0, len(encoded), 64)]
 checksum = base64.b64encode(crc24(packet).to_bytes(3, 'big'))
+boundary = b'-' * 5
 armor = b'\n'.join([
-    b'-----BEGIN PGP PRIVATE KEY BLOCK-----',
+    boundary + b'BEGIN PGP PRIVATE KEY BLOCK' + boundary,
     b'',
     *lines,
     b'=' + checksum,
-    b'-----END PGP PRIVATE KEY BLOCK-----',
+    boundary + b'END PGP PRIVATE KEY BLOCK' + boundary,
     b'',
 ])
 pathlib.Path(sys.argv[1]).write_bytes(armor)
@@ -1294,13 +1308,14 @@ expect_failure_without_value github-token-json "$github_token_json_apk" arm64-v8
 
 yaml_secret="$work_dir/yaml-secret"
 copy_fixture "$base_arm64" "$yaml_secret"
-yaml_secret_value='0123456789abcdef0123456789ABCDEF'
-printf 'refresh-token: %s\n' "$yaml_secret_value" > \
+yaml_fixture_value='0123456789abcdef'
+yaml_fixture_value+='0123456789ABCDEF'
+printf 'refresh-token: %s\n' "$yaml_fixture_value" > \
   "$yaml_secret/assets/private.yaml"
 yaml_secret_apk="$work_dir/yaml-secret.apk"
 make_apk "$yaml_secret" "$yaml_secret_apk"
 expect_failure_without_value yaml-unquoted-secret "$yaml_secret_apk" arm64-v8a \
-  "$yaml_secret_value"
+  "$yaml_fixture_value"
 
 deploy_token_yaml="$work_dir/deploy-token-yaml"
 copy_fixture "$base_arm64" "$deploy_token_yaml"

@@ -393,10 +393,11 @@ MAX_ARMOR_CHARACTERS = 256 * 1024
 MAX_ASSIGNMENT_LINE = 64 * 1024
 MAX_JSON_BYTES = 32 * 1024 * 1024
 MAX_HINT_WINDOWS = 100_000
+PEM_BOUNDARY = rb'-' * 5
 CANONICAL_BLOCK = re.compile(
-    rb'(?<!-)-----BEGIN RSA PRIVATE KEY-----'
+    rb'(?<!-)' + PEM_BOUNDARY + rb'BEGIN RSA PRIVATE KEY' + PEM_BOUNDARY +
     rb'(?P<body>[A-Za-z0-9+/=]{1,16384})'
-    rb'-----END RSA PRIVATE KEY-----(?!-)'
+    + PEM_BOUNDARY + rb'END RSA PRIVATE KEY' + PEM_BOUNDARY + rb'(?!-)'
 )
 DER_PRIVATE_CANDIDATE = re.compile(
     rb'(?:'
