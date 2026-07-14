@@ -22,6 +22,9 @@ CJumpgateScrobbleDispatcher::CJumpgateScrobbleDispatcher(
 {
   if (!transport)
     return;
+  m_registryReservation = m_registry->Reserve();
+  if (!m_registryReservation)
+    return;
   m_state = std::make_shared<WorkerState>(std::move(transport));
   m_worker = std::thread([state = m_state] { Run(state); });
 }
@@ -96,10 +99,11 @@ bool CJumpgateScrobbleDispatcher::Stop(bool drain, std::chrono::milliseconds tim
   {
     if (m_worker.joinable())
       m_worker.join();
+    m_registryReservation.Reset();
   }
   else if (m_worker.joinable())
   {
-    m_registry->Adopt(std::move(m_worker),
+    m_registry->Adopt(m_worker, std::move(m_registryReservation),
                       [state](std::chrono::milliseconds waitTime)
                       {
                         std::unique_lock<std::mutex> lock(state->mutex);

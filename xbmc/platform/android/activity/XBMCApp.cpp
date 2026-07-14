@@ -9,6 +9,7 @@
 #include "XBMCApp.h"
 
 #include "AndroidJumpgateCredentialStore.h"
+#include "AndroidJumpgateSubtitleTransport.h"
 #include "AndroidKey.h"
 #include "CompileInfo.h"
 #include "FileItem.h"
@@ -82,6 +83,7 @@
 #include "platform/android/storage/AndroidStorageProvider.h"
 
 #include <algorithm>
+#include <cctype>
 #include <charconv>
 #include <cstdio>
 #include <memory>
@@ -161,6 +163,35 @@ static void ClearSensitiveString(std::string& value)
 {
   std::fill(value.begin(), value.end(), '\0');
   value.clear();
+}
+
+static std::vector<std::string> ParseJumpgateSubtitleLanguages(const std::string& configured)
+{
+  std::vector<std::string> languages;
+  std::size_t begin = 0;
+  while (begin <= configured.size() && languages.size() < 16)
+  {
+    const std::size_t separator = configured.find(',', begin);
+    const std::size_t end = separator == std::string::npos ? configured.size() : separator;
+    std::string language = configured.substr(begin, end - begin);
+    const std::size_t first = language.find_first_not_of(" \t");
+    const std::size_t last = language.find_last_not_of(" \t");
+    if (first != std::string::npos)
+    {
+      language = language.substr(first, last - first + 1);
+      std::transform(language.begin(), language.end(), language.begin(),
+                     [](unsigned char item) { return static_cast<char>(std::tolower(item)); });
+      if (KODI::JUMPGATE::CJumpgateSubtitleClient::IsCanonicalLanguage(language) &&
+          std::find(languages.begin(), languages.end(), language) == languages.end())
+      {
+        languages.emplace_back(std::move(language));
+      }
+    }
+    if (separator == std::string::npos)
+      break;
+    begin = separator + 1;
+  }
+  return languages;
 }
 
 static int ParseHttpStatus(const std::string& protocolLine)
@@ -632,6 +663,10 @@ void CXBMCApp::onDestroy()
     StopPlaybackClaimCoordinator(false);
   }
 
+  // Cancel immediately, then let the final service drain join any Curl worker.
+  // Staged files stay in place until the player can no longer be reading them.
+  StopJumpgateSubtitleController(true, false);
+
   if (m_subtitleDownloader)
   {
     m_subtitleDownloader->Deinitialize();
@@ -733,12 +768,24 @@ void CXBMCApp::Initialize()
     ApplyActiveJumpgateProfile();
     m_traktScrobbler->Initialize();
 
-    m_subtitleDownloader = std::make_unique<SubtitleDownloader>();
-    m_subtitleDownloader->Initialize();
+    if (!m_jumpgateSubtitleController)
+      m_jumpgateSubtitleController =
+          std::make_unique<KODI::JUMPGATE::CAndroidJumpgateSubtitleController>();
+    m_jumpgateSubtitleController->SweepStartupOrphans();
 
-    // Pass subtitle language from settings
-    std::string subLangs = GetSettingString("subtitle_languages", "en");
-    m_subtitleDownloader->SetLanguages(subLangs);
+    KODI::JUMPGATE::ActiveProfile active;
+    if (m_jumpgateProfileRuntime)
+      active = m_jumpgateProfileRuntime->GetActive();
+    const auto provider = KODI::JUMPGATE::SelectAndroidJumpgateSubtitleProvider(
+        true, active.selected && active.sourceBacked, active.credentialsValid,
+        active.subtitlesEnabled, false);
+    if (provider == KODI::JUMPGATE::AndroidJumpgateSubtitleProvider::OpenSubtitles)
+    {
+      m_subtitleDownloader = std::make_unique<SubtitleDownloader>();
+      m_subtitleDownloader->Initialize();
+      m_subtitleDownloader->SetLanguages(active.subtitleLanguages);
+    }
+    active.ClearSecrets();
   }
 }
 
@@ -754,9 +801,14 @@ void CXBMCApp::Deinitialize()
           ReleasePlaybackSourceClaim();
           StopPlaybackClaimCoordinator(false);
         }
+        StopJumpgateSubtitleController(false);
         if (m_traktScrobbler)
           m_traktScrobbler->Deinitialize(true);
-        KODI::JUMPGATE::CJumpgateThreadRegistry::Global()->JoinAll();
+        if (!KODI::JUMPGATE::CJumpgateThreadRegistry::Global()->JoinAll(
+                std::chrono::seconds{12}))
+        {
+          CLog::Log(LOGERROR, "CXBMCApp: bounded Jumpgate worker drain expired");
+        }
       });
 }
 
@@ -1200,6 +1252,7 @@ void CXBMCApp::OnPlayBackStarted(bool resumed, uint64_t token)
     m_overlayHidden = false;
     CLog::Log(LOGINFO, "CXBMCApp: Playback started — overlay will hide when frames render");
   }
+  uint64_t subtitleGeneration = 0;
   if (resumed)
   {
     auto authorityTransaction = m_playbackAuthority.BeginTransaction();
@@ -1222,7 +1275,13 @@ void CXBMCApp::OnPlayBackStarted(bool resumed, uint64_t token)
     {
       m_ordinaryPlaybackAuthorityToken.store(started->token, std::memory_order_relaxed);
     }
+    else if (m_externalPlayerMode.load(std::memory_order_relaxed))
+    {
+      subtitleGeneration = started->generation;
+    }
   }
+  if (subtitleGeneration != 0 && m_jumpgateSubtitleController)
+    m_jumpgateSubtitleController->MarkPlaybackReady(subtitleGeneration);
 }
 
 void CXBMCApp::OnPlayBackPaused()
@@ -1277,6 +1336,8 @@ void CXBMCApp::CommitExternalPlaybackTerminal(bool completed, uint64_t token, bo
   }
   if (!terminal || terminal->generation == 0)
     return;
+  if (m_jumpgateSubtitleController)
+    m_jumpgateSubtitleController->OnPlaybackTerminal(terminal->generation);
   if (superseded)
   {
     CLog::Log(LOGDEBUG, "CXBMCApp: Ignored delayed terminal for superseded playback token {}",
@@ -1343,6 +1404,7 @@ void CXBMCApp::ExitExternalPlayerMode(
 
   // Save resume position before exiting
   SaveResumePosition(result.completed);
+  StopJumpgateSubtitleController(false);
   ReleasePlaybackSourceClaim();
   StopPlaybackClaimCoordinator(true);
 
@@ -1382,6 +1444,7 @@ void CXBMCApp::ReturnToStandaloneMode()
   CLog::Log(LOGINFO, "CXBMCApp: Returning to standalone mode");
 
   ReleasePlaybackSourceClaim();
+  StopJumpgateSubtitleController(false);
   StopPlaybackClaimCoordinator(true);
 
   // Keep the object alive so concurrent lifecycle readers cannot observe a
@@ -1395,6 +1458,7 @@ void CXBMCApp::ReturnToStandaloneMode()
     m_subtitleDownloader->Deinitialize();
     m_subtitleDownloader.reset();
   }
+  m_jumpgateSubtitleController.reset();
 
   // Reset external player state
   m_externalPlayerMode.store(false, std::memory_order_relaxed);
@@ -1903,6 +1967,8 @@ void CXBMCApp::CommitExternalPlaybackAdmissionFailure(uint64_t token)
 
   if (canceled && !superseded && m_traktScrobbler)
     m_traktScrobbler->CancelPlaybackGeneration(canceled->generation, canceled->token);
+  if (canceled && !superseded && m_jumpgateSubtitleController)
+    m_jumpgateSubtitleController->OnPlaybackTerminal(canceled->generation);
 }
 
 void CXBMCApp::DeliverRejectedExternalPlaybackResult(
@@ -1988,6 +2054,7 @@ void CXBMCApp::ProcessPlaybackSourceClaim()
       {
         m_submittedPlaybackClaimGeneration = pending->generation;
         m_submittedPlaybackClaimProfileId = active.profileId;
+        m_submittedPlaybackClaimDeviceId = active.deviceId;
         m_submittedPlaybackClaimOrigin = active.bridgeOrigin;
       }
     }
@@ -2001,6 +2068,7 @@ void CXBMCApp::ProcessPlaybackSourceClaim()
 
   std::optional<KODI::JUMPGATE::PlaybackClaimCompletion> completion;
   std::string expectedProfileId;
+  std::string expectedDeviceId;
   std::string expectedOrigin;
   {
     std::unique_lock lock(m_playbackClaimMutex);
@@ -2009,6 +2077,7 @@ void CXBMCApp::ProcessPlaybackSourceClaim()
     if (completion && completion->generation == m_submittedPlaybackClaimGeneration)
     {
       expectedProfileId = m_submittedPlaybackClaimProfileId;
+      expectedDeviceId = m_submittedPlaybackClaimDeviceId;
       expectedOrigin = m_submittedPlaybackClaimOrigin;
     }
   }
@@ -2023,6 +2092,7 @@ void CXBMCApp::ProcessPlaybackSourceClaim()
     active = m_jumpgateProfileRuntime->GetActive();
   const bool profileCurrent = generationCurrent && active.selected && active.sourceBacked &&
                               active.credentialsValid && active.profileId == expectedProfileId &&
+                              active.deviceId == expectedDeviceId &&
                               active.bridgeOrigin == expectedOrigin;
 
   if (!profileCurrent)
@@ -2077,6 +2147,7 @@ void CXBMCApp::ProcessPlaybackSourceClaim()
     {
       m_activePlaybackClaimSessionId = completion->result.claim.sessionId;
       m_activePlaybackClaimProfileId = active.profileId;
+      m_activePlaybackClaimDeviceId = active.deviceId;
       m_activePlaybackClaimOrigin = active.bridgeOrigin;
       accepted = true;
     }
@@ -2143,30 +2214,109 @@ void CXBMCApp::ProcessPlaybackSourceClaim()
   }
 
   LoadAndApplyPairedPlaybackResume(generation);
-
-  if (m_subtitleDownloader)
-  {
-    m_subtitleDownloader->ClearContentInfo();
-    m_subtitleDownloader->SetContentInfo(provider == "imdb" ? canonicalId : "", title, year, season,
-                                         episode);
-  }
+  QueueJumpgateSubtitles(generation);
   UpdateLoadingOverlayContentInfo(true);
   OnContentIdentified();
   CLog::Log(LOGINFO, "CXBMCApp: Authenticated playback context applied");
+}
+
+void CXBMCApp::QueueJumpgateSubtitles(uint64_t generation)
+{
+  if (!m_externalPlayerMode.load(std::memory_order_relaxed) || !m_jumpgateProfileRuntime ||
+      !m_jumpgateSubtitleController || generation == 0)
+  {
+    return;
+  }
+
+  KODI::JUMPGATE::ActiveProfile active = m_jumpgateProfileRuntime->GetActive();
+  std::string sessionId;
+  bool claimCurrent = false;
+  {
+    std::unique_lock lock(m_playbackClaimMutex);
+    claimCurrent = generation == m_playbackClaimGeneration &&
+                   generation == m_submittedPlaybackClaimGeneration && active.selected &&
+                   active.sourceBacked && active.credentialsValid &&
+                   active.profileId == m_activePlaybackClaimProfileId &&
+                   active.deviceId == m_activePlaybackClaimDeviceId &&
+                   active.bridgeOrigin == m_activePlaybackClaimOrigin &&
+                   !m_activePlaybackClaimSessionId.empty();
+    if (claimCurrent)
+      sessionId = m_activePlaybackClaimSessionId;
+  }
+
+  const auto provider = KODI::JUMPGATE::SelectAndroidJumpgateSubtitleProvider(
+      true, active.selected && active.sourceBacked, active.credentialsValid,
+      active.subtitlesEnabled, claimCurrent);
+  if (provider != KODI::JUMPGATE::AndroidJumpgateSubtitleProvider::Bridge)
+  {
+    active.ClearSecrets();
+    ClearSensitiveString(sessionId);
+    return;
+  }
+
+  KODI::JUMPGATE::JumpgateSubtitleRequest request;
+  request.binding = {generation, active.profileId, active.deviceId, active.bridgeOrigin, sessionId};
+  request.authority =
+      KODI::JUMPGATE::CJumpgateSubtitleBearerAuthority{std::move(active.deviceToken)};
+  request.languagePreferences = ParseJumpgateSubtitleLanguages(active.subtitleLanguages);
+  active.ClearSecrets();
+  ClearSensitiveString(sessionId);
+  if (!m_jumpgateSubtitleController->Queue(std::move(request)))
+    CLog::Log(LOGWARNING, "CXBMCApp: Bridge subtitle discovery was not queued");
+}
+
+void CXBMCApp::ProcessJumpgateSubtitles()
+{
+  if (!m_externalPlayerMode.load(std::memory_order_relaxed) || !m_jumpgateProfileRuntime ||
+      !m_jumpgateSubtitleController)
+  {
+    return;
+  }
+
+  KODI::JUMPGATE::ActiveProfile active = m_jumpgateProfileRuntime->GetActive();
+  KODI::JUMPGATE::JumpgateSubtitleBinding binding;
+  bool current = false;
+  {
+    std::unique_lock lock(m_playbackClaimMutex);
+    current = m_playbackClaimGeneration != 0 && active.selected && active.sourceBacked &&
+              active.credentialsValid && active.subtitlesEnabled &&
+              active.profileId == m_activePlaybackClaimProfileId &&
+              active.deviceId == m_activePlaybackClaimDeviceId &&
+              active.bridgeOrigin == m_activePlaybackClaimOrigin &&
+              !m_activePlaybackClaimSessionId.empty();
+    if (current)
+    {
+      binding = {m_playbackClaimGeneration, active.profileId, active.deviceId, active.bridgeOrigin,
+                 m_activePlaybackClaimSessionId};
+    }
+  }
+  active.ClearSecrets();
+  if (current)
+    m_jumpgateSubtitleController->Process(binding);
+  ClearSensitiveString(binding.sessionId);
+}
+
+void CXBMCApp::StopJumpgateSubtitleController(bool playerMayRead, bool waitForCompletion)
+{
+  if (m_jumpgateSubtitleController)
+    m_jumpgateSubtitleController->Stop(playerMayRead, waitForCompletion);
 }
 
 void CXBMCApp::ReleasePlaybackSourceClaim()
 {
   std::string sessionId;
   std::string profileId;
+  std::string deviceId;
   std::string origin;
   {
     std::unique_lock lock(m_playbackClaimMutex);
     sessionId = std::move(m_activePlaybackClaimSessionId);
     profileId = std::move(m_activePlaybackClaimProfileId);
+    deviceId = std::move(m_activePlaybackClaimDeviceId);
     origin = std::move(m_activePlaybackClaimOrigin);
     m_activePlaybackClaimSessionId.clear();
     m_activePlaybackClaimProfileId.clear();
+    m_activePlaybackClaimDeviceId.clear();
     m_activePlaybackClaimOrigin.clear();
   }
   if (sessionId.empty() || !m_jumpgateProfileRuntime)
@@ -2174,7 +2324,8 @@ void CXBMCApp::ReleasePlaybackSourceClaim()
 
   KODI::JUMPGATE::ActiveProfile active = m_jumpgateProfileRuntime->GetActive();
   if (!active.selected || !active.sourceBacked || !active.credentialsValid ||
-      active.profileId != profileId || active.bridgeOrigin != origin || active.deviceToken.empty())
+      active.profileId != profileId || active.deviceId != deviceId ||
+      active.bridgeOrigin != origin || active.deviceToken.empty())
   {
     active.ClearSecrets();
     ClearSensitiveString(sessionId);
@@ -2228,9 +2379,11 @@ void CXBMCApp::StopPlaybackClaimCoordinator(bool drainRelease)
     coordinator = std::move(m_playbackClaimCoordinator);
     ClearSensitiveString(m_activePlaybackClaimSessionId);
     m_activePlaybackClaimProfileId.clear();
+    m_activePlaybackClaimDeviceId.clear();
     m_activePlaybackClaimOrigin.clear();
     m_submittedPlaybackClaimGeneration = 0;
     m_submittedPlaybackClaimProfileId.clear();
+    m_submittedPlaybackClaimDeviceId.clear();
     m_submittedPlaybackClaimOrigin.clear();
   }
   m_playbackHistoryState.AdvanceGeneration(generation);
@@ -2315,6 +2468,7 @@ void CXBMCApp::PrepareJumpgateProfileAuthorityTransition()
     m_traktScrobbler->Deinitialize(false);
   }
   SavePairedPlaybackHistory(false);
+  StopJumpgateSubtitleController(false);
   ReleasePlaybackSourceClaim();
   StopPlaybackClaimCoordinator(true);
   m_resumeApplied.store(false, std::memory_order_relaxed);
@@ -2329,6 +2483,15 @@ bool CXBMCApp::FinishJumpgateProfileAuthorityTransition(
   ApplyActiveJumpgateProfile();
   if (m_traktScrobbler && m_externalPlayerMode.load(std::memory_order_relaxed))
     m_traktScrobbler->Initialize();
+  if (m_externalPlayerMode.load(std::memory_order_relaxed))
+  {
+    if (!m_jumpgateSubtitleController)
+      m_jumpgateSubtitleController =
+          std::make_unique<KODI::JUMPGATE::CAndroidJumpgateSubtitleController>();
+    else
+      m_jumpgateSubtitleController->Restart();
+    m_jumpgateSubtitleController->SweepStartupOrphans();
+  }
 
   auto authorityTransaction = m_playbackAuthority.BeginTransaction();
   const bool finished = committed ? authorityTransaction.CommitProfileMutation(token)
@@ -3444,7 +3607,10 @@ void CXBMCApp::ProcessSlow()
 
   // Apply source claims on the Kodi main thread before Trakt evaluates playback state.
   if (m_externalPlayerMode.load(std::memory_order_relaxed))
+  {
     ProcessPlaybackSourceClaim();
+    ProcessJumpgateSubtitles();
+  }
 
   // Trakt scrobbler: poll for device code auth
   if (m_traktScrobbler && m_externalPlayerMode.load(std::memory_order_relaxed))
@@ -3971,6 +4137,12 @@ void CXBMCApp::onNewIntent(CJNIIntent intent)
     admissionToken = admission->token;
     externalPlaybackPrepared = true;
 
+    if (!m_jumpgateSubtitleController)
+      m_jumpgateSubtitleController =
+          std::make_unique<KODI::JUMPGATE::CAndroidJumpgateSubtitleController>();
+    m_jumpgateSubtitleController->SweepStartupOrphans();
+    m_jumpgateSubtitleController->PrepareGeneration(admissionGeneration);
+
     if (previousResultOwner && previousResultOwner->generation != admissionGeneration)
     {
       call_method<void>(m_context, "supersedeExternalPlayerResult", "(JLjava/lang/String;)V",
@@ -4000,6 +4172,12 @@ void CXBMCApp::onNewIntent(CJNIIntent intent)
     ApplyActiveJumpgateProfile();
     m_traktScrobbler->Initialize();
     const bool pairedProfileBacked = m_traktScrobbler->IsBridgeProfileBacked();
+    KODI::JUMPGATE::ActiveProfile subtitleProfile;
+    if (m_jumpgateProfileRuntime)
+      subtitleProfile = m_jumpgateProfileRuntime->GetActive();
+    const auto subtitleProvider = KODI::JUMPGATE::SelectAndroidJumpgateSubtitleProvider(
+        true, subtitleProfile.selected && subtitleProfile.sourceBacked,
+        subtitleProfile.credentialsValid, subtitleProfile.subtitlesEnabled, false);
 
     m_traktScrobbler->StopForReplacement();
     m_traktScrobbler->SetPlaybackGeneration(admissionGeneration, admissionToken);
@@ -4036,18 +4214,27 @@ void CXBMCApp::onNewIntent(CJNIIntent intent)
       m_traktScrobbler->SetMediaUrl(targetFile);
     }
 
-    // Pass content info to SubtitleDownloader
-    if (!m_subtitleDownloader)
+    // A source-backed profile owns subtitle authority from admission onward. OpenSubtitles
+    // remains available only for the unpaired compatibility path.
+    if (subtitleProvider == KODI::JUMPGATE::AndroidJumpgateSubtitleProvider::OpenSubtitles &&
+        !m_subtitleDownloader)
     {
       m_subtitleDownloader = std::make_unique<SubtitleDownloader>();
       m_subtitleDownloader->Initialize();
-      m_subtitleDownloader->SetLanguages(GetSettingString("subtitle_languages", "en"));
+      m_subtitleDownloader->SetLanguages(subtitleProfile.subtitleLanguages);
     }
-    if (m_subtitleDownloader)
+    if (subtitleProvider == KODI::JUMPGATE::AndroidJumpgateSubtitleProvider::OpenSubtitles &&
+        m_subtitleDownloader)
     {
       m_subtitleDownloader->ClearContentInfo();
       m_subtitleDownloader->SetContentInfo(imdbId, title, year, season, episode);
     }
+    else if (m_subtitleDownloader)
+    {
+      m_subtitleDownloader->Deinitialize();
+      m_subtitleDownloader.reset();
+    }
+    subtitleProfile.ClearSecrets();
 
     // Java normalizes long extras to decimal strings because CJNIIntent has no
     // getLongExtra binding. The int fallback preserves older launchers.

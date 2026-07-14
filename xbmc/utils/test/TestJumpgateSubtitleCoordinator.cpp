@@ -6,6 +6,7 @@
  *  See LICENSES/README.md for more information.
  */
 
+#include "utils/Digest.h"
 #include "utils/JSONVariantParser.h"
 #include "utils/JumpgateSubtitleCoordinator.h"
 
@@ -37,6 +38,8 @@ const std::string BASE_NAME(64, 'c');
 const std::string TEXT_PAYLOAD = "WEBVTT\n\nA\n";
 const std::string INDEX_PAYLOAD = "# VobSub\n";
 const std::vector<std::uint8_t> SUB_PAYLOAD{0x00, 0x00, 0x01, 0xba, 0x44, 0x02};
+const std::string INDEX_SHA256 = "d4e6270fc336d62c9814128f08c7b85861773789fd959c4b804f975929d940ed";
+const std::string SUB_SHA256 = "3724f9de0017a850b18d1c84d3528f127e510f96b1b7aaff6e5cf83dfc9fc61f";
 
 std::vector<std::uint8_t> Bytes(const std::string& value)
 {
@@ -58,33 +61,39 @@ std::string DiscoverResponse()
          "\",\"language\":\"es\",\"format\":\"vtt\",\"label\":\"Spanish - VTT\",\"rank\":2}]}";
 }
 
-std::string ResolveResponse(const std::string& sessionId, bool vobSub, std::int64_t expiresAt)
+std::string ResolveResponse(const std::string& sessionId,
+                            bool vobSub,
+                            std::int64_t expiresAt,
+                            std::size_t textPayloadSize,
+                            const std::string& textSha256)
 {
   if (!vobSub)
   {
     const std::string fileName = BASE_NAME + ".vtt";
-    return "{\"schemaVersion\":1,\"status\":\"ready\",\"artifactId\":\"" + ARTIFACT +
+    return "{\"schemaVersion\":2,\"status\":\"ready\",\"artifactId\":\"" + ARTIFACT +
            "\",\"expiresAt\":" + std::to_string(expiresAt) +
            ",\"expiresAtUnit\":\"unix_ms\",\"parts\":[{\"partNumber\":1,"
            "\"role\":\"subtitle\",\"contentLength\":" +
-           std::to_string(TEXT_PAYLOAD.size()) + ",\"contentType\":\"text/vtt\",\"fileName\":\"" +
+           std::to_string(textPayloadSize) + ",\"contentType\":\"text/vtt\",\"fileName\":\"" +
            fileName + "\",\"path\":\"/v1/subtitles/" + sessionId + "/" + ARTIFACT + "/1/" +
-           fileName + "\"}]}";
+           fileName + "\",\"sha256\":\"" + textSha256 + "\"}]}";
   }
 
   const std::string indexName = BASE_NAME + ".idx";
   const std::string subName = BASE_NAME + ".sub";
-  return "{\"schemaVersion\":1,\"status\":\"ready\",\"artifactId\":\"" + ARTIFACT +
+  return "{\"schemaVersion\":2,\"status\":\"ready\",\"artifactId\":\"" + ARTIFACT +
          "\",\"expiresAt\":" + std::to_string(expiresAt) +
          ",\"expiresAtUnit\":\"unix_ms\",\"parts\":[{\"partNumber\":1,"
          "\"role\":\"index\",\"contentLength\":" +
          std::to_string(INDEX_PAYLOAD.size()) +
          ",\"contentType\":\"application/x-vobsub\",\"fileName\":\"" + indexName +
          "\",\"path\":\"/v1/subtitles/" + sessionId + "/" + ARTIFACT + "/1/" + indexName +
+         "\",\"sha256\":\"" + INDEX_SHA256 +
          "\"},{\"partNumber\":2,\"role\":\"sub\",\"contentLength\":" +
          std::to_string(SUB_PAYLOAD.size()) +
          ",\"contentType\":\"application/octet-stream\",\"fileName\":\"" + subName +
-         "\",\"path\":\"/v1/subtitles/" + sessionId + "/" + ARTIFACT + "/2/" + subName + "\"}]}";
+         "\",\"path\":\"/v1/subtitles/" + sessionId + "/" + ARTIFACT + "/2/" + subName +
+         "\",\"sha256\":\"" + SUB_SHA256 + "\"}]}";
 }
 
 class WorkflowTransport final : public IJumpgateSubtitleTransport
@@ -154,7 +163,10 @@ public:
         }
         response.statusCode = 200;
         response.contentType = "application/json; charset=utf-8";
-        response.body = Bytes(ResolveResponse(sessionId, m_vobSub, m_expiresAt));
+        const std::string textSha256 = KODI::UTILITY::CDigest::Calculate(
+            KODI::UTILITY::CDigest::Type::SHA256, m_textPayload.data(), m_textPayload.size());
+        response.body = Bytes(
+            ResolveResponse(sessionId, m_vobSub, m_expiresAt, m_textPayload.size(), textSha256));
       }
       --m_active;
       m_condition.notify_all();
@@ -183,9 +195,11 @@ public:
     else
     {
       response.contentType = "text/vtt";
-      response.body = Bytes(TEXT_PAYLOAD);
+      response.body = m_textPayload;
     }
     response.contentLength = response.body.size();
+    response.contentEncoding = "identity";
+    response.acceptRanges = "none";
     --m_active;
     m_condition.notify_all();
     return true;
@@ -257,6 +271,12 @@ public:
     m_expiresAt = expiresAt;
   }
 
+  void SetTextPayloadSize(std::size_t size)
+  {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_textPayload.assign(size, 0x41);
+  }
+
   int DiscoverCalls() const
   {
     std::lock_guard<std::mutex> lock(m_mutex);
@@ -314,6 +334,7 @@ private:
   bool m_releaseFirstDiscover{false};
   bool m_cancellationObserved{false};
   std::string m_retryAfter{"1"};
+  std::vector<std::uint8_t> m_textPayload{Bytes(TEXT_PAYLOAD)};
   std::vector<std::string> m_authorizations;
 };
 
@@ -549,6 +570,50 @@ TEST(TestJumpgateSubtitleCoordinator, RejectsArtifactThatExpiresBeforePublicatio
   EXPECT_TRUE(completion->artifact.parts.empty());
   EXPECT_EQ(transport->DownloadCalls(), 0);
   EXPECT_TRUE(coordinator.Stop());
+}
+
+TEST(TestJumpgateSubtitleCoordinator, CompletedPayloadReturnedBeforeCancelClearsOffCaller)
+{
+  auto transport = std::make_shared<WorkflowTransport>();
+  transport->SetTextPayloadSize(8ULL * 1024ULL * 1024ULL);
+  std::mutex observationMutex;
+  std::condition_variable observationCondition;
+  bool published = false;
+  bool cleared = false;
+  std::thread::id clearThread;
+  JumpgateSubtitleCoordinatorOptions options = Options();
+  options.completionPublishedObserver = [&](const JumpgateSubtitleBinding&)
+  {
+    std::lock_guard lock(observationMutex);
+    published = true;
+    observationCondition.notify_all();
+  };
+  options.completionClearObserver = [&](const JumpgateSubtitleCompletion& completion)
+  {
+    std::lock_guard lock(observationMutex);
+    clearThread = std::this_thread::get_id();
+    cleared = completion.artifact.parts.empty();
+    observationCondition.notify_all();
+  };
+  CJumpgateSubtitleCoordinator coordinator{transport, std::move(options)};
+  const JumpgateSubtitleBinding binding = Binding(9);
+  ASSERT_TRUE(coordinator.Queue(Request(binding)));
+  {
+    std::unique_lock lock(observationMutex);
+    ASSERT_TRUE(observationCondition.wait_for(lock, 5s, [&] { return published; }));
+  }
+
+  std::optional<JumpgateSubtitleCompletion> completion = coordinator.TakeCompletion(binding);
+  ASSERT_TRUE(completion);
+  ASSERT_TRUE(coordinator.ReturnCompletion(std::move(*completion)));
+  const std::thread::id caller = std::this_thread::get_id();
+  ASSERT_TRUE(coordinator.Cancel(binding));
+  {
+    std::unique_lock lock(observationMutex);
+    ASSERT_TRUE(observationCondition.wait_for(lock, 5s, [&] { return cleared; }));
+  }
+  EXPECT_NE(clearThread, caller);
+  EXPECT_TRUE(coordinator.Stop(1s));
 }
 
 TEST(TestJumpgateSubtitleCoordinator, StopOwnsCoordinatorUntilBlockedWorkerIsJoined)

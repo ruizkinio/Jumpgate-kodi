@@ -14,6 +14,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -62,6 +63,9 @@ struct JumpgateSubtitleCoordinatorOptions
   std::chrono::milliseconds retryAfterSecond{std::chrono::seconds{1}};
   std::chrono::milliseconds softFailureDelay{std::chrono::milliseconds{250}};
   std::function<std::int64_t()> nowMilliseconds;
+  std::function<bool()> requestSafeTransportCancellation;
+  std::function<void(const JumpgateSubtitleCompletion&)> completionClearObserver;
+  std::function<void(const JumpgateSubtitleBinding&)> completionPublishedObserver;
 };
 
 class CJumpgateSubtitleCoordinator final
@@ -79,6 +83,7 @@ public:
   bool Queue(JumpgateSubtitleRequest request);
   bool Cancel(const JumpgateSubtitleBinding& binding);
   std::optional<JumpgateSubtitleCompletion> TakeCompletion(const JumpgateSubtitleBinding& binding);
+  bool ReturnCompletion(JumpgateSubtitleCompletion&& completion);
 
   bool Stop(std::chrono::milliseconds timeout = std::chrono::milliseconds{3500});
 
@@ -107,13 +112,15 @@ private:
     std::shared_ptr<CJumpgateSubtitleCancellationSource> activeCancellation;
     std::optional<JumpgateSubtitleBinding> latestBinding;
     std::optional<JumpgateSubtitleCompletion> completion;
+    std::deque<JumpgateSubtitleCompletion> discardedCompletions;
     bool stopping{false};
     bool finished{false};
   };
 
   static bool SameBinding(const JumpgateSubtitleBinding& left,
                           const JumpgateSubtitleBinding& right);
-  static void ClearCompletion(JumpgateSubtitleCompletion& completion);
+  static void ClearCompletion(const std::shared_ptr<WorkerState>& state,
+                              JumpgateSubtitleCompletion& completion);
   static JumpgateSubtitleCompletion Execute(const std::shared_ptr<WorkerState>& state,
                                             Job& job,
                                             CJumpgateSubtitleClient& client);
@@ -125,6 +132,7 @@ private:
   mutable std::mutex m_ownerMutex;
   std::shared_ptr<WorkerState> m_state;
   std::shared_ptr<CJumpgateThreadRegistry> m_registry;
+  CJumpgateThreadRegistry::Reservation m_registryReservation;
   std::thread m_worker;
 };
 

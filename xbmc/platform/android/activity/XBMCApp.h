@@ -53,6 +53,7 @@ class SubtitleDownloader;
 namespace KODI::JUMPGATE
 {
 class CAndroidJumpgateCredentialStore;
+class CAndroidJumpgateSubtitleController;
 class CJumpgateProfileRuntime;
 class CJumpgateProfileStorage;
 class CJumpgatePlaybackClaimCoordinator;
@@ -307,6 +308,9 @@ private:
   void DeliverPendingExternalPlayerResult(
       KODI::JUMPGATE::CJumpgatePlaybackResultState::LifecycleOperation& lifecycleOperation);
   void ProcessPlaybackSourceClaim();
+  void QueueJumpgateSubtitles(uint64_t generation);
+  void ProcessJumpgateSubtitles();
+  void StopJumpgateSubtitleController(bool playerMayRead, bool waitForCompletion = true);
   bool SavePairedPlaybackHistory(bool explicitEnd, uint64_t generation = 0);
   void LoadAndApplyPairedPlaybackResume(uint64_t generation);
   void ReleasePlaybackSourceClaim();
@@ -394,9 +398,11 @@ private:
   uint64_t m_playbackClaimGeneration{0};
   uint64_t m_submittedPlaybackClaimGeneration{0};
   std::string m_submittedPlaybackClaimProfileId;
+  std::string m_submittedPlaybackClaimDeviceId;
   std::string m_submittedPlaybackClaimOrigin;
   std::string m_activePlaybackClaimSessionId;
   std::string m_activePlaybackClaimProfileId;
+  std::string m_activePlaybackClaimDeviceId;
   std::string m_activePlaybackClaimOrigin;
   KODI::JUMPGATE::CJumpgatePlaybackHistoryState m_playbackHistoryState;
   KODI::JUMPGATE::CJumpgatePlaybackAuthority m_playbackAuthority;
@@ -426,6 +432,7 @@ private:
 
   // Subtitle downloader (external player mode only)
   std::unique_ptr<SubtitleDownloader> m_subtitleDownloader;
+  std::unique_ptr<KODI::JUMPGATE::CAndroidJumpgateSubtitleController> m_jumpgateSubtitleController;
 
 public:
   // CJNISurfaceHolderCallback interface

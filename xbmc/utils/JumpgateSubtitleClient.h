@@ -107,6 +107,8 @@ struct JumpgateSubtitleHttpResponse final
   std::string contentType;
   std::optional<std::uint64_t> contentLength;
   std::string retryAfter;
+  std::string contentEncoding;
+  std::string acceptRanges;
   std::vector<std::uint8_t> body;
 };
 
@@ -152,6 +154,7 @@ struct JumpgateSubtitlePartDescriptor
   std::string contentType;
   std::string fileName;
   std::string path;
+  std::string sha256;
 };
 
 struct JumpgateSubtitleArtifactDescriptor

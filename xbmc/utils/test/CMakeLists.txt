@@ -1,4 +1,6 @@
 set(SOURCES TestAlarmClock.cpp
+            TestAndroidJumpgateSubtitleIntegration.cpp
+            TestAndroidJumpgateSubtitleProduction.cpp
             TestAliasShortcutUtils.cpp
             TestArchive.cpp
             TestArtUtils.cpp
@@ -73,6 +75,11 @@ set(SOURCES TestAlarmClock.cpp
             TestXBMCTinyXML.cpp
             TestXBMCTinyXML2.cpp
             TestXMLUtils.cpp)
+
+if(NOT CORE_SYSTEM_NAME STREQUAL android)
+  list(APPEND SOURCES ../../platform/android/activity/AndroidJumpgateSubtitleFileStore.cpp
+                      ../../platform/android/activity/AndroidJumpgateSubtitleTransport.cpp)
+endif()
 
 if(TARGET ${APP_NAME_LC}::Bluray)
   list(APPEND SOURCES TestBluray.cpp)

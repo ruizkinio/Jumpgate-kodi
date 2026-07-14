@@ -429,7 +429,88 @@ TEST(TestJumpgateApplicationLifecycleStatic, AndroidDestroyQuiescesBeforeTheFina
   ASSERT_FALSE(finalDrain.empty());
   EXPECT_NE(onDestroy.find("m_traktScrobbler->Deinitialize(false);"), std::string::npos);
   EXPECT_NE(finalDrain.find("m_traktScrobbler->Deinitialize(true);"), std::string::npos);
-  EXPECT_LT(finalDrain.find("m_traktScrobbler->Deinitialize(true);"),
-            finalDrain.find("CJumpgateThreadRegistry::Global()->JoinAll();"));
+  const std::size_t deinitializeScrobbler =
+      finalDrain.find("m_traktScrobbler->Deinitialize(true);");
+  const std::size_t boundedWorkerDrain =
+      finalDrain.find("CJumpgateThreadRegistry::Global()->JoinAll(");
+  ASSERT_NE(deinitializeScrobbler, std::string::npos);
+  ASSERT_NE(boundedWorkerDrain, std::string::npos);
+  EXPECT_LT(deinitializeScrobbler, boundedWorkerDrain);
   EXPECT_EQ(Count(trakt, "XFILE::CCurlFile "), Count(trakt, ".SetTotalTimeout("));
+}
+
+TEST(TestJumpgateApplicationLifecycleStatic,
+     AndroidSubtitlesCommitTerminalAndQuiesceBeforeCleanupOrServiceDrain)
+{
+  const std::string app = ReadKodiSource("platform/android/activity/XBMCApp.cpp");
+  const std::string subtitles =
+      ReadKodiSource("platform/android/activity/AndroidJumpgateSubtitleTransport.cpp");
+  ASSERT_FALSE(app.empty());
+  ASSERT_FALSE(subtitles.empty());
+
+  const std::string terminal = FunctionBody(app, "CXBMCApp::CommitExternalPlaybackTerminal(");
+  const std::string onDestroy = FunctionBody(app, "void CXBMCApp::onDestroy()");
+  const std::string deinitialize = FunctionBody(app, "void CXBMCApp::Deinitialize()");
+  const std::string transition =
+      FunctionBody(app, "CXBMCApp::PrepareJumpgateProfileAuthorityTransition()");
+  const std::string finishTransition =
+      FunctionBody(app, "CXBMCApp::FinishJumpgateProfileAuthorityTransition(");
+  const std::string stop =
+      FunctionBody(subtitles, "void CAndroidJumpgateSubtitleController::Stop(");
+  ASSERT_FALSE(terminal.empty());
+  ASSERT_FALSE(onDestroy.empty());
+  ASSERT_FALSE(deinitialize.empty());
+  ASSERT_FALSE(transition.empty());
+  ASSERT_FALSE(finishTransition.empty());
+  ASSERT_FALSE(stop.empty());
+
+  const std::size_t terminalCommit = terminal.find("CommitPlaybackTerminal(token, started)");
+  const std::size_t terminalSubtitles = terminal.find("OnPlaybackTerminal(terminal->generation)");
+  const std::size_t deinitializeSubtitles =
+      deinitialize.find("StopJumpgateSubtitleController(false)");
+  const std::size_t deinitializeDrain =
+      deinitialize.find("CJumpgateThreadRegistry::Global()->JoinAll(");
+  const std::size_t transitionSubtitles = transition.find("StopJumpgateSubtitleController(false)");
+  const std::size_t transitionClaim = transition.find("ReleasePlaybackSourceClaim()");
+  const std::size_t coordinatorStop = stop.find("coordinator->Stop(");
+  const std::size_t lifecycleShutdown = stop.find("m_lifecycle.Shutdown(playerMayRead)");
+  const std::size_t stageStop = stop.find("worker->Stop(");
+  ASSERT_NE(terminalCommit, std::string::npos);
+  ASSERT_NE(terminalSubtitles, std::string::npos);
+  ASSERT_NE(deinitializeSubtitles, std::string::npos);
+  ASSERT_NE(deinitializeDrain, std::string::npos);
+  ASSERT_NE(transitionSubtitles, std::string::npos);
+  ASSERT_NE(transitionClaim, std::string::npos);
+  ASSERT_NE(coordinatorStop, std::string::npos);
+  ASSERT_NE(lifecycleShutdown, std::string::npos);
+  ASSERT_NE(stageStop, std::string::npos);
+  ASSERT_NE(finishTransition.find("m_jumpgateSubtitleController->Restart()"), std::string::npos);
+  EXPECT_LT(terminalCommit, terminalSubtitles);
+  EXPECT_NE(onDestroy.find("StopJumpgateSubtitleController(true, false)"), std::string::npos);
+  EXPECT_LT(deinitializeSubtitles, deinitializeDrain);
+  EXPECT_LT(transitionSubtitles, transitionClaim);
+  EXPECT_LT(coordinatorStop, lifecycleShutdown);
+  EXPECT_LT(lifecycleShutdown, stageStop);
+}
+
+TEST(TestJumpgateApplicationLifecycleStatic, AndroidSubtitleCurlUsesOnlySafeCancellationControls)
+{
+  const std::string transport =
+      ReadKodiSource("platform/android/activity/AndroidJumpgateSubtitleTransport.cpp");
+  ASSERT_FALSE(transport.empty());
+
+  const std::string execute =
+      FunctionBody(transport, "bool Execute(const JumpgateSubtitleHttpRequest& request,");
+  const std::string cancel = FunctionBody(transport, "void RequestSafeCancellation() override");
+  ASSERT_FALSE(execute.empty());
+  ASSERT_FALSE(cancel.empty());
+  EXPECT_NE(execute.find("if (m_activeCurl)"), std::string::npos);
+  EXPECT_NE(execute.find("curl.SetRetry(false);"), std::string::npos);
+  EXPECT_NE(execute.find("curl.SetAcceptEncoding(\"identity\");"), std::string::npos);
+  EXPECT_NE(execute.find("curl.SetRequestHeader(\"Range\", \"\");"), std::string::npos);
+  EXPECT_NE(execute.find("redirect-limit\", \"0\""), std::string::npos);
+  EXPECT_NE(cancel.find("m_activeCurl->Cancel();"), std::string::npos);
+  EXPECT_EQ(cancel.find("Close("), std::string::npos);
+  EXPECT_EQ(cancel.find("ClearSensitiveState("), std::string::npos);
+  EXPECT_EQ(cancel.find("reset("), std::string::npos);
 }

@@ -1,5 +1,7 @@
 set(SOURCES android_main.cpp
             AndroidJumpgateCredentialStore.cpp
+            AndroidJumpgateSubtitleFileStore.cpp
+            AndroidJumpgateSubtitleTransport.cpp
             AndroidJoyStick.cpp
             AndroidKey.cpp
             AndroidMouse.cpp
@@ -29,6 +31,8 @@ set(SOURCES android_main.cpp
 
 set(HEADERS AndroidJoyStick.h
             AndroidJumpgateCredentialStore.h
+            AndroidJumpgateSubtitleFileStore.h
+            AndroidJumpgateSubtitleTransport.h
             AndroidKey.h
             AndroidMouse.h
             AndroidTouch.h

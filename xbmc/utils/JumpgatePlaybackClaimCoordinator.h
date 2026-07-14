@@ -98,6 +98,7 @@ private:
 
   std::shared_ptr<WorkerState> m_state;
   std::shared_ptr<CJumpgateThreadRegistry> m_registry;
+  CJumpgateThreadRegistry::Reservation m_registryReservation;
   std::thread m_worker;
 };
 

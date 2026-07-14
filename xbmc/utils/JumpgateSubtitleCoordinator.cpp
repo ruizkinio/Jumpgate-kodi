@@ -15,6 +15,8 @@ namespace KODI::JUMPGATE
 {
 namespace
 {
+constexpr std::size_t MAX_DISCARDED_COMPLETIONS = 4;
+
 std::int64_t SystemNowMilliseconds()
 {
   return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -52,6 +54,9 @@ CJumpgateSubtitleCoordinator::CJumpgateSubtitleCoordinator(
   {
     return;
   }
+  m_registryReservation = m_registry->Reserve();
+  if (!m_registryReservation)
+    return;
   if (!options.nowMilliseconds)
     options.nowMilliseconds = SystemNowMilliseconds;
   m_state = std::make_shared<WorkerState>(std::move(transport), std::move(options));
@@ -82,6 +87,7 @@ bool CJumpgateSubtitleCoordinator::Queue(JumpgateSubtitleRequest request)
   const std::shared_ptr<WorkerState> state = m_state;
   if (!state)
     return false;
+  bool requestSafeCancellation = false;
   {
     std::lock_guard<std::mutex> lock(state->mutex);
     if (state->stopping ||
@@ -89,22 +95,29 @@ bool CJumpgateSubtitleCoordinator::Queue(JumpgateSubtitleRequest request)
     {
       return false;
     }
+    if (state->completion)
+    {
+      if (state->discardedCompletions.size() >= MAX_DISCARDED_COMPLETIONS)
+        return false;
+      state->discardedCompletions.emplace_back(std::move(*state->completion));
+      state->completion.reset();
+    }
     if (state->activeCancellation)
+    {
       state->activeCancellation->Cancel();
+      requestSafeCancellation = true;
+    }
     if (state->pending)
     {
       state->pending->cancellation->Cancel();
       state->pending.reset();
     }
-    if (state->completion)
-    {
-      ClearCompletion(*state->completion);
-      state->completion.reset();
-    }
     state->latestBinding = request.binding;
     state->pending = Job{std::move(request), std::move(cancellation)};
   }
   state->condition.notify_all();
+  if (requestSafeCancellation && state->options.requestSafeTransportCancellation)
+    state->options.requestSafeTransportCancellation();
   return true;
 }
 
@@ -114,24 +127,33 @@ bool CJumpgateSubtitleCoordinator::Cancel(const JumpgateSubtitleBinding& binding
   const std::shared_ptr<WorkerState> state = m_state;
   if (!state)
     return false;
+  bool requestSafeCancellation = false;
   {
     std::lock_guard<std::mutex> lock(state->mutex);
     if (state->stopping || !state->latestBinding || !SameBinding(*state->latestBinding, binding))
       return false;
+    if (state->completion && SameBinding(state->completion->binding, binding))
+    {
+      if (state->discardedCompletions.size() < MAX_DISCARDED_COMPLETIONS)
+      {
+        state->discardedCompletions.emplace_back(std::move(*state->completion));
+        state->completion.reset();
+      }
+    }
     if (state->activeCancellation)
+    {
       state->activeCancellation->Cancel();
+      requestSafeCancellation = true;
+    }
     if (state->pending && SameBinding(state->pending->request.binding, binding))
     {
       state->pending->cancellation->Cancel();
       state->pending.reset();
     }
-    if (state->completion && SameBinding(state->completion->binding, binding))
-    {
-      ClearCompletion(*state->completion);
-      state->completion.reset();
-    }
   }
   state->condition.notify_all();
+  if (requestSafeCancellation && state->options.requestSafeTransportCancellation)
+    state->options.requestSafeTransportCancellation();
   return true;
 }
 
@@ -153,32 +175,55 @@ std::optional<JumpgateSubtitleCompletion> CJumpgateSubtitleCoordinator::TakeComp
   return completion;
 }
 
+bool CJumpgateSubtitleCoordinator::ReturnCompletion(JumpgateSubtitleCompletion&& completion)
+{
+  std::lock_guard<std::mutex> ownerLock(m_ownerMutex);
+  const std::shared_ptr<WorkerState> state = m_state;
+  if (!state)
+    return false;
+
+  std::lock_guard<std::mutex> lock(state->mutex);
+  if (state->stopping || state->completion || !state->latestBinding ||
+      !SameBinding(*state->latestBinding, completion.binding))
+  {
+    return false;
+  }
+  state->completion = std::move(completion);
+  return true;
+}
+
 bool CJumpgateSubtitleCoordinator::Stop(std::chrono::milliseconds timeout)
 {
   std::lock_guard<std::mutex> ownerLock(m_ownerMutex);
   const std::shared_ptr<WorkerState> state = m_state;
   if (!state)
     return true;
+  bool requestSafeCancellation = false;
   {
     std::lock_guard<std::mutex> lock(state->mutex);
     if (!state->stopping)
     {
       state->stopping = true;
+      if (state->completion && state->discardedCompletions.size() < MAX_DISCARDED_COMPLETIONS)
+      {
+        state->discardedCompletions.emplace_back(std::move(*state->completion));
+        state->completion.reset();
+      }
       if (state->activeCancellation)
+      {
         state->activeCancellation->Cancel();
+        requestSafeCancellation = true;
+      }
       if (state->pending)
       {
         state->pending->cancellation->Cancel();
         state->pending.reset();
       }
-      if (state->completion)
-      {
-        ClearCompletion(*state->completion);
-        state->completion.reset();
-      }
     }
   }
   state->condition.notify_all();
+  if (requestSafeCancellation && state->options.requestSafeTransportCancellation)
+    state->options.requestSafeTransportCancellation();
 
   bool finishedBeforeDeadline = false;
   {
@@ -191,10 +236,11 @@ bool CJumpgateSubtitleCoordinator::Stop(std::chrono::milliseconds timeout)
   {
     if (m_worker.joinable())
       m_worker.join();
+    m_registryReservation.Reset();
   }
   else if (m_worker.joinable())
   {
-    m_registry->Adopt(std::move(m_worker),
+    m_registry->Adopt(m_worker, std::move(m_registryReservation),
                       [state](std::chrono::milliseconds waitTime)
                       {
                         std::unique_lock<std::mutex> lock(state->mutex);
@@ -214,7 +260,8 @@ bool CJumpgateSubtitleCoordinator::SameBinding(const JumpgateSubtitleBinding& le
          left.sessionId == right.sessionId;
 }
 
-void CJumpgateSubtitleCoordinator::ClearCompletion(JumpgateSubtitleCompletion& completion)
+void CJumpgateSubtitleCoordinator::ClearCompletion(const std::shared_ptr<WorkerState>& state,
+                                                   JumpgateSubtitleCompletion& completion)
 {
   for (JumpgateSubtitleStagedPart& part : completion.artifact.parts)
   {
@@ -228,6 +275,16 @@ void CJumpgateSubtitleCoordinator::ClearCompletion(JumpgateSubtitleCompletion& c
   completion.artifact.selected = {};
   completion.artifact.artifactId.clear();
   completion.artifact.expiresAt = 0;
+  if (state->options.completionClearObserver)
+  {
+    try
+    {
+      state->options.completionClearObserver(completion);
+    }
+    catch (...)
+    {
+    }
+  }
 }
 
 JumpgateSubtitleCompletion CJumpgateSubtitleCoordinator::Execute(
@@ -283,14 +340,14 @@ JumpgateSubtitleCompletion CJumpgateSubtitleCoordinator::Execute(
   completion.httpStatus = resolved.httpStatus;
   if (resolved.status != JumpgateSubtitleResultStatus::Success)
   {
-    ClearCompletion(completion);
+    ClearCompletion(state, completion);
     return completion;
   }
   if (resolved.artifact.expiresAt <= 0 ||
       resolved.artifact.expiresAt <= state->options.nowMilliseconds())
   {
     completion.status = JumpgateSubtitleResultStatus::Stale;
-    ClearCompletion(completion);
+    ClearCompletion(state, completion);
     return completion;
   }
 
@@ -302,7 +359,7 @@ JumpgateSubtitleCompletion CJumpgateSubtitleCoordinator::Execute(
     if (resolved.artifact.expiresAt <= state->options.nowMilliseconds())
     {
       completion.status = JumpgateSubtitleResultStatus::Stale;
-      ClearCompletion(completion);
+      ClearCompletion(state, completion);
       return completion;
     }
 
@@ -325,7 +382,7 @@ JumpgateSubtitleCompletion CJumpgateSubtitleCoordinator::Execute(
     completion.httpStatus = downloaded.httpStatus;
     if (downloaded.status != JumpgateSubtitleResultStatus::Success)
     {
-      ClearCompletion(completion);
+      ClearCompletion(state, completion);
       return completion;
     }
     completion.artifact.parts.emplace_back(std::move(downloaded.part));
@@ -334,7 +391,7 @@ JumpgateSubtitleCompletion CJumpgateSubtitleCoordinator::Execute(
   if (resolved.artifact.expiresAt <= state->options.nowMilliseconds())
   {
     completion.status = JumpgateSubtitleResultStatus::Stale;
-    ClearCompletion(completion);
+    ClearCompletion(state, completion);
     return completion;
   }
   completion.status = JumpgateSubtitleResultStatus::Success;
@@ -360,34 +417,72 @@ void CJumpgateSubtitleCoordinator::Run(const std::shared_ptr<WorkerState>& state
   while (true)
   {
     std::optional<Job> job;
+    std::optional<JumpgateSubtitleCompletion> discardedCompletion;
     {
       std::unique_lock<std::mutex> lock(state->mutex);
       state->condition.wait(lock,
-                            [&state] { return state->stopping || state->pending.has_value(); });
-      if (state->stopping && !state->pending)
+                            [&state]
+                            {
+                              return state->stopping || state->pending.has_value() ||
+                                     !state->discardedCompletions.empty();
+                            });
+      if (!state->discardedCompletions.empty())
+      {
+        discardedCompletion = std::move(state->discardedCompletions.front());
+        state->discardedCompletions.pop_front();
+      }
+      else if (state->stopping && state->completion)
+      {
+        discardedCompletion = std::move(state->completion);
+        state->completion.reset();
+      }
+      else if (state->stopping && !state->pending)
         break;
-      job = std::move(state->pending);
-      state->pending.reset();
-      state->activeCancellation = job->cancellation;
+      else
+      {
+        job = std::move(state->pending);
+        state->pending.reset();
+        state->activeCancellation = job->cancellation;
+      }
+    }
+
+    if (discardedCompletion)
+    {
+      ClearCompletion(state, *discardedCompletion);
+      continue;
     }
 
     JumpgateSubtitleCompletion completion = Execute(state, *job, client);
+    std::optional<JumpgateSubtitleCompletion> supersededCompletion;
+    bool current = false;
+    bool published = false;
     {
       std::lock_guard<std::mutex> lock(state->mutex);
-      const bool current = !state->stopping && state->latestBinding &&
-                           SameBinding(*state->latestBinding, job->request.binding) &&
-                           !job->cancellation->Token().IsCancelled();
+      current = !state->stopping && state->latestBinding &&
+                SameBinding(*state->latestBinding, job->request.binding) &&
+                !job->cancellation->Token().IsCancelled();
       if (state->activeCancellation == job->cancellation)
         state->activeCancellation.reset();
       if (current)
       {
         if (state->completion)
-          ClearCompletion(*state->completion);
+          supersededCompletion = std::move(state->completion);
         state->completion = std::move(completion);
+        published = true;
       }
-      else
+    }
+    if (supersededCompletion)
+      ClearCompletion(state, *supersededCompletion);
+    if (!current)
+      ClearCompletion(state, completion);
+    if (published && state->options.completionPublishedObserver)
+    {
+      try
       {
-        ClearCompletion(completion);
+        state->options.completionPublishedObserver(job->request.binding);
+      }
+      catch (...)
+      {
       }
     }
   }

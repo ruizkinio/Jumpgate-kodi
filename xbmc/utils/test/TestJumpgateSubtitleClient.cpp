@@ -33,6 +33,7 @@ const std::string SELECTOR_A(64, 'a');
 const std::string SELECTOR_B(64, 'b');
 const std::string ARTIFACT = "artifact_00000001";
 const std::string BASE_NAME(64, 'c');
+const std::string TEXT_SHA256 = "56db31420cc3d2ec7c1fb467c036051bf463c64fe95f07a5536317476a1afc72";
 
 std::vector<std::uint8_t> Bytes(const std::string& value)
 {
@@ -48,6 +49,8 @@ struct Reply
   std::string contentType{"application/json; charset=utf-8"};
   std::optional<std::uint64_t> contentLength;
   std::string retryAfter;
+  std::string contentEncoding{"identity"};
+  std::string acceptRanges{"none"};
   std::vector<std::uint8_t> body;
 };
 
@@ -86,6 +89,8 @@ public:
     response.contentType = std::move(reply.contentType);
     response.contentLength = reply.contentLength;
     response.retryAfter = std::move(reply.retryAfter);
+    response.contentEncoding = std::move(reply.contentEncoding);
+    response.acceptRanges = std::move(reply.acceptRanges);
     response.body = std::move(reply.body);
     return reply.succeeds;
   }
@@ -117,11 +122,12 @@ std::string DiscoverResponse()
 std::string TextResolveResponse(std::uint64_t length = 12)
 {
   const std::string fileName = BASE_NAME + ".vtt";
-  return "{\"schemaVersion\":1,\"status\":\"ready\",\"artifactId\":\"" + ARTIFACT +
+  return "{\"schemaVersion\":2,\"status\":\"ready\",\"artifactId\":\"" + ARTIFACT +
          "\",\"expiresAt\":1783900900000,\"expiresAtUnit\":\"unix_ms\",\"parts\":[{"
          "\"partNumber\":1,\"role\":\"subtitle\",\"contentLength\":" +
          std::to_string(length) + ",\"contentType\":\"text/vtt\",\"fileName\":\"" + fileName +
-         "\",\"path\":\"/v1/subtitles/" + SESSION + "/" + ARTIFACT + "/1/" + fileName + "\"}]}";
+         "\",\"path\":\"/v1/subtitles/" + SESSION + "/" + ARTIFACT + "/1/" + fileName +
+         "\",\"sha256\":\"" + TEXT_SHA256 + "\"}]}";
 }
 
 std::string VobSubResolveResponse(bool sameBase = true)
@@ -129,23 +135,25 @@ std::string VobSubResolveResponse(bool sameBase = true)
   const std::string secondBase = sameBase ? BASE_NAME : std::string(64, 'd');
   const std::string indexName = BASE_NAME + ".idx";
   const std::string subName = secondBase + ".sub";
-  return "{\"schemaVersion\":1,\"status\":\"ready\",\"artifactId\":\"" + ARTIFACT +
+  return "{\"schemaVersion\":2,\"status\":\"ready\",\"artifactId\":\"" + ARTIFACT +
          "\",\"expiresAt\":1783900900000,\"expiresAtUnit\":\"unix_ms\",\"parts\":[{"
          "\"partNumber\":1,\"role\":\"index\",\"contentLength\":11,"
          "\"contentType\":\"application/x-vobsub\",\"fileName\":\"" +
          indexName + "\",\"path\":\"/v1/subtitles/" + SESSION + "/" + ARTIFACT + "/1/" + indexName +
+         "\",\"sha256\":\"" + std::string(64, 'd') +
          "\"},{\"partNumber\":2,\"role\":\"sub\",\"contentLength\":13,"
          "\"contentType\":\"application/octet-stream\",\"fileName\":\"" +
          subName + "\",\"path\":\"/v1/subtitles/" + SESSION + "/" + ARTIFACT + "/2/" + subName +
-         "\"}]}";
+         "\",\"sha256\":\"" + std::string(64, 'e') + "\"}]}";
 }
 
 JumpgateSubtitlePartDescriptor TextDescriptor(std::uint64_t length)
 {
   const std::string fileName = BASE_NAME + ".vtt";
-  return {1,        "subtitle",
-          length,   "text/vtt",
-          fileName, "/v1/subtitles/" + std::string(SESSION) + "/" + ARTIFACT + "/1/" + fileName};
+  return {1,          "subtitle",
+          length,     "text/vtt",
+          fileName,   "/v1/subtitles/" + std::string(SESSION) + "/" + ARTIFACT + "/1/" + fileName,
+          TEXT_SHA256};
 }
 } // namespace
 
@@ -388,7 +396,9 @@ TEST(TestJumpgateSubtitleClient, ParsesExactTextResolutionAndCanonicalDeliveryPa
   ASSERT_EQ(result.artifact.parts.size(), 1u);
   EXPECT_EQ(result.artifact.parts[0].role, "subtitle");
   EXPECT_EQ(result.artifact.parts[0].contentType, "text/vtt");
+  EXPECT_EQ(result.artifact.parts[0].sha256, TEXT_SHA256);
   EXPECT_EQ(transport.urls[0], "https://bridge.example/v1/subtitles/resolve");
+  EXPECT_NE(transport.bodies[0].find("\"responseSchemaVersion\":2"), std::string::npos);
 }
 
 TEST(TestJumpgateSubtitleClient, RejectsMalformedResolveMetadataAndPaths)
@@ -399,7 +409,10 @@ TEST(TestJumpgateSubtitleClient, RejectsMalformedResolveMetadataAndPaths)
       std::regex_replace(valid, std::regex("unix_ms"), "seconds"),
       std::regex_replace(valid, std::regex("1783900900000"), "0"),
       std::regex_replace(valid, std::regex("text/vtt"), "text/plain"),
+      std::regex_replace(valid, std::regex("schemaVersion\\\":2"), "schemaVersion\":1"),
       std::regex_replace(valid, std::regex(R"(contentLength":12)"), R"(contentLength":0)"),
+      std::regex_replace(valid, std::regex(TEXT_SHA256), std::string(64, 'A')),
+      std::regex_replace(valid, std::regex(R"(,"sha256":"[a-f0-9]{64}")"), ""),
       std::regex_replace(valid, std::regex("/1/"), "/2/"),
       std::regex_replace(valid, std::regex("\\.vtt"), ".idx"),
       std::regex_replace(valid, std::regex(R"("role":"subtitle")"),
@@ -414,6 +427,25 @@ TEST(TestJumpgateSubtitleClient, RejectsMalformedResolveMetadataAndPaths)
     EXPECT_EQ(client.Resolve(ORIGIN, authority, SESSION, SELECTOR_A).status,
               JumpgateSubtitleResultStatus::ProtocolFailure)
         << body;
+  }
+}
+
+TEST(TestJumpgateSubtitleClient, RejectsPartAndAggregateMetadataAboveStagingCaps)
+{
+  const std::string oversizedPart = std::regex_replace(
+      TextResolveResponse(), std::regex(R"(contentLength":12)"), R"(contentLength":8388609)");
+  const std::string oversizedAggregate = std::regex_replace(
+      std::regex_replace(VobSubResolveResponse(), std::regex(R"(contentLength":11)"),
+                         R"(contentLength":7340032)"),
+      std::regex(R"(contentLength":13)"), R"(contentLength":6291456)");
+  for (const std::string& body : {oversizedPart, oversizedAggregate})
+  {
+    FakeSubtitleTransport transport;
+    transport.replies.push_back(JsonReply(body));
+    CJumpgateSubtitleClient client{transport};
+    CJumpgateSubtitleBearerAuthority authority{DEVICE_TOKEN};
+    EXPECT_EQ(client.Resolve(ORIGIN, authority, SESSION, SELECTOR_A).status,
+              JumpgateSubtitleResultStatus::ProtocolFailure);
   }
 }
 
@@ -432,6 +464,8 @@ TEST(TestJumpgateSubtitleClient, PreservesOnlyCanonicalTwoPartVobSub)
             valid.artifact.parts[1].fileName.substr(0, 64));
   EXPECT_EQ(valid.artifact.parts[0].role, "index");
   EXPECT_EQ(valid.artifact.parts[1].role, "sub");
+  EXPECT_EQ(valid.artifact.parts[0].sha256, std::string(64, 'd'));
+  EXPECT_EQ(valid.artifact.parts[1].sha256, std::string(64, 'e'));
 
   EXPECT_EQ(client.Resolve(ORIGIN, authority, SESSION, SELECTOR_A).status,
             JumpgateSubtitleResultStatus::ProtocolFailure);
@@ -454,11 +488,37 @@ TEST(TestJumpgateSubtitleClient, ValidatesDeliveryMimeLengthAndComputesChecksum)
 
   ASSERT_EQ(result.status, JumpgateSubtitleResultStatus::Success);
   EXPECT_EQ(result.part.bytes, Bytes(payload));
-  EXPECT_EQ(result.part.sha256, "56db31420cc3d2ec7c1fb467c036051bf463c64fe95f07a5536317476a1afc72");
+  EXPECT_EQ(result.part.sha256, TEXT_SHA256);
   EXPECT_EQ(transport.methods[0], JumpgateSubtitleHttpMethod::Get);
   EXPECT_TRUE(transport.contentTypes[0].empty());
   EXPECT_TRUE(transport.bodies[0].empty());
   EXPECT_EQ(transport.responseCaps[0], payload.size());
+}
+
+TEST(TestJumpgateSubtitleClient, RejectsChecksumEncodingAndRangeContractMismatch)
+{
+  const std::string payload = "WEBVTT\n\nA\n";
+  for (int scenario = 0; scenario < 3; ++scenario)
+  {
+    Reply reply;
+    reply.contentType = "text/vtt";
+    reply.contentLength = payload.size();
+    reply.body = Bytes(payload);
+    JumpgateSubtitlePartDescriptor descriptor = TextDescriptor(payload.size());
+    if (scenario == 0)
+      descriptor.sha256 = std::string(64, '0');
+    else if (scenario == 1)
+      reply.contentEncoding = "gzip";
+    else
+      reply.acceptRanges = "bytes";
+
+    FakeSubtitleTransport transport;
+    transport.replies.push_back(std::move(reply));
+    CJumpgateSubtitleClient client{transport};
+    CJumpgateSubtitleBearerAuthority authority{DEVICE_TOKEN};
+    EXPECT_EQ(client.Download(ORIGIN, authority, descriptor).status,
+              JumpgateSubtitleResultStatus::ProtocolFailure);
+  }
 }
 
 TEST(TestJumpgateSubtitleClient, RejectsDeliveryMetadataMismatchAndCrossOriginCompletion)

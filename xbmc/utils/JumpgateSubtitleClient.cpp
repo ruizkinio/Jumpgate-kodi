@@ -32,7 +32,8 @@ constexpr std::size_t MAX_JSON_RESPONSE_BYTES = 256 * 1024;
 constexpr std::size_t MAX_REQUEST_BODY_BYTES = 2 * 1024;
 constexpr std::size_t MAX_DISCOVERED_SUBTITLES = 128;
 constexpr std::size_t MAX_LANGUAGE_PREFERENCES = 16;
-constexpr std::uint64_t MAX_PART_BYTES = 64ULL * 1024ULL * 1024ULL;
+constexpr std::uint64_t MAX_PART_BYTES = 8ULL * 1024ULL * 1024ULL;
+constexpr std::uint64_t MAX_ARTIFACT_BYTES = 12ULL * 1024ULL * 1024ULL;
 constexpr std::int64_t MAX_DATE_MILLISECONDS = 8640000000000000LL;
 
 void SecureClear(std::string& value)
@@ -379,6 +380,7 @@ bool SerializeResolveRequest(const std::string& sessionId,
   CVariant root{CVariant::VariantTypeObject};
   root["sessionId"] = sessionId;
   root["selector"] = selector;
+  root["responseSchemaVersion"] = 2;
   return CJSONVariantWriter::Write(root, body, true) && body.size() <= MAX_REQUEST_BODY_BYTES;
 }
 
@@ -448,7 +450,7 @@ bool ParseResolveResponse(const std::vector<std::uint8_t>& bytes,
       !HasOnlyMembers(
           root, {"schemaVersion", "status", "artifactId", "expiresAt", "expiresAtUnit", "parts"}) ||
       !root.isMember("schemaVersion") || !root["schemaVersion"].isInteger() ||
-      root["schemaVersion"].asUnsignedInteger() != 1 || !root.isMember("status") ||
+      root["schemaVersion"].asUnsignedInteger() != 2 || !root.isMember("status") ||
       !root["status"].isString() || root["status"].asString() != "ready" ||
       !root.isMember("artifactId") || !root["artifactId"].isString() ||
       !CJumpgateSubtitleClient::IsCanonicalRouteIdentifier(root["artifactId"].asString()) ||
@@ -465,14 +467,15 @@ bool ParseResolveResponse(const std::vector<std::uint8_t>& bytes,
   parsed.artifactId = root["artifactId"].asString();
   parsed.expiresAt = static_cast<std::int64_t>(expiresAt);
   parsed.parts.reserve(root["parts"].size());
+  std::uint64_t aggregateBytes = 0;
   for (std::size_t index = 0; index < root["parts"].size(); ++index)
   {
     const CVariant& input = root["parts"][static_cast<unsigned int>(index)];
     std::uint64_t partNumber = 0;
     std::uint64_t contentLength = 0;
-    if (!input.isObject() || input.size() != 6 ||
-        !HasOnlyMembers(
-            input, {"partNumber", "role", "contentLength", "contentType", "fileName", "path"}) ||
+    if (!input.isObject() || input.size() != 7 ||
+        !HasOnlyMembers(input, {"partNumber", "role", "contentLength", "contentType", "fileName",
+                                "path", "sha256"}) ||
         !input.isMember("partNumber") || !ReadPositiveInteger(input["partNumber"], 2, partNumber) ||
         partNumber != index + 1 || !input.isMember("role") || !input["role"].isString() ||
         !IsFormat(input["role"].asString()) || !input.isMember("contentLength") ||
@@ -480,7 +483,9 @@ bool ParseResolveResponse(const std::vector<std::uint8_t>& bytes,
         !input.isMember("contentType") || !input["contentType"].isString() ||
         !IsContentType(input["contentType"].asString()) || !input.isMember("fileName") ||
         !input["fileName"].isString() || !IsCanonicalFileName(input["fileName"].asString()) ||
-        !input.isMember("path") || !input["path"].isString())
+        !input.isMember("path") || !input["path"].isString() || !input.isMember("sha256") ||
+        !input["sha256"].isString() || !IsLowerHex(input["sha256"].asString(), 64) ||
+        aggregateBytes > MAX_ARTIFACT_BYTES - contentLength)
     {
       return false;
     }
@@ -492,6 +497,8 @@ bool ParseResolveResponse(const std::vector<std::uint8_t>& bytes,
     part.contentType = input["contentType"].asString();
     part.fileName = input["fileName"].asString();
     part.path = input["path"].asString();
+    part.sha256 = input["sha256"].asString();
+    aggregateBytes += contentLength;
     if (part.path !=
             BuildDeliveryPath(sessionId, parsed.artifactId, part.partNumber, part.fileName) ||
         !IsCanonicalDeliveryPath(part))
@@ -636,6 +643,8 @@ void JumpgateSubtitleHttpResponse::ClearSensitive()
   SecureClear(effectiveUrl);
   SecureClear(redirectUrl);
   retryAfter.clear();
+  contentEncoding.clear();
+  acceptRanges.clear();
 }
 
 CJumpgateSubtitleClient::CJumpgateSubtitleClient(IJumpgateSubtitleTransport& transport)
@@ -750,7 +759,8 @@ JumpgateSubtitlePartResult CJumpgateSubtitleClient::Download(
   if (!IsCanonicalOrigin(bridgeOrigin) || !IsOpaqueToken(authority.m_token) ||
       descriptor.partNumber < 1 || descriptor.partNumber > 2 || descriptor.contentLength < 1 ||
       descriptor.contentLength > MAX_PART_BYTES || !IsContentType(descriptor.contentType) ||
-      !IsCanonicalFileName(descriptor.fileName) || !IsCanonicalPartDescriptor(descriptor))
+      !IsCanonicalFileName(descriptor.fileName) || !IsCanonicalPartDescriptor(descriptor) ||
+      !IsLowerHex(descriptor.sha256, 64))
   {
     result.status = JumpgateSubtitleResultStatus::InvalidRequest;
     return result;
@@ -778,7 +788,9 @@ JumpgateSubtitlePartResult CJumpgateSubtitleClient::Download(
   if (!response.contentLength || *response.contentLength != descriptor.contentLength ||
       response.contentType != descriptor.contentType ||
       response.body.size() != descriptor.contentLength ||
-      response.body.size() > request.maximumResponseBytes)
+      response.body.size() > request.maximumResponseBytes ||
+      (!response.contentEncoding.empty() && response.contentEncoding != "identity") ||
+      response.acceptRanges != "none")
   {
     result.status = JumpgateSubtitleResultStatus::ProtocolFailure;
     return result;
@@ -788,13 +800,14 @@ JumpgateSubtitlePartResult CJumpgateSubtitleClient::Download(
   result.part.role = descriptor.role;
   result.part.contentType = descriptor.contentType;
   result.part.fileName = descriptor.fileName;
-  result.part.sha256 = KODI::UTILITY::CDigest::Calculate(
+  const std::string calculatedSha256 = KODI::UTILITY::CDigest::Calculate(
       KODI::UTILITY::CDigest::Type::SHA256, response.body.data(), response.body.size());
-  if (!IsLowerHex(result.part.sha256, 64))
+  if (!IsLowerHex(calculatedSha256, 64) || calculatedSha256 != descriptor.sha256)
   {
     result.status = JumpgateSubtitleResultStatus::ProtocolFailure;
     return result;
   }
+  result.part.sha256 = calculatedSha256;
   result.part.bytes = std::move(response.body);
   return result;
 }
