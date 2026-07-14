@@ -519,6 +519,29 @@ expect_failure_without_value() {
   fi
 }
 
+expect_failure_diagnostic() {
+  local label="$1"
+  local apk="$2"
+  local abi="$3"
+  local expected_entry="$4"
+  local expected_phase="$5"
+  local output status diagnostic
+  shift 5
+  set +e
+  output="$(verify_apk "$apk" "$abi" "$@" 2>&1)"
+  status="$?"
+  set -e
+  if [[ "$status" -eq 0 ]]; then
+    echo "Expected verifier failure: $label" >&2
+    exit 1
+  fi
+  diagnostic="JUMPGATE_APK_SCAN_REJECT {\"entry\":\"$expected_entry\",\"phase\":\"$expected_phase\"}"
+  if [[ "$output" != *"$diagnostic"* ]]; then
+    echo "Verifier omitted the sanitized finding diagnostic: $label" >&2
+    exit 1
+  fi
+}
+
 base_arm64="$work_dir/base-arm64"
 base_armv7="$work_dir/base-armv7"
 allowed_rsa_pem="$work_dir/allowed-rsa-key.pem"
@@ -936,8 +959,8 @@ copy_fixture "$base_arm64" "$raw_der_asset"
 cp "$allowed_rsa_der" "$raw_der_asset/assets/copied-key.der"
 raw_der_asset_apk="$work_dir/raw-der-asset.apk"
 make_apk "$raw_der_asset" "$raw_der_asset_apk"
-expect_failure_reason raw-der-asset "$raw_der_asset_apk" arm64-v8a \
-  'private signing, deployment, or runtime secret material'
+expect_failure_diagnostic raw-der-asset "$raw_der_asset_apk" arm64-v8a \
+  'assets/copied-key.der' 'raw-private-format'
 
 raw_der_expected_lib="$work_dir/raw-der-expected-lib"
 copy_fixture "$base_arm64" "$raw_der_expected_lib"

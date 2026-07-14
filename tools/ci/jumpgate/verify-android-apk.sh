@@ -448,8 +448,24 @@ UTF8_WHITESPACE_BYTES = tuple(sorted(
 ))
 
 
+scan_entry = None
+scan_phase = 'archive-structure'
+
+
+def set_scan_context(record, phase: str) -> None:
+    global scan_entry, scan_phase
+    scan_entry = None if record is None else record[1].as_posix()
+    scan_phase = phase
+
+
 def fail() -> None:
-    raise ValueError('private key material rejected')
+    detail = {'phase': scan_phase}
+    if scan_entry is not None:
+        detail['entry'] = scan_entry
+    raise ValueError(
+        'JUMPGATE_APK_SCAN_REJECT ' +
+        json.dumps(detail, ensure_ascii=True, separators=(',', ':'), sort_keys=True)
+    )
 
 
 def collect_regular_files() -> list[tuple[pathlib.Path, pathlib.PurePosixPath, int]]:
@@ -1566,12 +1582,14 @@ def scan_known_encodings(record, data, accepted_span, budget: WorkBudget) -> Non
 def main() -> None:
     if os.environ.get('JUMPGATE_TEST_FORCE_SECRET_SCANNER_ERROR') == '1':
         raise RuntimeError('forced scanner error')
+    set_scan_context(None, 'archive-structure')
     files = collect_regular_files()
     budget = WorkBudget()
     expected_record = next((record for record in files if record[1] == allowed_path), None)
     if expected_record is None:
         fail()
 
+    set_scan_context(expected_record, 'allowed-airplay-key')
     with mapped_file(expected_record) as data:
         if data is None:
             fail()
@@ -1597,16 +1615,23 @@ def main() -> None:
         with mapped_file(record) as data:
             if data is None:
                 continue
+            set_scan_context(record, 'raw-private-format')
             scan_raw_private_formats(data, budget)
+            set_scan_context(record, 'json-private-key')
             scan_json_jwk(record, data)
             record_span = accepted_span if record[1] == allowed_path else None
+            set_scan_context(record, 'encoded-private-format')
             scan_encoded_base64_formats(data, record_span, budget)
+            set_scan_context(record, 'text-secret')
             scan_known_encodings(record, data, record_span, budget)
 
 
 try:
     main()
-except BaseException:
+except BaseException as error:
+    message = str(error)
+    if message.startswith('JUMPGATE_APK_SCAN_REJECT '):
+        print(message, file=sys.stderr)
     raise SystemExit(1)
 PY
 then
