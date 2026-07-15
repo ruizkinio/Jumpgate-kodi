@@ -448,6 +448,9 @@ OPENSSH_MAGIC = b'openssh-key-v1\0'
 OPENPGP_SECRET_HEADERS = bytes((
     0xC5, 0xC7, 0x94, 0x95, 0x96, 0x97, 0x9C, 0x9D, 0x9E, 0x9F,
 ))
+MAX_OPENPGP_EC_POINT_BITS = 1059
+OPENPGP_STANDARD_KDF_HASHES = frozenset({8, 9, 10, 12, 14})
+OPENPGP_STANDARD_KDF_CIPHERS = frozenset({7, 8, 9})
 BASE64_BYTES = frozenset(b'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=_-')
 UNICODE_WHITESPACE_CODEPOINTS = (
     *range(0x09, 0x0E), 0x20, 0x85, 0xA0, 0x1680,
@@ -772,6 +775,23 @@ def read_openpgp_mpi(data, cursor: int, end: int):
     return bits, finish
 
 
+def valid_openpgp_oid(value) -> bool:
+    if not value:
+        return False
+    cursor = 0
+    while cursor < len(value):
+        if value[cursor] == 0x80:
+            return False
+        while True:
+            if cursor >= len(value):
+                return False
+            octet = value[cursor]
+            cursor += 1
+            if not octet & 0x80:
+                break
+    return True
+
+
 MAX_OPENPGP_PARTIAL_CHUNKS = 128
 
 
@@ -852,7 +872,7 @@ def openpgp_packet_body(data, offset: int):
     return tag, body, end if not malformed else None, malformed
 
 
-def openpgp_public_layout(data):
+def openpgp_public_layout(data, require_standard_kdf: bool = False):
     end = len(data)
     if end < 10 or data[0] != 4:
         return None
@@ -894,9 +914,16 @@ def openpgp_public_layout(data):
         oid_length = data[cursor]
         if cursor + 1 + oid_length > end:
             return None
+        if not valid_openpgp_oid(data[cursor + 1:cursor + 1 + oid_length]):
+            return None
         cursor += 1 + oid_length
+        point_start = cursor
         point = read_openpgp_mpi(data, cursor, end)
-        if point is None or point[0] < 200:
+        if (
+            point is None
+            or not 200 <= point[0] <= MAX_OPENPGP_EC_POINT_BITS
+            or data[point_start + 2] not in {0x04, 0x40}
+        ):
             return None
         cursor = point[1]
         if algorithm == 18:
@@ -904,6 +931,13 @@ def openpgp_public_layout(data):
                 return None
             kdf_length = data[cursor]
             if cursor + 1 + kdf_length > end:
+                return None
+            if require_standard_kdf and (
+                kdf_length != 3
+                or data[cursor + 1] != 1
+                or data[cursor + 2] not in OPENPGP_STANDARD_KDF_HASHES
+                or data[cursor + 3] not in OPENPGP_STANDARD_KDF_CIPHERS
+            ):
                 return None
             cursor += 1 + kdf_length
         secret_mpi_count = 1
@@ -949,7 +983,7 @@ def openpgp_secret_packet_end(data, offset: int):
     if malformed:
         # Random packet-tag bytes are common in binaries. A malformed bounded
         # chain is private-key-like only after its public key section parses.
-        if openpgp_public_layout(body) is not None:
+        if openpgp_public_layout(body, require_standard_kdf=True) is not None:
             fail()
         return None
     if is_openpgp_secret_body(body):

@@ -1274,13 +1274,34 @@ openpgp_old_packet="$work_dir/openpgp-old-indeterminate.pgp"
 openpgp_partial_packet="$work_dir/openpgp-partial.pgp"
 openpgp_malformed_partial="$work_dir/openpgp-malformed-partial.pgp"
 openpgp_nonsecret_partial="$work_dir/openpgp-nonsecret-partial.pgp"
+openpgp_dex_collision="$work_dir/openpgp-dex-collision.bin"
+openpgp_ec_malformed="$work_dir/openpgp-ec-malformed.pgp"
+openpgp_oid_collision="$work_dir/openpgp-oid-collision.bin"
+openpgp_point_bounds_collision="$work_dir/openpgp-point-bounds-collision.bin"
+openpgp_kdf_policy_collision="$work_dir/openpgp-kdf-policy-collision.bin"
+openpgp_ec_sha3="$work_dir/openpgp-ec-sha3.pgp"
+openpgp_ec_sha224="$work_dir/openpgp-ec-sha224.pgp"
+openpgp_ec_malformed_kdf="$work_dir/openpgp-ec-malformed-kdf.pgp"
+openpgp_ec_standard_variants="$work_dir/openpgp-ec-standard-variants"
+openpgp_ec_control_variants="$work_dir/openpgp-ec-control-variants"
+mkdir -p "$openpgp_ec_standard_variants" "$openpgp_ec_control_variants"
 python3 - \
   "$openpgp_private_key/assets/private-key.asc" \
   "$openpgp_packet" \
   "$openpgp_old_packet" \
   "$openpgp_partial_packet" \
   "$openpgp_malformed_partial" \
-  "$openpgp_nonsecret_partial" <<'PY'
+  "$openpgp_nonsecret_partial" \
+  "$openpgp_dex_collision" \
+  "$openpgp_ec_malformed" \
+  "$openpgp_oid_collision" \
+  "$openpgp_point_bounds_collision" \
+  "$openpgp_kdf_policy_collision" \
+  "$openpgp_ec_sha3" \
+  "$openpgp_ec_sha224" \
+  "$openpgp_ec_malformed_kdf" \
+  "$openpgp_ec_standard_variants" \
+  "$openpgp_ec_control_variants" <<'PY'
 import base64
 import pathlib
 import sys
@@ -1289,6 +1310,11 @@ import sys
 def mpi(value: int) -> bytes:
     encoded = value.to_bytes((value.bit_length() + 7) // 8, 'big')
     return value.bit_length().to_bytes(2, 'big') + encoded
+
+
+def mpi_bytes(value: bytes) -> bytes:
+    bits = value[0].bit_length() + (len(value) - 1) * 8
+    return bits.to_bytes(2, 'big') + value
 
 
 def crc24(data: bytes) -> int:
@@ -1318,6 +1344,34 @@ def partial_packet(tag: int, value: bytes, chunk_size: int = 64) -> bytes:
     output.append(len(remaining))
     output.extend(remaining)
     return bytes(output)
+
+
+def fixed_packet(tag: int, value: bytes) -> bytes:
+    if len(value) < 192:
+        length = bytes([len(value)])
+    elif len(value) <= 8383:
+        adjusted = len(value) - 192
+        length = bytes([192 + (adjusted >> 8), adjusted & 0xFF])
+    else:
+        length = b'\xff' + len(value).to_bytes(4, 'big')
+    return bytes([0xC0 | tag]) + length + value
+
+
+def ec_public(oid: bytes, point: bytes, kdf: bytes) -> bytes:
+    return (
+        b'\x04' + (0).to_bytes(4, 'big') + b'\x12' + bytes([len(oid)]) +
+        oid + mpi_bytes(point) + kdf
+    )
+
+
+def truncated_old_secret_packet(public: bytes) -> bytes:
+    return b'\x96' + (len(public) + 32).to_bytes(4, 'big') + public
+
+
+def complete_ec_secret_packet(public: bytes) -> bytes:
+    secret = mpi((1 << 255) + 0x13579)
+    body = public + b'\x00' + secret + (sum(secret) & 0xFFFF).to_bytes(2, 'big')
+    return fixed_packet(5, body)
 
 
 # Deterministic non-key MPIs create a structurally valid packet without sensitive data.
@@ -1354,6 +1408,69 @@ pathlib.Path(sys.argv[3]).write_bytes(b'\x97' + body)
 pathlib.Path(sys.argv[4]).write_bytes(partial_packet(5, body))
 pathlib.Path(sys.argv[5]).write_bytes(b'\xc5\xe7' + body[:128])
 pathlib.Path(sys.argv[6]).write_bytes(partial_packet(11, b'nonsecret-packet-data-' * 12))
+
+# This malformed old-format packet reproduces the structural collision found in
+# a real classes.dex. Every public field except the EC point prefix is valid.
+dex_oid = bytes.fromhex('121548c28b03c2a2060f08c29001120a08c29101120508')
+dex_public = ec_public(dex_oid, b'\x05' + b'\x01' * 64, b'\x03\x01\x08\x07')
+pathlib.Path(sys.argv[7]).write_bytes(truncated_old_secret_packet(dex_public))
+
+# A standards-shaped P-256 ECDH public section remains rejectable even when the
+# packet is truncated before its secret material.
+p256_oid = bytes.fromhex('2A8648CE3D030107')
+p256_point = b'\x04' + b'\x11' * 64
+standard_ec_public = ec_public(p256_oid, p256_point, b'\x03\x01\x0e\x07')
+pathlib.Path(sys.argv[8]).write_bytes(truncated_old_secret_packet(standard_ec_public))
+
+# Each control below violates one independent malformed-packet predicate.
+pathlib.Path(sys.argv[9]).write_bytes(truncated_old_secret_packet(
+    ec_public(bytes.fromhex('2A8000'), p256_point, b'\x03\x01\x08\x07')
+))
+pathlib.Path(sys.argv[10]).write_bytes(truncated_old_secret_packet(
+    ec_public(p256_oid, b'\x04' + b'\x22' * 133, b'\x03\x01\x08\x07')
+))
+sha224_public = ec_public(p256_oid, p256_point, b'\x03\x01\x0b\x07')
+pathlib.Path(sys.argv[11]).write_bytes(truncated_old_secret_packet(sha224_public))
+
+# Complete secret packets are private material even when they use a stronger,
+# policy-invalid, or malformed-but-bounded KDF declaration.
+sha3_public = ec_public(p256_oid, p256_point, b'\x03\x01\x0e\x07')
+malformed_kdf_public = ec_public(p256_oid, p256_point, b'\x04\x02\x08\x07\x00')
+pathlib.Path(sys.argv[12]).write_bytes(complete_ec_secret_packet(sha3_public))
+pathlib.Path(sys.argv[13]).write_bytes(complete_ec_secret_packet(sha224_public))
+pathlib.Path(sys.argv[14]).write_bytes(complete_ec_secret_packet(malformed_kdf_public))
+
+# Accepted malformed-packet boundaries cover every permitted KDF id, the native
+# point prefix, and the maximum P-521 point width. Each must remain key-like.
+standard_variants = {
+    'native-hash8-cipher8': ec_public(
+        bytes.fromhex('2B060104019755010501'),
+        b'\x40' + b'\x31' * 32,
+        b'\x03\x01\x08\x08',
+    ),
+    'p521-hash12-cipher9': ec_public(
+        bytes.fromhex('2B81040023'), b'\x04' + b'\x41' * 132, b'\x03\x01\x0c\x09'
+    ),
+    'p256-hash9-cipher7': ec_public(
+        p256_oid, p256_point, b'\x03\x01\x09\x07'
+    ),
+    'p256-hash10-cipher7': ec_public(
+        p256_oid, p256_point, b'\x03\x01\x0a\x07'
+    ),
+}
+variant_dir = pathlib.Path(sys.argv[15])
+for name, variant_public in standard_variants.items():
+    (variant_dir / f'{name}.pgp').write_bytes(truncated_old_secret_packet(variant_public))
+
+# These controls isolate each KDF field rejected for malformed packets.
+control_variants = {
+    'kdf-length': ec_public(p256_oid, p256_point, b'\x04\x01\x08\x07\x00'),
+    'kdf-reserved': ec_public(p256_oid, p256_point, b'\x03\x02\x08\x07'),
+    'kdf-cipher': ec_public(p256_oid, p256_point, b'\x03\x01\x08\x06'),
+}
+control_dir = pathlib.Path(sys.argv[16])
+for name, variant_public in control_variants.items():
+    (control_dir / f'{name}.bin').write_bytes(truncated_old_secret_packet(variant_public))
 PY
 openpgp_private_key_apk="$work_dir/openpgp-private-key.apk"
 make_apk "$openpgp_private_key" "$openpgp_private_key_apk"
@@ -1385,6 +1502,67 @@ cp "$openpgp_nonsecret_partial" "$openpgp_nonsecret/assets/nonsecret-packet.pgp"
 openpgp_nonsecret_apk="$work_dir/openpgp-nonsecret-control.apk"
 make_apk "$openpgp_nonsecret" "$openpgp_nonsecret_apk"
 verify_apk "$openpgp_nonsecret_apk" arm64-v8a >/dev/null
+
+openpgp_dex_control="$work_dir/openpgp-dex-control"
+copy_fixture "$base_arm64" "$openpgp_dex_control"
+cp "$openpgp_dex_collision" "$openpgp_dex_control/classes.dex"
+openpgp_dex_control_apk="$work_dir/openpgp-dex-control.apk"
+make_apk "$openpgp_dex_control" "$openpgp_dex_control_apk"
+verify_apk "$openpgp_dex_control_apk" arm64-v8a >/dev/null
+
+for packet_control in oid-collision point-bounds-collision kdf-policy-collision; do
+  openpgp_control="$work_dir/openpgp-$packet_control-control"
+  copy_fixture "$base_arm64" "$openpgp_control"
+  cp "$work_dir/openpgp-$packet_control.bin" "$openpgp_control/classes.dex"
+  openpgp_control_apk="$work_dir/openpgp-$packet_control-control.apk"
+  make_apk "$openpgp_control" "$openpgp_control_apk"
+  verify_apk "$openpgp_control_apk" arm64-v8a >/dev/null
+done
+
+for packet_control in kdf-length kdf-reserved kdf-cipher; do
+  openpgp_control="$work_dir/openpgp-$packet_control-control"
+  copy_fixture "$base_arm64" "$openpgp_control"
+  cp "$openpgp_ec_control_variants/$packet_control.bin" \
+    "$openpgp_control/classes.dex"
+  openpgp_control_apk="$work_dir/openpgp-$packet_control-control.apk"
+  make_apk "$openpgp_control" "$openpgp_control_apk"
+  verify_apk "$openpgp_control_apk" arm64-v8a >/dev/null
+done
+
+openpgp_ec_truncated="$work_dir/openpgp-ec-truncated"
+copy_fixture "$base_arm64" "$openpgp_ec_truncated"
+cp "$openpgp_ec_malformed" "$openpgp_ec_truncated/assets/private-key.pgp"
+openpgp_ec_truncated_apk="$work_dir/openpgp-ec-truncated.apk"
+make_apk "$openpgp_ec_truncated" "$openpgp_ec_truncated_apk"
+expect_failure_reason openpgp-ec-truncated "$openpgp_ec_truncated_apk" arm64-v8a \
+  'private signing, deployment, or runtime secret material'
+
+for packet_variant in \
+  native-hash8-cipher8 \
+  p521-hash12-cipher9 \
+  p256-hash9-cipher7 \
+  p256-hash10-cipher7; do
+  openpgp_boundary="$work_dir/openpgp-$packet_variant-boundary"
+  copy_fixture "$base_arm64" "$openpgp_boundary"
+  cp "$openpgp_ec_standard_variants/$packet_variant.pgp" \
+    "$openpgp_boundary/assets/private-key.pgp"
+  openpgp_boundary_apk="$work_dir/openpgp-$packet_variant-boundary.apk"
+  make_apk "$openpgp_boundary" "$openpgp_boundary_apk"
+  expect_failure_reason "openpgp-$packet_variant" \
+    "$openpgp_boundary_apk" arm64-v8a \
+    'private signing, deployment, or runtime secret material'
+done
+
+for packet_variant in ec-sha3 ec-sha224 ec-malformed-kdf; do
+  openpgp_complete="$work_dir/openpgp-$packet_variant-complete"
+  copy_fixture "$base_arm64" "$openpgp_complete"
+  cp "$work_dir/openpgp-$packet_variant.pgp" \
+    "$openpgp_complete/assets/private-key.pgp"
+  openpgp_complete_apk="$work_dir/openpgp-$packet_variant-complete.apk"
+  make_apk "$openpgp_complete" "$openpgp_complete_apk"
+  expect_failure_reason "openpgp-$packet_variant" "$openpgp_complete_apk" arm64-v8a \
+    'private signing, deployment, or runtime secret material'
+done
 
 private_key_block="$work_dir/private-key-block"
 copy_fixture "$base_arm64" "$private_key_block"
