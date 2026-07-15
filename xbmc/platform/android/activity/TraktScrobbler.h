@@ -10,7 +10,6 @@
 #include "threads/CriticalSection.h"
 #include "utils/JumpgatePlaybackAuthority.h"
 
-#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -76,17 +75,6 @@ public:
   void ForceReAuth();
   bool IsAuthenticatedPublic() const;
 
-  // Bridge resume data (populated by QueryBridgeServer when available)
-  // Uses std::atomic for lock-free cross-thread access (F-009 fix)
-  int64_t GetBridgeResumePosition() const
-  {
-    return m_bridgeResumePositionMs.load(std::memory_order_relaxed);
-  }
-  void ClearBridgeResume() { m_bridgeResumePositionMs.store(0, std::memory_order_relaxed); }
-
-  // Trakt playback sync (cross-device resume)
-  int64_t GetTraktResumePosition();
-
   // Bridge URL
   std::string GetBridgeUrl() const;
   void SetBridgeUrl(const std::string& url);
@@ -122,7 +110,6 @@ private:
                               int season,
                               int episode,
                               const std::string& mediaUrlSnapshot);
-  bool QueryBridgeServer();
   bool FetchLogoFromBridge(const std::string& imdbId, const std::string& mediaUrlSnapshot);
   // Bridge auto-detect
   void DetectBridgeUrl();
@@ -191,10 +178,6 @@ private:
   bool m_bridgeTraktEnabled{false};
   bool m_profileRuntimeApplied{false};
   uint64_t m_authAuthorityGeneration{0};
-
-  // Bridge resume data (from /identify response)
-  // std::atomic for lock-free access from XBMCApp (F-009 fix)
-  std::atomic<int64_t> m_bridgeResumePositionMs{0};
 
   // Periodic scrobble progress update (keeps Trakt /users/me/watching fresh)
   static constexpr int SCROBBLE_UPDATE_INTERVAL_SEC = 10;

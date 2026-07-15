@@ -29,11 +29,10 @@
 #include <cctype>
 #include <charconv>
 #include <chrono>
-#include <cstdio>
 #include <limits>
 #include <mutex>
 #include <regex>
-#include <thread>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -125,51 +124,191 @@ bool AddCanonicalId(CVariant& ids, const std::string& provider, const std::strin
   return true;
 }
 
-bool CanonicalIdMatches(const CVariant& ids,
-                        const std::string& provider,
-                        const std::string& expectedId)
+struct LogUrlOrigin
 {
-  if (!ids.isObject() || !ids.isMember(provider))
-    return false;
-  const CVariant& value = ids[provider];
-  if (value.isString())
-    return value.asString() == expectedId;
-  if (value.isSignedInteger())
-  {
-    const int64_t numeric = value.asInteger();
-    return numeric >= 0 && std::to_string(numeric) == expectedId;
-  }
-  if (value.isUnsignedInteger())
-    return std::to_string(value.asUnsignedInteger()) == expectedId;
-  return false;
+  std::string_view scheme;
+  std::string_view host;
+  std::string_view port;
+
+  constexpr bool IsValid() const noexcept { return !scheme.empty(); }
+};
+
+constexpr bool IsAsciiAlpha(char character)
+{
+  return (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z');
 }
 
-// Avoid leaking full URLs (which may include user identifiers or signed tokens) into logs.
+constexpr bool IsAsciiDigit(char character)
+{
+  return character >= '0' && character <= '9';
+}
+
+constexpr bool IsAsciiAlphaNumeric(char character)
+{
+  return IsAsciiAlpha(character) || IsAsciiDigit(character);
+}
+
+constexpr char ToAsciiLower(char character)
+{
+  return character >= 'A' && character <= 'Z' ? character + ('a' - 'A') : character;
+}
+
+constexpr bool IsUnsafeLogUrlCharacter(char character)
+{
+  const auto byte = static_cast<unsigned char>(character);
+  return byte <= 0x20 || byte >= 0x7f || character == '\\';
+}
+
+constexpr bool IsValidLogUrlScheme(std::string_view scheme)
+{
+  if (scheme.empty() || scheme.size() > 32 || !IsAsciiAlpha(scheme.front()))
+    return false;
+
+  for (std::size_t position = 1; position < scheme.size(); ++position)
+  {
+    const char character = scheme[position];
+    if (!IsAsciiAlphaNumeric(character) && character != '+' && character != '-' && character != '.')
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
+constexpr bool IsValidLogUrlHost(std::string_view host)
+{
+  if (host.empty() || host.size() > 253)
+    return false;
+
+  std::size_t labelStart = 0;
+  for (std::size_t position = 0; position <= host.size(); ++position)
+  {
+    if (position != host.size() && host[position] != '.')
+      continue;
+
+    const std::string_view label = host.substr(labelStart, position - labelStart);
+    if (label.empty() || label.size() > 63 || !IsAsciiAlphaNumeric(label.front()) ||
+        !IsAsciiAlphaNumeric(label.back()))
+    {
+      return false;
+    }
+
+    for (char character : label)
+    {
+      if (!IsAsciiAlphaNumeric(character) && character != '-')
+        return false;
+    }
+    labelStart = position + 1;
+  }
+  return true;
+}
+
+constexpr bool IsValidLogUrlPort(std::string_view port)
+{
+  if (port.empty() || port.size() > 5)
+    return false;
+
+  unsigned int value = 0;
+  for (char character : port)
+  {
+    if (!IsAsciiDigit(character))
+      return false;
+    value = value * 10 + static_cast<unsigned int>(character - '0');
+  }
+  return value >= 1 && value <= 65535;
+}
+
+constexpr LogUrlOrigin ParseUrlOriginForLog(std::string_view rawUrl)
+{
+  for (char character : rawUrl)
+  {
+    if (IsUnsafeLogUrlCharacter(character))
+      return {};
+  }
+
+  const std::size_t schemeEnd = rawUrl.find("://");
+  if (schemeEnd == std::string_view::npos)
+    return {};
+
+  const std::string_view scheme = rawUrl.substr(0, schemeEnd);
+  if (!IsValidLogUrlScheme(scheme))
+    return {};
+
+  const std::size_t authorityStart = schemeEnd + 3;
+  std::size_t authorityEnd = rawUrl.find_first_of("/?#", authorityStart);
+  if (authorityEnd == std::string_view::npos)
+    authorityEnd = rawUrl.size();
+  const std::string_view authority = rawUrl.substr(authorityStart, authorityEnd - authorityStart);
+  if (authority.empty())
+    return {};
+
+  for (char character : authority)
+  {
+    if (character == '@' || character == '%')
+      return {};
+  }
+
+  std::string_view host = authority;
+  std::string_view port;
+  const std::size_t colon = authority.find(':');
+  if (colon != std::string_view::npos)
+  {
+    if (authority.find(':', colon + 1) != std::string_view::npos)
+      return {};
+    host = authority.substr(0, colon);
+    port = authority.substr(colon + 1);
+    if (!IsValidLogUrlPort(port))
+      return {};
+  }
+
+  if (!IsValidLogUrlHost(host))
+    return {};
+  return {scheme, host, port};
+}
+
+constexpr LogUrlOrigin SAFE_LOG_URL_ORIGIN =
+    ParseUrlOriginForLog("HTTPS://Example.TEST:443/private/media?token=secret#fragment");
+static_assert(SAFE_LOG_URL_ORIGIN.IsValid());
+static_assert(SAFE_LOG_URL_ORIGIN.scheme == "HTTPS");
+static_assert(SAFE_LOG_URL_ORIGIN.host == "Example.TEST");
+static_assert(SAFE_LOG_URL_ORIGIN.port == "443");
+static_assert(!ParseUrlOriginForLog("https://viewer:opaque@example.test/private").IsValid());
+static_assert(!ParseUrlOriginForLog("https://viewer@example.test/private").IsValid());
+static_assert(!ParseUrlOriginForLog("https://viewer%40example.test/private").IsValid());
+static_assert(!ParseUrlOriginForLog("https://viewer:opaque/private").IsValid());
+static_assert(!ParseUrlOriginForLog("https:///private").IsValid());
+static_assert(!ParseUrlOriginForLog("not-a-url").IsValid());
+static_assert(!ParseUrlOriginForLog("https://example.test:70000/private").IsValid());
+static_assert(!ParseUrlOriginForLog("https://example.test\\@attacker.test/private").IsValid());
+static_assert(!ParseUrlOriginForLog("https://example..test/private").IsValid());
+static_assert(!ParseUrlOriginForLog("https://example.test/\nprivate").IsValid());
+
+// Avoid leaking URL paths, credentials, user identifiers, or signed tokens into logs.
 std::string RedactUrlForLog(const std::string& rawUrl)
 {
   if (rawUrl.empty())
     return "<empty>";
 
-  std::string s = rawUrl;
-
-  // Strip query/fragment.
-  size_t q = s.find('?');
-  if (q != std::string::npos)
-    s.resize(q);
-  size_t f = s.find('#');
-  if (f != std::string::npos)
-    s.resize(f);
-
-  // Keep origin only: scheme://host[:port]/<redacted>
-  size_t scheme = s.find("://");
-  if (scheme == std::string::npos)
+  const LogUrlOrigin origin = ParseUrlOriginForLog(rawUrl);
+  if (!origin.IsValid())
     return "<redacted>";
 
-  size_t hostStart = scheme + 3;
-  size_t pathStart = s.find('/', hostStart);
-  if (pathStart == std::string::npos)
-    return s + "/<redacted>";
-  return s.substr(0, pathStart) + "/<redacted>";
+  std::string redacted;
+  redacted.reserve(origin.scheme.size() + origin.host.size() + origin.port.size() + 4);
+  const auto appendLower = [&redacted](std::string_view value)
+  {
+    for (char character : value)
+      redacted.push_back(ToAsciiLower(character));
+  };
+  appendLower(origin.scheme);
+  redacted.append("://");
+  appendLower(origin.host);
+  if (!origin.port.empty())
+  {
+    redacted.push_back(':');
+    redacted.append(origin.port);
+  }
+  return redacted;
 }
 
 } // namespace
@@ -657,11 +796,9 @@ void TraktScrobbler::ProcessSlow()
       m_identifyFailed = true;
       CLog::Log(LOGWARNING, "TraktScrobbler: Content identification failed after {}s", elapsed);
 
-      std::string identifyToast = "Could not identify content for scrobbling";
-      if (m_bridgeUrl.find("/_c/") != std::string::npos)
-        identifyToast += " (ensure Configured addon is installed, not Quick)";
-      CGUIDialogKaiToast::QueueNotification(CGUIDialogKaiToast::Warning, "Trakt", identifyToast,
-                                            5000, true);
+      CGUIDialogKaiToast::QueueNotification(CGUIDialogKaiToast::Warning, "Trakt",
+                                            "Could not identify content for scrobbling", 5000,
+                                            true);
     }
   }
 
@@ -1086,7 +1223,6 @@ void TraktScrobbler::ClearContentInfo()
   m_resolvedUrl.clear();
   m_playbackStartTime = 0;
   m_identifyFailed = false;
-  m_bridgeResumePositionMs.store(0, std::memory_order_relaxed);
   m_lastPublicHydrateAttemptTime = 0;
   m_lastPublicHydrateKey.clear();
 }
@@ -1616,106 +1752,6 @@ void TraktScrobbler::DetectBridgeUrl()
   CLog::Log(LOGINFO, "TraktScrobbler: Using cloud Bridge at {}", BRIDGE_CLOUD_URL);
 }
 
-// ---------------------------------------------------------------------------
-// QueryBridgeServer: Called WITHOUT the lock held (from IdentifyContent).
-// Reads bridge URL under brief lock, does HTTP without lock, writes results
-// into output parameters. Caller is responsible for writing to member state.
-// ---------------------------------------------------------------------------
-bool TraktScrobbler::QueryBridgeServer()
-{
-  std::unique_lock lock(m_critSection);
-  const std::string bridgeUrl = NormalizeBridgeUrl(m_bridgeUrl);
-  lock.unlock();
-
-  if (bridgeUrl.empty())
-    return false;
-
-  const std::string identifyUrl = BuildBridgeEndpoint(bridgeUrl, "/identify");
-  if (identifyUrl.empty())
-    return false;
-
-  // Retry a short-lived stream-registration race, but never search another
-  // profile. The selected profile is the only allowed identity boundary.
-  for (int attempt = 0; attempt < 3; ++attempt)
-  {
-    if (attempt > 0)
-    {
-      CLog::Log(LOGDEBUG, "TraktScrobbler: Bridge retry {}/3 after 2s delay", attempt + 1);
-      std::this_thread::sleep_for(std::chrono::seconds(2));
-    }
-
-    XFILE::CCurlFile curl;
-    curl.SetTimeout(3);
-    curl.SetTotalTimeout(5);
-    std::string response;
-    if (!curl.Get(identifyUrl, response))
-    {
-      CLog::Log(LOGDEBUG, "TraktScrobbler: Bridge server query failed (attempt {})", attempt + 1);
-      continue;
-    }
-
-    CVariant data;
-    if (!CJSONVariantParser::Parse(response, data) || !data.isObject())
-      continue;
-    if (!data.isMember("found") || !data["found"].asBoolean())
-      continue;
-
-    const std::string imdb = data["imdb"].asString();
-    if (imdb.empty())
-      continue;
-
-    int season = -1;
-    int episode = -1;
-    const std::string seasonStr = data["season"].asString();
-    const std::string episodeStr = data["episode"].asString();
-    if (!seasonStr.empty())
-      season = std::atoi(seasonStr.c_str());
-    if (!episodeStr.empty())
-      episode = std::atoi(episodeStr.c_str());
-    const std::string logoUrl = data["logo"].asString();
-
-    lock.lock();
-    if (!StringUtils::EqualsNoCase(m_bridgeUrl, bridgeUrl))
-    {
-      lock.unlock();
-      CLog::Log(LOGINFO, "TraktScrobbler: Discarding stale Bridge identification");
-      return false;
-    }
-    m_imdbId = imdb;
-    if (season >= 0)
-      m_season = season;
-    if (episode >= 0)
-      m_episode = episode;
-    if (!logoUrl.empty())
-    {
-      m_logoUrl = logoUrl;
-      m_logoFetchedForImdb = imdb;
-    }
-
-    if (data.isMember("resume") && data["resume"].isMember("position"))
-    {
-      const int64_t resumePos = data["resume"]["position"].asInteger(0);
-      const int64_t resumeDur = data["resume"]["duration"].asInteger(0);
-      if (resumeDur > 0 && resumePos > 0 &&
-          static_cast<float>(resumePos) / static_cast<float>(resumeDur) <
-              Jumpgate::RESUME_DISCARD_RATIO)
-      {
-        m_bridgeResumePositionMs.store(resumePos, std::memory_order_relaxed);
-        CLog::Log(LOGINFO, "TraktScrobbler: Bridge resume data - pos={} dur={}", resumePos,
-                  resumeDur);
-      }
-    }
-    lock.unlock();
-
-    CLog::Log(LOGINFO, "TraktScrobbler: Bridge identified - {} S{}E{} (attempt {}/3)", imdb, season,
-              episode, attempt + 1);
-    return true;
-  }
-
-  CLog::Log(LOGDEBUG, "TraktScrobbler: Active Bridge returned no identification");
-  return false;
-}
-
 bool TraktScrobbler::FetchLogoFromBridge(const std::string& imdbId,
                                          const std::string& mediaUrlSnapshot)
 {
@@ -1853,37 +1889,7 @@ bool TraktScrobbler::IdentifyContent()
     }
   }
 
-  // Layer 3: Bridge server side-channel query (zero-config mode, HTTP with retries)
-  // QueryBridgeServer manages its own locking
-  if (imdbId.empty())
-  {
-    bool bridgeResult = QueryBridgeServer();
-
-    // Check staleness after bridge query (which may have taken seconds)
-    lock.lock();
-    if (m_mediaUrl != mediaUrlSnapshot)
-    {
-      CLog::Log(LOGINFO, "TraktScrobbler: Discarding stale Bridge result (content changed)");
-      return false;
-    }
-    lock.unlock();
-
-    if (bridgeResult)
-    {
-      CLog::Log(LOGINFO, "TraktScrobbler: Content identified via Bridge server");
-      // Hydrate title/year/episode title via Trakt public endpoints now that we have IMDB.
-      lock.lock();
-      std::string curImdb = m_imdbId;
-      int curSeason = m_season;
-      int curEpisode = m_episode;
-      lock.unlock();
-      FetchLogoFromBridge(curImdb, mediaUrlSnapshot);
-      HydrateFromTraktPublic(curImdb, curSeason, curEpisode, mediaUrlSnapshot);
-      return true;
-    }
-  }
-
-  // Layer 4: Follow redirects and check response headers on the media URL.
+  // Layer 3: Follow redirects and check response headers on the media URL.
   if (!mediaUrl.empty() && resolvedUrl.empty())
   {
     // HTTP probe without lock
@@ -1899,13 +1905,11 @@ bool TraktScrobbler::IdentifyContent()
       std::string contentDisp = curl.GetHttpHeader().GetValue("Content-Disposition");
       if (!contentDisp.empty())
       {
-        CLog::Log(LOGINFO, "TraktScrobbler: Content-Disposition: {}", contentDisp);
         std::regex fnPattern("filename[*]?=[\"']?([^\"';]+)[\"']?");
         std::smatch fnMatch;
         if (std::regex_search(contentDisp, fnMatch, fnPattern))
         {
           std::string cdFilename = fnMatch[1].str();
-          CLog::Log(LOGINFO, "TraktScrobbler: Filename from header: {}", cdFilename);
           if (newResolvedUrl.empty() || newResolvedUrl == mediaUrl)
             newResolvedUrl = "http://header/" + cdFilename;
         }
@@ -2229,123 +2233,6 @@ std::string TraktScrobbler::BuildScrobbleJson(float progress)
   }
 
   return json;
-}
-
-int64_t TraktScrobbler::GetTraktResumePosition()
-{
-  std::unique_lock lock(m_critSection);
-
-  if (!IsAuthenticated() || !IsTraktIdentityAuthorized())
-    return 0;
-
-  const std::string type = (m_season >= 0 && m_episode >= 0) ? "episodes" : "movies";
-  const std::string endpoint = "/sync/playback/" + type;
-  std::string accessToken = m_accessToken;
-  const std::string clientId = m_traktClientId;
-  const std::string canonicalProvider = m_canonicalProvider.empty() ? "imdb" : m_canonicalProvider;
-  const std::string canonicalId = m_canonicalId.empty() ? m_imdbId : m_canonicalId;
-  const int season = m_season;
-  const int episode = m_episode;
-  const std::string profileId = m_bridgeProfileId;
-  const uint64_t authorityGeneration = m_authAuthorityGeneration;
-  const uint64_t contentGeneration = m_contentAuthorityGeneration;
-
-  lock.unlock();
-
-  std::string response;
-  if (!TraktGetWithToken(endpoint, response, accessToken, clientId))
-  {
-    ClearSensitive(accessToken);
-    ClearSensitive(response);
-    return 0;
-  }
-  ClearSensitive(accessToken);
-
-  CVariant results;
-  if (!CJSONVariantParser::Parse(response, results) || !results.isArray())
-  {
-    ClearSensitive(response);
-    return 0;
-  }
-  ClearSensitive(response);
-
-  float progress = -1.0f;
-  for (unsigned int i = 0; i < results.size(); ++i)
-  {
-    const CVariant& item = results[i];
-
-    if (type == "movies")
-    {
-      const CVariant& movie = item["movie"];
-      if (movie.isMember("ids"))
-      {
-        if (CanonicalIdMatches(movie["ids"], canonicalProvider, canonicalId))
-        {
-          progress = item["progress"].asFloat(0.0f);
-          break;
-        }
-      }
-    }
-    else
-    {
-      const CVariant& show = item["show"];
-      const CVariant& ep = item["episode"];
-      if (show.isMember("ids"))
-      {
-        int itemSeason = ep["season"].asInteger(-1);
-        int itemEpisode = ep["number"].asInteger(-1);
-
-        if (CanonicalIdMatches(show["ids"], canonicalProvider, canonicalId) &&
-            itemSeason == season && itemEpisode == episode)
-        {
-          progress = item["progress"].asFloat(0.0f);
-          break;
-        }
-      }
-    }
-  }
-
-  results = CVariant{};
-  if (progress < 0.0f)
-    return 0;
-
-  const auto& components = CServiceBroker::GetAppComponents();
-  const auto appPlayer = components.GetComponent<CApplicationPlayer>();
-  const int64_t totalMs = appPlayer->GetTotalTime();
-  if (totalMs <= 0)
-    return 0;
-
-  if (progress <= 0.0f || progress > 100.0f)
-    return 0;
-  const int64_t posMs = static_cast<int64_t>(static_cast<long double>(progress) / 100.0L *
-                                             static_cast<long double>(totalMs));
-
-  lock.lock();
-  const std::string currentProvider = m_canonicalProvider.empty() ? "imdb" : m_canonicalProvider;
-  const std::string currentId = m_canonicalId.empty() ? m_imdbId : m_canonicalId;
-  const bool current = m_initialized && m_authAuthorityGeneration == authorityGeneration &&
-                       m_contentAuthorityGeneration == contentGeneration &&
-                       m_bridgeProfileId == profileId && currentProvider == canonicalProvider &&
-                       currentId == canonicalId && m_season == season && m_episode == episode;
-  lock.unlock();
-  if (!current)
-  {
-    CLog::Log(LOGDEBUG,
-              "TraktScrobbler: Discarded stale personalized resume after authority change");
-    return 0;
-  }
-
-  if (type == "episodes")
-  {
-    CLog::Log(LOGINFO, "TraktScrobbler: Trakt resume for {} episode S{}E{} - {:.1f}% = {} ms",
-              canonicalProvider, season, episode, progress, posMs);
-  }
-  else
-  {
-    CLog::Log(LOGINFO, "TraktScrobbler: Trakt resume for {} movie - {:.1f}% = {} ms",
-              canonicalProvider, progress, posMs);
-  }
-  return posMs;
 }
 
 float TraktScrobbler::GetPlaybackProgress() const

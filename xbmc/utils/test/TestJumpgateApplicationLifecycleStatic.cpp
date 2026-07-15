@@ -473,6 +473,255 @@ TEST(TestJumpgateApplicationLifecycleStatic,
 }
 
 TEST(TestJumpgateApplicationLifecycleStatic,
+     NativeRuntimeHasNoUnauthenticatedLegacyIdentityTransport)
+{
+  const std::string source = ReadKodiSource("platform/android/activity/TraktScrobbler.cpp");
+  const std::string header = ReadKodiSource("platform/android/activity/TraktScrobbler.h");
+  const std::string app = ReadKodiSource("platform/android/activity/XBMCApp.cpp");
+  ASSERT_FALSE(source.empty());
+  ASSERT_FALSE(header.empty());
+  ASSERT_FALSE(app.empty());
+
+  EXPECT_EQ(source.find("QueryBridgeServer"), std::string::npos);
+  EXPECT_EQ(header.find("QueryBridgeServer"), std::string::npos);
+  EXPECT_EQ(source.find("\"/identify\""), std::string::npos);
+  EXPECT_EQ(source.find("\"/resume\""), std::string::npos);
+  EXPECT_EQ(app.find("\"/identify\""), std::string::npos);
+  EXPECT_EQ(app.find("\"/resume\""), std::string::npos);
+  EXPECT_EQ(source.find("GetTraktResumePosition"), std::string::npos);
+  EXPECT_EQ(header.find("GetTraktResumePosition"), std::string::npos);
+  EXPECT_EQ(header.find("GetBridgeResumePosition"), std::string::npos);
+  EXPECT_EQ(header.find("m_bridgeResumePositionMs"), std::string::npos);
+
+  const std::string saveResume =
+      FunctionBody(app, "void CXBMCApp::SaveResumePosition(bool explicitEnd)");
+  const std::string identify = FunctionBody(source, "bool TraktScrobbler::IdentifyContent()");
+  ASSERT_FALSE(saveResume.empty());
+  ASSERT_FALSE(identify.empty());
+  EXPECT_EQ(saveResume.find("XFILE::CCurlFile"), std::string::npos);
+  EXPECT_EQ(saveResume.find(".Post("), std::string::npos);
+  EXPECT_NE(app.find("special://profile/jumpgate_resume.json"), std::string::npos);
+
+  EXPECT_NE(identify.find("GetValue(\"Content-Disposition\")"), std::string::npos);
+  EXPECT_NE(identify.find("std::regex fnPattern"), std::string::npos);
+  EXPECT_EQ(identify.find("Content-Disposition: {}"), std::string::npos);
+  EXPECT_EQ(identify.find("Filename from header: {}"), std::string::npos);
+  EXPECT_EQ(Count(identify, "contentDisp"), 3u);
+  EXPECT_EQ(Count(identify, "cdFilename"), 2u);
+}
+
+TEST(TestJumpgateApplicationLifecycleStatic, RuntimeLogsNeverExposeAndroidUrisOrUrlCredentials)
+{
+  const std::string app = ReadKodiSource("platform/android/activity/XBMCApp.cpp");
+  const std::string source = ReadKodiSource("platform/android/activity/TraktScrobbler.cpp");
+  ASSERT_FALSE(app.empty());
+  ASSERT_FALSE(source.empty());
+
+  const std::string startActivity = FunctionBody(app, "bool CXBMCApp::StartActivity(");
+  const std::string redactionGuards =
+      FunctionSection(source, "struct LogUrlOrigin", "std::string RedactUrlForLog(");
+  const std::string redact = FunctionBody(source, "std::string RedactUrlForLog(");
+  const std::string setMediaUrl = FunctionBody(source, "void TraktScrobbler::SetMediaUrl(");
+  const std::string identify = FunctionBody(source, "bool TraktScrobbler::IdentifyContent()");
+  ASSERT_FALSE(startActivity.empty());
+  ASSERT_FALSE(redactionGuards.empty());
+  ASSERT_FALSE(redact.empty());
+  ASSERT_FALSE(setMediaUrl.empty());
+  ASSERT_FALSE(identify.empty());
+
+  EXPECT_NE(startActivity.find("Starting Android activity"), std::string::npos);
+  EXPECT_NE(startActivity.find("Sharing content through FileProvider"), std::string::npos);
+  EXPECT_NE(startActivity.find("std::string(CCompileInfo::GetPackage()) + \".fileprovider\""),
+            std::string::npos);
+  EXPECT_EQ(startActivity.find("dataURI: {}"), std::string::npos);
+  EXPECT_EQ(startActivity.find("jniURI.toString()"), std::string::npos);
+  EXPECT_EQ(startActivity.find("Share using FileProvider:"), std::string::npos);
+  EXPECT_EQ(startActivity.find("Putting extra key:"), std::string::npos);
+  EXPECT_EQ(startActivity.find("ExceptionDescribe()"), std::string::npos);
+  EXPECT_EQ(startActivity.find("{}"), std::string::npos);
+
+  EXPECT_NE(redactionGuards.find("character == '@' || character == '%'"), std::string::npos);
+  EXPECT_NE(redactionGuards.find("IsUnsafeLogUrlCharacter(character)"), std::string::npos);
+  EXPECT_NE(redactionGuards.find("authority.find(':', colon + 1)"), std::string::npos);
+  EXPECT_NE(redactionGuards.find("IsValidLogUrlHost(host)"), std::string::npos);
+  EXPECT_NE(redactionGuards.find("value >= 1 && value <= 65535"), std::string::npos);
+  EXPECT_GE(Count(redactionGuards, "static_assert("), 10u);
+  EXPECT_NE(redactionGuards.find("HTTPS://Example.TEST:443/private/media?token=secret#fragment"),
+            std::string::npos);
+  EXPECT_NE(redactionGuards.find("viewer:opaque@example.test"), std::string::npos);
+  EXPECT_NE(redactionGuards.find("viewer@example.test"), std::string::npos);
+  EXPECT_NE(redactionGuards.find("viewer%40example.test"), std::string::npos);
+  EXPECT_NE(redactionGuards.find("viewer:opaque/private"), std::string::npos);
+  EXPECT_NE(redactionGuards.find("https:///private"), std::string::npos);
+  EXPECT_NE(redactionGuards.find("not-a-url"), std::string::npos);
+  EXPECT_NE(redactionGuards.find("example.test:70000/private"), std::string::npos);
+  EXPECT_NE(redactionGuards.find("attacker.test/private"), std::string::npos);
+  EXPECT_NE(redactionGuards.find("example..test/private"), std::string::npos);
+
+  EXPECT_NE(redact.find("ParseUrlOriginForLog(rawUrl)"), std::string::npos);
+  EXPECT_NE(redact.find("appendLower(origin.scheme)"), std::string::npos);
+  EXPECT_NE(redact.find("appendLower(origin.host)"), std::string::npos);
+  EXPECT_NE(redact.find("redacted.append(origin.port)"), std::string::npos);
+  EXPECT_EQ(redact.find("/<redacted>"), std::string::npos);
+  EXPECT_EQ(redact.find("redacted.append(rawUrl)"), std::string::npos);
+
+  EXPECT_NE(setMediaUrl.find("RedactUrlForLog(url)"), std::string::npos);
+  EXPECT_NE(identify.find("RedactUrlForLog(newResolvedUrl)"), std::string::npos);
+  EXPECT_NE(identify.find("RedactUrlForLog(mediaUrl)"), std::string::npos);
+  EXPECT_EQ(Count(source, "RedactUrlForLog("), 7u);
+}
+
+TEST(TestJumpgateApplicationLifecycleStatic, UnpairedHeuristicsCannotAuthorizeTraktOrProfileHistory)
+{
+  const std::string source = ReadKodiSource("platform/android/activity/TraktScrobbler.cpp");
+  const std::string app = ReadKodiSource("platform/android/activity/XBMCApp.cpp");
+  ASSERT_FALSE(source.empty());
+  ASSERT_FALSE(app.empty());
+
+  const std::string setInfo = FunctionBody(source, "void TraktScrobbler::SetContentInfo(");
+  const std::string authority =
+      FunctionBody(source, "bool TraktScrobbler::IsTraktIdentityAuthorized() const");
+  const std::string identify = FunctionBody(source, "bool TraktScrobbler::IdentifyContent()");
+  const std::string saveResume =
+      FunctionBody(app, "void CXBMCApp::SaveResumePosition(bool explicitEnd)");
+  const std::string processClaim = FunctionBody(app, "void CXBMCApp::ProcessPlaybackSourceClaim()");
+  const std::string onDestroy = FunctionBody(app, "void CXBMCApp::onDestroy()");
+  ASSERT_FALSE(setInfo.empty());
+  ASSERT_FALSE(authority.empty());
+  ASSERT_FALSE(identify.empty());
+  ASSERT_FALSE(saveResume.empty());
+  ASSERT_FALSE(processClaim.empty());
+  ASSERT_FALSE(onDestroy.empty());
+
+  EXPECT_NE(setInfo.find("m_sourceClaimResolved = false"), std::string::npos);
+  EXPECT_NE(setInfo.find("m_sourceClaimAuthorized = false"), std::string::npos);
+  EXPECT_NE(setInfo.find("m_contentIdentified = !m_bridgeProfileBacked"), std::string::npos);
+  EXPECT_NE(authority.find("m_bridgeProfileBacked"), std::string::npos);
+  EXPECT_NE(authority.find("m_sourceClaimResolved"), std::string::npos);
+  EXPECT_NE(authority.find("m_sourceClaimAuthorized"), std::string::npos);
+
+  const std::string pairedIdentify = FunctionBody(identify, "if (m_bridgeProfileBacked)");
+  ASSERT_FALSE(pairedIdentify.empty());
+  EXPECT_NE(pairedIdentify.find("return authorized;"), std::string::npos);
+  EXPECT_EQ(pairedIdentify.find("FetchLogoFromBridge"), std::string::npos);
+  EXPECT_LT(identify.find("if (m_bridgeProfileBacked)"), identify.find("std::regex imdbPattern"));
+  EXPECT_LT(identify.find("if (m_bridgeProfileBacked)"),
+            identify.find("GetValue(\"Content-Disposition\")"));
+
+  const std::string pairedHistory =
+      FunctionBody(saveResume, "if (m_traktScrobbler->IsBridgeProfileBacked())");
+  ASSERT_FALSE(pairedHistory.empty());
+  EXPECT_NE(pairedHistory.find("SavePairedPlaybackHistory(explicitEnd)"), std::string::npos);
+  EXPECT_NE(pairedHistory.find("return;"), std::string::npos);
+  EXPECT_LT(saveResume.find("if (m_traktScrobbler->IsBridgeProfileBacked())"),
+            saveResume.find("CSpecialProtocol::TranslatePath(RESUME_STORE_FILE)"));
+  EXPECT_EQ(Count(app, "m_playbackHistoryState.Activate("), 1u);
+  EXPECT_NE(processClaim.find("m_playbackHistoryState.Activate("), std::string::npos);
+
+  const std::string destroyHistory = FunctionBody(
+      onDestroy, "if (m_externalPlayerMode.load(std::memory_order_relaxed) && m_traktScrobbler)");
+  const std::string pairedDestroy =
+      FunctionBody(destroyHistory, "if (m_traktScrobbler->IsBridgeProfileBacked())");
+  const std::string unpairedDestroy = FunctionBody(destroyHistory, "else");
+  ASSERT_FALSE(destroyHistory.empty());
+  ASSERT_FALSE(pairedDestroy.empty());
+  ASSERT_FALSE(unpairedDestroy.empty());
+  EXPECT_NE(pairedDestroy.find("SavePairedPlaybackHistory(false)"), std::string::npos);
+  EXPECT_EQ(pairedDestroy.find("SaveLegacyResumeForContentLocal"), std::string::npos);
+  EXPECT_NE(unpairedDestroy.find("SaveLegacyResumeForContentLocal"), std::string::npos);
+  EXPECT_EQ(unpairedDestroy.find("SavePairedPlaybackHistory"), std::string::npos);
+}
+
+TEST(TestJumpgateApplicationLifecycleStatic,
+     PairedLocalOnlyClaimsUseExactHistoryAndFailuresCannotUseLegacyIdentity)
+{
+  const std::string source = ReadKodiSource("platform/android/activity/TraktScrobbler.cpp");
+  const std::string app = ReadKodiSource("platform/android/activity/XBMCApp.cpp");
+  ASSERT_FALSE(source.empty());
+  ASSERT_FALSE(app.empty());
+
+  const std::string setClaim = FunctionBody(source, "bool TraktScrobbler::SetClaimedContentInfo(");
+  const std::string identify = FunctionBody(source, "bool TraktScrobbler::IdentifyContent()");
+  const std::string processClaim = FunctionBody(app, "void CXBMCApp::ProcessPlaybackSourceClaim()");
+  const std::string loadPaired =
+      FunctionBody(app, "void CXBMCApp::LoadAndApplyPairedPlaybackResume(uint64_t generation)");
+  const std::string onContent = FunctionBody(app, "void CXBMCApp::OnContentIdentified()");
+  const std::string intent = FunctionBody(app, "void CXBMCApp::onNewIntent(CJNIIntent intent)");
+  ASSERT_FALSE(setClaim.empty());
+  ASSERT_FALSE(identify.empty());
+  ASSERT_FALSE(processClaim.empty());
+  ASSERT_FALSE(loadPaired.empty());
+  ASSERT_FALSE(onContent.empty());
+  ASSERT_FALSE(intent.empty());
+
+  EXPECT_NE(setClaim.find("const bool authorized = traktEligible"), std::string::npos);
+  EXPECT_NE(setClaim.find("m_sourceClaimAuthorized = authorized"), std::string::npos);
+  EXPECT_NE(setClaim.find("Source claim is local-only; Trakt remains disabled"), std::string::npos);
+  EXPECT_NE(setClaim.find("return true;"), std::string::npos);
+  EXPECT_EQ(Count(processClaim, "context->traktEligible"), 1u);
+  EXPECT_NE(processClaim.find("historyIdentity.profileId = context->profileId"), std::string::npos);
+  EXPECT_NE(processClaim.find("historyIdentity.contentKey = *context->contentKey"),
+            std::string::npos);
+  EXPECT_NE(processClaim.find("const std::string title = context->display.title.value_or"),
+            std::string::npos);
+  EXPECT_NE(processClaim.find("const std::string logoUrl = context->display.logo.value_or"),
+            std::string::npos);
+  EXPECT_NE(setClaim.find("m_title = title"), std::string::npos);
+  EXPECT_NE(setClaim.find("m_logoUrl = logoUrl"), std::string::npos);
+
+  const std::size_t applyClaim = processClaim.find("SetClaimedContentInfo(");
+  const std::size_t bindProfile =
+      processClaim.find("historyIdentity.profileId = context->profileId");
+  const std::size_t bindContent =
+      processClaim.find("historyIdentity.contentKey = *context->contentKey");
+  const std::size_t activate = processClaim.find("m_playbackHistoryState.Activate(");
+  const std::size_t loadResume = processClaim.find("LoadAndApplyPairedPlaybackResume(generation)");
+  ASSERT_NE(applyClaim, std::string::npos);
+  ASSERT_NE(bindProfile, std::string::npos);
+  ASSERT_NE(bindContent, std::string::npos);
+  ASSERT_NE(activate, std::string::npos);
+  ASSERT_NE(loadResume, std::string::npos);
+  EXPECT_LT(applyClaim, bindProfile);
+  EXPECT_LT(bindProfile, activate);
+  EXPECT_LT(bindContent, activate);
+  EXPECT_LT(activate, loadResume);
+  EXPECT_NE(loadPaired.find("Get(token->profileId, token->contentKey"), std::string::npos);
+
+  const std::string failedClaim =
+      FunctionBody(processClaim, "if (!completion->result.IsClaimed())");
+  const std::string invalidContext =
+      FunctionBody(processClaim, "if (!context || context->profileId != expectedProfileId ||");
+  ASSERT_FALSE(failedClaim.empty());
+  ASSERT_FALSE(invalidContext.empty());
+  EXPECT_NE(failedClaim.find("return;"), std::string::npos);
+  EXPECT_EQ(failedClaim.find("SetClaimedContentInfo"), std::string::npos);
+  EXPECT_EQ(failedClaim.find("m_playbackHistoryState.Activate"), std::string::npos);
+  EXPECT_NE(invalidContext.find("return;"), std::string::npos);
+  EXPECT_EQ(invalidContext.find("SetClaimedContentInfo"), std::string::npos);
+  EXPECT_EQ(invalidContext.find("m_playbackHistoryState.Activate"), std::string::npos);
+
+  const std::string pairedIdentify = FunctionBody(identify, "if (m_bridgeProfileBacked)");
+  const std::string legacyResume =
+      FunctionBody(onContent, "if (!m_traktScrobbler->IsBridgeProfileBacked())");
+  ASSERT_FALSE(pairedIdentify.empty());
+  ASSERT_FALSE(legacyResume.empty());
+  EXPECT_NE(pairedIdentify.find("return authorized;"), std::string::npos);
+  EXPECT_EQ(pairedIdentify.find("FetchLogoFromBridge"), std::string::npos);
+  EXPECT_NE(legacyResume.find("LoadResumePosition(imdb, season, episode)"), std::string::npos);
+  EXPECT_EQ(Count(onContent, "LoadResumePosition("), 1u);
+
+  const std::string legacyIntentMetadata = FunctionBody(intent, "if (!pairedProfileBacked)");
+  const std::string legacyIntentResume = FunctionBody(
+      intent, "if (!pairedProfileBacked && resumePositionMs <= 0 && !imdbId.empty() &&");
+  ASSERT_FALSE(legacyIntentMetadata.empty());
+  ASSERT_FALSE(legacyIntentResume.empty());
+  EXPECT_NE(legacyIntentMetadata.find("intent.hasExtra(\"imdb_id\")"), std::string::npos);
+  EXPECT_NE(legacyIntentResume.find("LoadResumePosition(imdbId, season, episode)"),
+            std::string::npos);
+  EXPECT_EQ(Count(intent, "LoadResumePosition("), 1u);
+}
+
+TEST(TestJumpgateApplicationLifecycleStatic,
      AndroidSubtitlesCommitTerminalAndQuiesceBeforeCleanupOrServiceDrain)
 {
   const std::string app = ReadKodiSource("platform/android/activity/XBMCApp.cpp");

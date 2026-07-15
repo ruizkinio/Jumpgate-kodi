@@ -1631,29 +1631,6 @@ void CXBMCApp::SaveResumePosition(bool explicitEnd)
       outFile.Close();
     }
   }
-
-  // POST to Bridge /resume (fire-and-forget, 2s timeout)
-  {
-    XFILE::CCurlFile curl;
-    curl.SetRequestHeader("Content-Type", "application/json");
-    curl.SetTimeout(2);
-    curl.SetTotalTimeout(3);
-
-    CVariant body(CVariant::VariantTypeObject);
-    body["imdb"] = imdb;
-    body["season"] = (season >= 0) ? std::to_string(season) : "";
-    body["episode"] = (episode >= 0) ? std::to_string(episode) : "";
-    body["position"] = posMs;
-    body["duration"] = durMs;
-
-    std::string bodyJson;
-    CJSONVariantWriter::Write(body, bodyJson, true);
-
-    std::string bridgeUrl = m_traktScrobbler->GetBridgeUrl() + "/resume";
-    std::string response;
-    curl.Post(bridgeUrl, bodyJson, response);
-    // Ignore errors — Bridge may not be running
-  }
 }
 
 int64_t CXBMCApp::LoadResumePosition(const std::string& imdbId, int season, int episode)
@@ -1742,11 +1719,9 @@ void CXBMCApp::OnContentIdentified()
   // immediately after claim application. These fallbacks are legacy-only.
   if (!m_traktScrobbler->IsBridgeProfileBacked())
   {
-    int64_t savedPos = m_traktScrobbler->GetBridgeResumePosition();
-    if (savedPos <= 0 && !imdb.empty())
+    int64_t savedPos = 0;
+    if (!imdb.empty())
       savedPos = LoadResumePosition(imdb, season, episode);
-    if (savedPos <= 0)
-      savedPos = m_traktScrobbler->GetTraktResumePosition();
 
     std::unique_lock resumeLock(m_playbackClaimMutex);
     if (resumeGeneration != m_playbackClaimGeneration)
@@ -1774,8 +1749,6 @@ void CXBMCApp::OnContentIdentified()
       return;
     m_resumeApplied.store(true, std::memory_order_relaxed);
   }
-  m_traktScrobbler->ClearBridgeResume();
-
   // Propagate to SubtitleDownloader for late subtitle download (F-011)
   // Always auto-download regardless of playback position (per user decision)
   // Silent download -- no toast notification (per user decision)
@@ -3682,15 +3655,7 @@ bool CXBMCApp::StartActivity(const std::string& package,
                              const std::string& category,
                              const std::string& className)
 {
-  CLog::LogF(LOGDEBUG, "package: {}", package);
-  CLog::LogF(LOGDEBUG, "intent: {}", intent);
-  CLog::LogF(LOGDEBUG, "dataType: {}", dataType);
-  CLog::LogF(LOGDEBUG, "dataURI: {}", dataURI);
-  CLog::LogF(LOGDEBUG, "flags: {}", flags);
-  CLog::LogF(LOGDEBUG, "extras: {}", extras);
-  CLog::LogF(LOGDEBUG, "action: {}", action);
-  CLog::LogF(LOGDEBUG, "category: {}", category);
-  CLog::LogF(LOGDEBUG, "className: {}", className);
+  CLog::LogF(LOGDEBUG, "Starting Android activity");
 
   CJNIIntent newIntent =
       intent.empty() ? GetPackageManager().getLaunchIntentForPackage(package) : CJNIIntent(intent);
@@ -3718,10 +3683,11 @@ bool CXBMCApp::StartActivity(const std::string& package,
     if (!pathname.empty() && StringUtils::StartsWith(pathname, "/storage/"))
     {
       // generate a content URI
-      jniURI = CJNIFileProvider::getUriForFile(CXBMCApp::Get(), "org.xbmc.kodi.fileprovider",
-                                               CJNIFile(pathname));
+      jniURI = CJNIFileProvider::getUriForFile(
+          CXBMCApp::Get(), std::string(CCompileInfo::GetPackage()) + ".fileprovider",
+          CJNIFile(pathname));
 
-      CLog::LogF(LOGINFO, "Share using FileProvider: {}", jniURI.toString());
+      CLog::LogF(LOGINFO, "Sharing content through FileProvider");
 
       // grant temporary permission to external app
       CJNIContext::grantUriPermission(package, jniURI, CJNIIntent::FLAG_GRANT_READ_URI_PERMISSION);
@@ -3742,7 +3708,7 @@ bool CXBMCApp::StartActivity(const std::string& package,
     {
       newIntent.setFlags(std::stoi(flags));
     }
-    catch (const std::exception& e)
+    catch (const std::exception&)
     {
       CLog::LogF(LOGDEBUG, "Invalid flags given, ignore them");
     }
@@ -3770,11 +3736,10 @@ bool CXBMCApp::StartActivity(const std::string& package,
       if (e["type"] == "string")
       {
         newIntent.putExtra(e["key"].asString(), e["value"].asString());
-        CLog::LogF(LOGDEBUG, "Putting extra key: {}, value: {}", e["key"].asString(),
-                   e["value"].asString());
+        CLog::LogF(LOGDEBUG, "Adding Android intent extra");
       }
       else
-        CLog::LogF(LOGDEBUG, "Intent extras data type ({}) not implemented", e["type"].asString());
+        CLog::LogF(LOGDEBUG, "Ignoring unsupported Android intent extra type");
     }
   }
 
@@ -3785,8 +3750,7 @@ bool CXBMCApp::StartActivity(const std::string& package,
   startActivity(newIntent);
   if (xbmc_jnienv()->ExceptionCheck())
   {
-    CLog::LogF(LOGERROR, "ExceptionOccurred launching {}", package);
-    xbmc_jnienv()->ExceptionDescribe();
+    CLog::LogF(LOGERROR, "Exception occurred launching Android activity");
     xbmc_jnienv()->ExceptionClear();
     return false;
   }
