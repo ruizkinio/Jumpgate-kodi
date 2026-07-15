@@ -31,7 +31,7 @@ env:
   ANDROID_NDK_VERSION: '28.2.13676358'
   JAVA_VERSION: '17'
   CACHE_SCHEMA_VERSION: v2
-  CANONICAL_REPOSITORY: ruizkinio/ModiKodi-kodi
+  CANONICAL_REPOSITORY: ruizkinio/Jumpgate-kodi
 
 jobs:
   android-apk:
