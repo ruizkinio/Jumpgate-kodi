@@ -88,7 +88,7 @@ package: libs python java
 	ANDROID_HOME=$(SDKROOT) ./gradlew assemble$(BUILD_TYPE)
 	@cp xbmc/build/outputs/apk/$(BUILD_TYPE_LC)/xbmc-$(BUILD_TYPE_LC).apk $(CMAKE_SOURCE_DIR)/@APP_NAME_LC@app-$(CPU)-$(BUILD_TYPE_LC).apk
 
-$(PREFIX)/lib/xbmc/lib@APP_NAME_LC@.so:
+$(PREFIX)/lib/@APP_NAME_LC@/lib@APP_NAME_LC@.so:
 	$(MAKE) -C ../../depends/target/xbmc
 
 apk-clean:
@@ -103,4 +103,3 @@ apk-clean:
 	rm -rf assets
 
 .PHONY: force libs assets python sharedapk res package
-

@@ -3,7 +3,7 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 <apk> <expected-abi> <expected-package> <expected-min-sdk> <expected-target-sdk> <expected-version-name> <expected-version-code> <expected-signer-sha256>" >&2
+  echo "usage: $0 <apk> <expected-abi> <expected-package> <expected-min-sdk> <expected-target-sdk> <expected-version-name> <expected-version-code> <expected-signer-sha256> <expected-core-library>" >&2
   exit 2
 }
 
@@ -12,7 +12,7 @@ fail() {
   exit 1
 }
 
-[[ "$#" -eq 8 ]] || usage
+[[ "$#" -eq 9 ]] || usage
 
 apk="$1"
 expected_abi="$2"
@@ -22,6 +22,7 @@ expected_target_sdk="$5"
 expected_version_name="$6"
 expected_version_code="$7"
 expected_signer_sha256="${8,,}"
+expected_core_library="$9"
 
 case "$expected_abi" in
   arm64-v8a)
@@ -57,6 +58,10 @@ if [[ -z "$expected_version_name" || ${#expected_version_name} -gt 128 ||
 fi
 if [[ ! "$expected_signer_sha256" =~ ^[0-9a-f]{64}$ ]]; then
   echo 'Invalid expected APK signer digest' >&2
+  exit 2
+fi
+if [[ ! "$expected_core_library" =~ ^lib[A-Za-z0-9._+-]+\.so$ ]]; then
+  echo 'Invalid expected Android core library name' >&2
   exit 2
 fi
 
@@ -277,7 +282,7 @@ mapfile -t signer_digests < <(
 if [[ "${#signer_digests[@]}" -ne 1 ||
       ! "${signer_digests[0]:-}" =~ ^[0-9a-f]{64}$ ||
       "${signer_digests[0]:-}" != "$expected_signer_sha256" ]]; then
-  fail 'APK signer certificate does not match the ephemeral CI certificate'
+  fail 'APK signer certificate does not match the expected signer'
 fi
 
 if find "$extract_dir" -type l -print -quit | grep -q .; then
@@ -315,7 +320,8 @@ mapfile -d '' -t shared_libraries < <(
   find "$abi_root" -mindepth 1 -maxdepth 1 -type f -name '*.so' -print0 | LC_ALL=C sort -z
 )
 [[ "${#shared_libraries[@]}" -gt 0 ]] || fail 'APK contains no native shared libraries'
-[[ -f "$abi_root/libkodi.so" ]] || fail 'APK does not contain the Kodi core library'
+[[ -f "$abi_root/$expected_core_library" ]] ||
+  fail 'APK does not contain the expected core native library'
 mapfile -d '' -t all_shared_libraries < <(
   find "$extract_dir" -type f -name '*.so' -print0 | LC_ALL=C sort -z
 )
@@ -372,7 +378,7 @@ for shared_library in "${shared_libraries[@]}"; do
   fi
 done
 
-if ! python3 - "$extract_dir" "$expected_abi" <<'PY'
+if ! python3 - "$extract_dir" "$expected_abi" "$expected_core_library" <<'PY'
 import base64
 import binascii
 import codecs
@@ -389,7 +395,8 @@ import unicodedata
 
 root = pathlib.Path(sys.argv[1])
 expected_abi = sys.argv[2]
-allowed_path = pathlib.PurePosixPath('lib') / expected_abi / 'libkodi.so'
+expected_core_library = sys.argv[3]
+allowed_path = pathlib.PurePosixPath('lib') / expected_abi / expected_core_library
 allowed_der_sha256 = '8959c62b4351cbaa702942f4572d37335a7a3dfdcc6f0d2763a2afb486e3ac8f'
 MAX_FILES = 100_000
 MAX_FILE_BYTES = 512 * 1024 * 1024
@@ -2082,5 +2089,6 @@ apk_name="$(basename "$apk")"
   sha256sum "$apk_name" > "$apk_name.sha256"
 )
 
-printf 'Verified ephemeral CI APK: package=%s version=%s abi=%s\n' \
-  "$actual_package" "$version_name" "$expected_abi"
+printf 'Verified APK against expected signer: package=%s version=%s abi=%s core=%s signer_sha256=%s\n' \
+  "$actual_package" "$version_name" "$expected_abi" "$expected_core_library" \
+  "$expected_signer_sha256"

@@ -7,11 +7,12 @@ verifier="$script_dir/verify-android-apk.sh"
 work_dir="$(mktemp -d)"
 trap 'rm -rf "$work_dir"' EXIT
 
-expected_package='org.xbmc.kodi'
+expected_package='com.example.fixtureplayer'
 expected_min_sdk='24'
 expected_target_sdk='36'
 expected_version_name='22.0-ALPHA2'
 expected_version_code='2190702'
+expected_core_library='libfixture.so'
 mock_signer_sha256='abababababababababababababababababababababababababababababababab'
 allowed_rsa_der_sha256='8959c62b4351cbaa702942f4572d37335a7a3dfdcc6f0d2763a2afb486e3ac8f'
 
@@ -19,6 +20,12 @@ command -v python3 >/dev/null
 command -v sha256sum >/dev/null
 python3 -c 'import yaml' >/dev/null
 test -f "$verifier"
+if grep -Fqi 'ephemeral CI certificate' "$verifier"; then
+  echo 'APK verifier still hard-codes an ephemeral-CI-only signer diagnostic' >&2
+  exit 1
+fi
+grep -Fq 'does not match the expected signer' "$verifier"
+grep -Fq 'Verified APK against expected signer:' "$verifier"
 
 find_tool() {
   local root="$1"
@@ -100,7 +107,7 @@ cat > "$mock_tools/aapt2" <<'MOCK_AAPT2'
 set -euo pipefail
 [[ "$#" -eq 3 && "$1" == 'dump' && "$2" == 'badging' ]]
 printf "package: name='%s' versionCode='%s' versionName='%s' platformBuildVersionName='16' platformBuildVersionCode='36' compileSdkVersion='36' compileSdkVersionCodename='16'\n" \
-  "${MOCK_PACKAGE:-org.xbmc.kodi}" \
+  "${MOCK_PACKAGE:-com.example.fixtureplayer}" \
   "${MOCK_VERSION_CODE:-2190702}" \
   "${MOCK_VERSION_NAME:-22.0-ALPHA2}"
 printf "minSdkVersion:'%s'\n" "${MOCK_MIN_SDK:-24}"
@@ -286,9 +293,11 @@ copy_fixture() {
 }
 
 append_allowed_rsa_key() {
-  printf '\0' >> "$1"
-  cat "$allowed_rsa_pem" >> "$1"
-  printf '\0' >> "$1"
+  {
+    printf '\0'
+    cat "$allowed_rsa_pem"
+    printf '\0'
+  } >> "$1"
 }
 
 remove_allowed_rsa_key() {
@@ -445,7 +454,8 @@ verify_apk() {
       "$expected_target_sdk" \
       "$expected_version_name" \
       "$expected_version_code" \
-      "$mock_signer_sha256"
+      "$mock_signer_sha256" \
+      "$expected_core_library"
 }
 
 verify_real_apk() {
@@ -463,7 +473,8 @@ verify_real_apk() {
       "$expected_target_sdk" \
       "$expected_version_name" \
       "$expected_version_code" \
-      "$signer_sha256"
+      "$signer_sha256" \
+      "$expected_core_library"
 }
 
 expect_failure() {
@@ -745,12 +756,12 @@ for name, value in {
 }.items():
     (root / name).write_bytes(value)
 PY
-compile_shared "$base_arm64/lib/arm64-v8a/libkodi.so" arm64-v8a
+compile_shared "$base_arm64/lib/arm64-v8a/$expected_core_library" arm64-v8a
 compile_shared "$base_arm64/lib/arm64-v8a/libhelper.so" arm64-v8a
-compile_shared "$base_armv7/lib/armeabi-v7a/libkodi.so" armeabi-v7a
+compile_shared "$base_armv7/lib/armeabi-v7a/$expected_core_library" armeabi-v7a
 compile_shared "$base_armv7/lib/armeabi-v7a/libhelper.so" armeabi-v7a
-append_allowed_rsa_key "$base_arm64/lib/arm64-v8a/libkodi.so"
-append_allowed_rsa_key "$base_armv7/lib/armeabi-v7a/libkodi.so"
+append_allowed_rsa_key "$base_arm64/lib/arm64-v8a/$expected_core_library"
+append_allowed_rsa_key "$base_armv7/lib/armeabi-v7a/$expected_core_library"
 mkdir -p "$base_arm64/assets" "$base_armv7/assets"
 cat > "$base_arm64/assets/placeholders.json" <<'JSON'
 {"auth":{"accessToken":"${JUMPGATE_ACCESS_TOKEN}"},"api_key":"YOUR_API_KEY","client_secret":"REDACTED","password":"","oauth_metadata":{"token_type":"Bearer","token_endpoint":"https://example.com/oauth/token","token_expiry":3600}}
@@ -804,18 +815,41 @@ make_apk "$base_arm64" "$arm64_apk"
 make_apk "$base_armv7" "$armv7_apk"
 
 : > "$readelf_log"
-verify_apk "$arm64_apk" arm64-v8a >/dev/null
+arm64_verify_output="$(verify_apk "$arm64_apk" arm64-v8a)"
+[[ "$arm64_verify_output" == \
+  "Verified APK against expected signer: package=$expected_package version=$expected_version_name abi=arm64-v8a core=$expected_core_library signer_sha256=$mock_signer_sha256" ]]
 [[ "$(wc -l < "$readelf_log")" -eq 2 ]]
 grep -Fxq 'libhelper.so' "$readelf_log"
-grep -Fxq 'libkodi.so' "$readelf_log"
+grep -Fxq "$expected_core_library" "$readelf_log"
 test -s "$arm64_apk.sha256"
 
 : > "$readelf_log"
 verify_apk "$armv7_apk" armeabi-v7a >/dev/null
 [[ "$(wc -l < "$readelf_log")" -eq 2 ]]
 grep -Fxq 'libhelper.so' "$readelf_log"
-grep -Fxq 'libkodi.so' "$readelf_log"
+grep -Fxq "$expected_core_library" "$readelf_log"
 test -s "$armv7_apk.sha256"
+
+set +e
+invalid_core_output="$(
+  env \
+    ANDROID_BUILD_TOOLS_ROOT="$mock_tools" \
+    JUMPGATE_READELF_BIN="$readelf_wrapper" \
+    bash "$verifier" \
+      "$arm64_apk" \
+      arm64-v8a \
+      "$expected_package" \
+      "$expected_min_sdk" \
+      "$expected_target_sdk" \
+      "$expected_version_name" \
+      "$expected_version_code" \
+      "$mock_signer_sha256" \
+      '../libfixture.so' 2>&1
+)"
+invalid_core_status="$?"
+set -e
+[[ "$invalid_core_status" -eq 2 ]]
+[[ "$invalid_core_output" == *'Invalid expected Android core library name'* ]]
 
 benign_cryptodome_runtime="$work_dir/benign-cryptodome-runtime"
 copy_fixture "$base_arm64" "$benign_cryptodome_runtime"
@@ -890,7 +924,7 @@ verify_apk "$der_noise_apk" arm64-v8a >/dev/null
 manifest="$work_dir/AndroidManifest.xml"
 cat > "$manifest" <<'MANIFEST'
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="org.xbmc.kodi"
+    package="com.example.fixtureplayer"
     android:versionCode="2190702"
     android:versionName="22.0-ALPHA2">
     <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="36" />
@@ -973,8 +1007,8 @@ make_apk "$no_libraries" "$no_libraries_apk"
 expect_failure no-libraries "$no_libraries_apk" arm64-v8a
 
 spoof_library="$work_dir/spoof-library"
-mkdir -p "$spoof_library/lib/arm64-v8a/libkodi.so"
-printf 'not a library\n' > "$spoof_library/lib/arm64-v8a/libkodi.so/file.txt"
+mkdir -p "$spoof_library/lib/arm64-v8a/$expected_core_library"
+printf 'not a library\n' > "$spoof_library/lib/arm64-v8a/$expected_core_library/file.txt"
 spoof_library_apk="$work_dir/spoof-library.apk"
 make_apk "$spoof_library" "$spoof_library_apk"
 expect_failure spoof-library "$spoof_library_apk" arm64-v8a
@@ -1087,14 +1121,14 @@ expect_failure_reason \
 
 missing_core="$work_dir/missing-core"
 copy_fixture "$base_arm64" "$missing_core"
-rm "$missing_core/lib/arm64-v8a/libkodi.so"
+rm "$missing_core/lib/arm64-v8a/$expected_core_library"
 missing_core_apk="$work_dir/missing-core.apk"
 make_apk "$missing_core" "$missing_core_apk"
 expect_failure missing-core "$missing_core_apk" arm64-v8a
 
 mutated_rsa_key="$work_dir/mutated-rsa-key"
 copy_fixture "$base_arm64" "$mutated_rsa_key"
-mutate_allowed_rsa_key "$mutated_rsa_key/lib/arm64-v8a/libkodi.so" A
+mutate_allowed_rsa_key "$mutated_rsa_key/lib/arm64-v8a/$expected_core_library" A
 mutated_rsa_key_apk="$work_dir/mutated-rsa-key.apk"
 make_apk "$mutated_rsa_key" "$mutated_rsa_key_apk"
 expect_failure_reason mutated-rsa-key "$mutated_rsa_key_apk" arm64-v8a \
@@ -1110,7 +1144,7 @@ expect_failure_diagnostic raw-der-asset "$raw_der_asset_apk" arm64-v8a \
 
 raw_der_expected_lib="$work_dir/raw-der-expected-lib"
 copy_fixture "$base_arm64" "$raw_der_expected_lib"
-cat "$allowed_rsa_der" >> "$raw_der_expected_lib/lib/arm64-v8a/libkodi.so"
+cat "$allowed_rsa_der" >> "$raw_der_expected_lib/lib/arm64-v8a/$expected_core_library"
 raw_der_expected_lib_apk="$work_dir/raw-der-expected-lib.apk"
 make_apk "$raw_der_expected_lib" "$raw_der_expected_lib_apk"
 expect_failure_reason raw-der-expected-lib "$raw_der_expected_lib_apk" arm64-v8a \
@@ -1176,7 +1210,7 @@ expect_failure_reason semantic-base64-copy "$semantic_base64_copy_apk" arm64-v8a
 
 wrong_path_rsa_key="$work_dir/wrong-path-rsa-key"
 copy_fixture "$base_arm64" "$wrong_path_rsa_key"
-remove_allowed_rsa_key "$wrong_path_rsa_key/lib/arm64-v8a/libkodi.so"
+remove_allowed_rsa_key "$wrong_path_rsa_key/lib/arm64-v8a/$expected_core_library"
 append_allowed_rsa_key "$wrong_path_rsa_key/assets/copied-key.pem"
 wrong_path_rsa_key_apk="$work_dir/wrong-path-rsa-key.apk"
 make_apk "$wrong_path_rsa_key" "$wrong_path_rsa_key_apk"
@@ -1193,7 +1227,7 @@ expect_failure_reason cross-file-duplicate "$cross_file_duplicate_apk" arm64-v8a
 
 duplicate_rsa_key="$work_dir/duplicate-rsa-key"
 copy_fixture "$base_arm64" "$duplicate_rsa_key"
-append_allowed_rsa_key "$duplicate_rsa_key/lib/arm64-v8a/libkodi.so"
+append_allowed_rsa_key "$duplicate_rsa_key/lib/arm64-v8a/$expected_core_library"
 duplicate_rsa_key_apk="$work_dir/duplicate-rsa-key.apk"
 make_apk "$duplicate_rsa_key" "$duplicate_rsa_key_apk"
 expect_failure_reason duplicate-rsa-key "$duplicate_rsa_key_apk" arm64-v8a \
@@ -1206,7 +1240,7 @@ write_private_armor \
   'PRIVATE KEY' \
   "$allowed_rsa_body"
 cat "$work_dir/additional-private-key.pem" >> \
-  "$additional_private_key/lib/arm64-v8a/libkodi.so"
+  "$additional_private_key/lib/arm64-v8a/$expected_core_library"
 additional_private_key_apk="$work_dir/additional-private-key.apk"
 make_apk "$additional_private_key" "$additional_private_key_apk"
 expect_failure_reason additional-private-key "$additional_private_key_apk" arm64-v8a \
@@ -1214,7 +1248,7 @@ expect_failure_reason additional-private-key "$additional_private_key_apk" arm64
 
 malformed_rsa_key="$work_dir/malformed-rsa-key"
 copy_fixture "$base_arm64" "$malformed_rsa_key"
-mutate_allowed_rsa_key "$malformed_rsa_key/lib/arm64-v8a/libkodi.so" '!'
+mutate_allowed_rsa_key "$malformed_rsa_key/lib/arm64-v8a/$expected_core_library" '!'
 malformed_rsa_key_apk="$work_dir/malformed-rsa-key.apk"
 make_apk "$malformed_rsa_key" "$malformed_rsa_key_apk"
 expect_failure_reason malformed-rsa-key "$malformed_rsa_key_apk" arm64-v8a \
@@ -1222,7 +1256,7 @@ expect_failure_reason malformed-rsa-key "$malformed_rsa_key_apk" arm64-v8a \
 
 unterminated_rsa_key="$work_dir/unterminated-rsa-key"
 copy_fixture "$base_arm64" "$unterminated_rsa_key"
-python3 - "$unterminated_rsa_key/lib/arm64-v8a/libkodi.so" <<'PY'
+python3 - "$unterminated_rsa_key/lib/arm64-v8a/$expected_core_library" <<'PY'
 import pathlib
 import sys
 
@@ -1976,13 +2010,13 @@ PY
 expect_failure path-traversal "$path_traversal_apk" arm64-v8a
 
 symlink_apk="$work_dir/symlink.apk"
-python3 - "$symlink_apk" <<'PY'
+python3 - "$symlink_apk" "$expected_core_library" <<'PY'
 import pathlib
 import stat
 import sys
 import zipfile
 
-link = zipfile.ZipInfo('lib/arm64-v8a/libkodi.so')
+link = zipfile.ZipInfo(f'lib/arm64-v8a/{sys.argv[2]}')
 link.create_system = 3
 link.external_attr = (stat.S_IFLNK | 0o777) << 16
 with zipfile.ZipFile(pathlib.Path(sys.argv[1]), 'w') as archive:

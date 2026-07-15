@@ -30,7 +30,7 @@ env:
   ANDROID_BUILD_TOOLS_VERSION: '36.0.0'
   ANDROID_NDK_VERSION: '28.2.13676358'
   JAVA_VERSION: '17'
-  CACHE_SCHEMA_VERSION: v2
+  CACHE_SCHEMA_VERSION: v3
   CANONICAL_REPOSITORY: ruizkinio/Jumpgate-kodi
 
 jobs:
@@ -154,9 +154,12 @@ jobs:
         if: ${{ matrix.cache_id == 'arm64' }}
         run: |
           python3 tools/ci/jumpgate/test-manager-addon.py
+          python3 tools/ci/jumpgate/test-android-branding.py
+          python3 tools/ci/jumpgate/test-jumpgate-android-release-workflow.py
           bash tools/ci/jumpgate/test-verify-shairplay-crypto-symbols.sh
           python3 tools/ci/jumpgate/test-verify-android-python-runtime.py
           bash tools/ci/jumpgate/test-verify-android-apk.sh
+          bash tools/ci/jumpgate/test-verify-android-release.sh
 
       - name: Derive tracked-source cache keys
         id: source-keys
@@ -179,6 +182,7 @@ jobs:
 
           depends_hash="$(hash_tracked_tree tools/depends)"
           gradle_hash="$(hash_tracked_tree tools/android/packaging)"
+          identity_hash="$(sha256sum version.txt | cut -d ' ' -f 1)"
           toolchain_hash="$({
             printf 'image=%s\n' "${ImageOS:-unknown}"
             printf 'image-version=%s\n' "${ImageVersion:-unknown}"
@@ -199,6 +203,7 @@ jobs:
           {
             echo "depends_hash=$depends_hash"
             echo "gradle_hash=$gradle_hash"
+            echo "identity_hash=$identity_hash"
             echo "toolchain_hash=$toolchain_hash"
           } >> "$GITHUB_OUTPUT"
 
@@ -216,7 +221,7 @@ jobs:
           path: |
             ${{ env.DEPENDS_PREFIX }}
             ${{ env.DEPENDS_STATE_DIR }}
-          key: jumpgate-android-${{ env.CACHE_SCHEMA_VERSION }}-depends-${{ runner.os }}-${{ runner.arch }}-${{ matrix.host }}-${{ steps.source-keys.outputs.toolchain_hash }}-${{ steps.source-keys.outputs.depends_hash }}
+          key: jumpgate-android-${{ env.CACHE_SCHEMA_VERSION }}-depends-${{ runner.os }}-${{ runner.arch }}-${{ matrix.host }}-${{ steps.source-keys.outputs.toolchain_hash }}-${{ steps.source-keys.outputs.depends_hash }}-${{ steps.source-keys.outputs.identity_hash }}
 
       - name: Restore ABI ccache
         id: restore-ccache
@@ -234,7 +239,7 @@ jobs:
           path: |
             ${{ env.GRADLE_USER_HOME }}/caches
             ${{ env.GRADLE_USER_HOME }}/wrapper
-          key: jumpgate-android-${{ env.CACHE_SCHEMA_VERSION }}-gradle-${{ runner.os }}-${{ matrix.host }}-${{ steps.source-keys.outputs.toolchain_hash }}-${{ steps.source-keys.outputs.gradle_hash }}
+          key: jumpgate-android-${{ env.CACHE_SCHEMA_VERSION }}-gradle-${{ runner.os }}-${{ matrix.host }}-${{ steps.source-keys.outputs.toolchain_hash }}-${{ steps.source-keys.outputs.gradle_hash }}-${{ steps.source-keys.outputs.identity_hash }}
 
       - name: Create ephemeral CI signing key
         run: |
@@ -479,6 +484,8 @@ jobs:
           }
 
           expected_package="$(read_version_field APP_PACKAGE)"
+          app_name_lc="$(read_version_field APP_NAME | LC_ALL=C tr '[:upper:]' '[:lower:]')"
+          expected_core_library="lib${app_name_lc}.so"
           version_major="$(read_version_field VERSION_MAJOR)"
           version_minor="$(read_version_field VERSION_MINOR)"
           version_tag="$(read_version_field VERSION_TAG)"
@@ -492,9 +499,11 @@ jobs:
           expected_version_name="${version_major}.${version_minor}-${version_tag}"
           target_platform="$(awk -F= '$1 == "PLATFORM" { print $2 }' tools/depends/Makefile.include)"
           target_prefix="$DEPENDS_PREFIX/$target_platform"
-          source_apk="kodiapp-${{ matrix.abi }}-release.apk"
+          source_apk="${app_name_lc}app-${{ matrix.abi }}-release.apk"
           artifact_apk="$ARTIFACT_DIR/jumpgate-android-ci-ephemeral-signed-${{ matrix.abi }}-${GITHUB_SHA}.apk"
           test -n "$expected_package"
+          [[ "$app_name_lc" =~ ^[a-z][a-z0-9]*$ ]]
+          [[ "$expected_core_library" =~ ^lib[a-z][a-z0-9]*\.so$ ]]
           test -n "$target_platform"
           test -d "$target_prefix"
           [[ "${EXPECTED_APK_SIGNER_SHA256:-}" =~ ^[0-9a-f]{64}$ ]]
@@ -509,7 +518,8 @@ jobs:
             "$ANDROID_PLATFORM_VERSION" \
             "$expected_version_name" \
             "$expected_version_code" \
-            "$EXPECTED_APK_SIGNER_SHA256"
+            "$EXPECTED_APK_SIGNER_SHA256" \
+            "$expected_core_library"
           python3 tools/ci/jumpgate/verify-android-python-runtime.py \
             "$artifact_apk" \
             "${{ matrix.abi }}" \
@@ -529,7 +539,7 @@ jobs:
           path: |
             ${{ env.DEPENDS_PREFIX }}
             ${{ env.DEPENDS_STATE_DIR }}
-          key: jumpgate-android-${{ env.CACHE_SCHEMA_VERSION }}-depends-${{ runner.os }}-${{ runner.arch }}-${{ matrix.host }}-${{ steps.source-keys.outputs.toolchain_hash }}-${{ steps.source-keys.outputs.depends_hash }}
+          key: jumpgate-android-${{ env.CACHE_SCHEMA_VERSION }}-depends-${{ runner.os }}-${{ runner.arch }}-${{ matrix.host }}-${{ steps.source-keys.outputs.toolchain_hash }}-${{ steps.source-keys.outputs.depends_hash }}-${{ steps.source-keys.outputs.identity_hash }}
 
       - name: Save ABI ccache
         if: ${{ github.repository == env.CANONICAL_REPOSITORY && github.event_name != 'pull_request' && steps.restore-ccache.outputs.cache-hit != 'true' }}
@@ -545,7 +555,7 @@ jobs:
           path: |
             ${{ env.GRADLE_USER_HOME }}/caches
             ${{ env.GRADLE_USER_HOME }}/wrapper
-          key: jumpgate-android-${{ env.CACHE_SCHEMA_VERSION }}-gradle-${{ runner.os }}-${{ matrix.host }}-${{ steps.source-keys.outputs.toolchain_hash }}-${{ steps.source-keys.outputs.gradle_hash }}
+          key: jumpgate-android-${{ env.CACHE_SCHEMA_VERSION }}-gradle-${{ runner.os }}-${{ matrix.host }}-${{ steps.source-keys.outputs.toolchain_hash }}-${{ steps.source-keys.outputs.gradle_hash }}-${{ steps.source-keys.outputs.identity_hash }}
 
       - name: Remove ephemeral signing material
         if: ${{ always() }}
