@@ -50,6 +50,21 @@
 using namespace KODI;
 using namespace std::chrono_literals;
 
+#ifdef TARGET_ANDROID
+namespace
+{
+uint64_t GetJumpgateLifecycleToken(const CFileItem& file)
+{
+  const CVariant& property = file.GetProperty("jumpgate.lifecycle_token");
+  if (property.isUnsignedInteger())
+    return property.asUnsignedInteger();
+  if (property.isSignedInteger() && property.asInteger() > 0)
+    return static_cast<uint64_t>(property.asInteger());
+  return 0;
+}
+} // namespace
+#endif
+
 uint64_t CApplicationPlayerCallback::GetPlaybackToken(const CFileItem& file)
 {
   uint64_t token = 0;
@@ -79,8 +94,10 @@ void CApplicationPlayerCallback::OnPlayBackOpenFailed(const CFileItem& file)
   if (!m_playbackAttempts.CancelOpen(token))
     return;
 #ifdef TARGET_ANDROID
-  if (CXBMCApp::HasInstance())
-    CXBMCApp::Get().CommitExternalPlaybackOpenFailure(token);
+  const auto appTarget =
+      jni::CJNIMainActivity::AcquireAppInstance(GetJumpgateLifecycleToken(file));
+  if (auto* app = dynamic_cast<CXBMCApp*>(appTarget.get()))
+    app->CommitExternalPlaybackOpenFailure(token);
 #endif
 }
 

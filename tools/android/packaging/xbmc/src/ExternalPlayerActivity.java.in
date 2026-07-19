@@ -70,9 +70,10 @@ public class ExternalPlayerActivity extends Splash {
     }
 
     synchronized boolean deliver(ExternalPlayerResultCoordinator.Terminal terminal) {
-      if (!mOwner.claim(terminal)) return false;
+      ExternalPlayerResultCoordinator.Owner completedOwner = mOwner.copy();
+      if (!completedOwner.claim(terminal) || !mHost.persist(completedOwner.copy())) return false;
 
-      mHost.persist(mOwner.copy());
+      mOwner = completedOwner;
       mHost.setTerminalResult(terminal);
       mHost.finishOwner();
       if (!terminal.exitProcess || !mHost.acknowledge(terminal))
@@ -81,11 +82,12 @@ public class ExternalPlayerActivity extends Splash {
     }
 
     synchronized boolean cancelForCaller() {
-      if (!claimCancellation()) return false;
+      ExternalPlayerResultCoordinator.Owner canceledOwner = canceledOwner();
+      if (canceledOwner == null || !mHost.persist(canceledOwner.copy())) return false;
 
-      long generation = mOwner.expectedGeneration();
-      String requestId = mOwner.requestId();
-      mHost.persist(mOwner.copy());
+      mOwner = canceledOwner;
+      long generation = canceledOwner.expectedGeneration();
+      String requestId = canceledOwner.requestId();
       mHost.setCanceledResult();
       mHost.finishOwner();
       finishCancellation(requestId, generation);
@@ -93,12 +95,27 @@ public class ExternalPlayerActivity extends Splash {
     }
 
     synchronized boolean abandonFinishedOwner() {
-      if (!claimCancellation()) return false;
+      ExternalPlayerResultCoordinator.Owner canceledOwner = canceledOwner();
+      if (canceledOwner == null || !mHost.persist(canceledOwner.copy())) return false;
 
-      long generation = mOwner.expectedGeneration();
-      String requestId = mOwner.requestId();
-      mHost.persist(mOwner.copy());
+      mOwner = canceledOwner;
+      long generation = canceledOwner.expectedGeneration();
+      String requestId = canceledOwner.requestId();
       finishCancellation(requestId, generation);
+      return true;
+    }
+
+    synchronized boolean cancelForTeardown(String requestId, long generation) {
+      if (!mOwner.requestId().equals(requestId) || mOwner.expectedGeneration() != generation)
+        return false;
+      ExternalPlayerResultCoordinator.Owner canceledOwner = canceledOwner();
+      if (canceledOwner == null || !mHost.persist(canceledOwner.copy())) return false;
+
+      mOwner = canceledOwner;
+      mHost.setCanceledResult();
+      mHost.finishOwner();
+      if (generation > 0) mHost.clearExact(requestId, generation);
+      else mHost.clearUnbound(requestId);
       return true;
     }
 
@@ -109,12 +126,15 @@ public class ExternalPlayerActivity extends Splash {
 
       String staleRequestId = mOwner.requestId();
       long staleGeneration = mOwner.expectedGeneration();
+      ExternalPlayerResultCoordinator.Owner replacementOwner =
+          new ExternalPlayerResultCoordinator.Owner(
+              replacementRequestId, false, 0, false, false);
+      if (!mHost.persist(replacementOwner.copy())) return false;
+
       if (staleGeneration > 0) mHost.clearExact(staleRequestId, staleGeneration);
       else mHost.clearUnbound(staleRequestId);
 
-      mOwner =
-          new ExternalPlayerResultCoordinator.Owner(replacementRequestId, false, 0, false, false);
-      if (!mHost.persist(mOwner.copy())) return false;
+      mOwner = replacementOwner;
       return forwardOnce();
     }
 
@@ -126,10 +146,14 @@ public class ExternalPlayerActivity extends Splash {
       return mOwner.copy();
     }
 
-    private boolean claimCancellation() {
-      long generation = mOwner.expectedGeneration();
-      if (generation > 0) return mOwner.cancel(generation, mOwner.requestId());
-      return mOwner.cancelBeforeAdmission();
+    private ExternalPlayerResultCoordinator.Owner canceledOwner() {
+      ExternalPlayerResultCoordinator.Owner canceledOwner = mOwner.copy();
+      long generation = canceledOwner.expectedGeneration();
+      boolean canceled =
+          generation > 0
+              ? canceledOwner.cancel(generation, canceledOwner.requestId())
+              : canceledOwner.cancelBeforeAdmission();
+      return canceled ? canceledOwner : null;
     }
 
     private void finishCancellation(String requestId, long generation) {
@@ -214,8 +238,10 @@ public class ExternalPlayerActivity extends Splash {
       unregisterReceiver(mResultReceiver);
       mReceiverRegistered = false;
     }
-    if (mController != null && isFinishing() && !isChangingConfigurations())
-      mController.abandonFinishedOwner();
+    if (mController != null && isFinishing() && !isChangingConfigurations()) {
+      ExternalPlayerResultCoordinator.Owner owner = mController.owner();
+      mController.cancelForTeardown(owner.requestId(), owner.expectedGeneration());
+    }
     super.onDestroy();
   }
 

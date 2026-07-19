@@ -29,6 +29,18 @@ std::optional<int64_t> ParseJumpgatePositiveInt64(std::string_view value)
   return static_cast<int64_t>(parsed);
 }
 
+bool IsJumpgateResumeCorrectionWithinWindow(int64_t playbackStartedAtMs,
+                                            int64_t observedAtMs,
+                                            int64_t windowMs)
+{
+  if (playbackStartedAtMs < 0 || observedAtMs < 0 || windowMs < 0)
+    return false;
+  if (playbackStartedAtMs == 0)
+    return true;
+  return observedAtMs >= playbackStartedAtMs &&
+         observedAtMs - playbackStartedAtMs <= windowMs;
+}
+
 bool CJumpgatePlaybackHistoryState::AdvanceGeneration(uint64_t generation)
 {
   std::lock_guard<std::mutex> lock(m_mutex);
@@ -43,8 +55,50 @@ bool CJumpgatePlaybackHistoryState::AdvanceGeneration(uint64_t generation)
 bool CJumpgatePlaybackHistoryState::Activate(JumpgatePlaybackHistoryIdentity identity,
                                              int64_t activatedAtMs)
 {
-  if (!IsValidJumpgateHistoryProfileId(identity.profileId) ||
-      !IsValidJumpgateHistoryContentKey(identity.contentKey) || activatedAtMs < 0 ||
+  const JumpgatePlaybackHistoryKey key{identity.historyNamespace, identity.profileId,
+                                       identity.contentKey};
+  if (!IsValidJumpgatePlaybackHistoryKey(key) || activatedAtMs < 0 ||
+      (identity.canonicalIdentity &&
+       !IsValidJumpgateHistoryCanonicalIdentity(*identity.canonicalIdentity)) ||
+      (identity.historyNamespace == JumpgatePlaybackHistoryNamespace::LocalSource &&
+       identity.canonicalIdentity))
+  {
+    return false;
+  }
+
+  std::lock_guard<std::mutex> lock(m_mutex);
+  if (identity.generation == 0 || identity.generation != m_generation || m_active)
+    return false;
+  ++m_resumeSerial;
+  m_active =
+      ActiveState{std::move(identity), 0, 0, activatedAtMs, false, std::nullopt, std::nullopt};
+  return true;
+}
+
+bool CJumpgatePlaybackHistoryState::ActivateLocalSource(
+    uint64_t generation,
+    const std::vector<std::string>& canonicalFingerprints,
+    std::string_view rawLaunchUri,
+    int64_t activatedAtMs)
+{
+  std::optional<std::string> contentKey =
+      DeriveJumpgateLocalSourceHistoryKey(canonicalFingerprints);
+  if (!contentKey)
+    contentKey = DeriveJumpgateLocalSourceFallbackHistoryKey(rawLaunchUri);
+
+  JumpgatePlaybackHistoryIdentity identity;
+  identity.generation = generation;
+  identity.historyNamespace = JumpgatePlaybackHistoryNamespace::LocalSource;
+  identity.contentKey = std::move(*contentKey);
+  return Activate(std::move(identity), activatedAtMs);
+}
+
+bool CJumpgatePlaybackHistoryState::Promote(JumpgatePlaybackHistoryIdentity identity)
+{
+  const JumpgatePlaybackHistoryKey key{identity.historyNamespace, identity.profileId,
+                                       identity.contentKey};
+  if (identity.historyNamespace != JumpgatePlaybackHistoryNamespace::AuthenticatedProfile ||
+      !IsValidJumpgatePlaybackHistoryKey(key) ||
       (identity.canonicalIdentity &&
        !IsValidJumpgateHistoryCanonicalIdentity(*identity.canonicalIdentity)))
   {
@@ -52,10 +106,17 @@ bool CJumpgatePlaybackHistoryState::Activate(JumpgatePlaybackHistoryIdentity ide
   }
 
   std::lock_guard<std::mutex> lock(m_mutex);
-  if (identity.generation == 0 || identity.generation != m_generation)
+  if (!m_active || m_active->finalSnapshot || identity.generation == 0 ||
+      identity.generation != m_generation || identity.generation != m_active->identity.generation ||
+      m_active->identity.historyNamespace != JumpgatePlaybackHistoryNamespace::LocalSource ||
+      m_active->identity.contentKey == identity.contentKey)
+  {
     return false;
+  }
+
   ++m_resumeSerial;
-  m_active = ActiveState{std::move(identity), 0, 0, activatedAtMs, false, std::nullopt};
+  m_active->identity = std::move(identity);
+  m_active->resumeApplied = false;
   return true;
 }
 
@@ -110,6 +171,7 @@ std::optional<JumpgatePlaybackHistoryEntry> CJumpgatePlaybackHistoryState::Final
     return std::nullopt;
 
   JumpgatePlaybackHistoryEntry entry;
+  entry.historyNamespace = m_active->identity.historyNamespace;
   entry.profileId = m_active->identity.profileId;
   entry.contentKey = m_active->identity.contentKey;
   entry.canonicalIdentity = m_active->identity.canonicalIdentity;
@@ -131,8 +193,10 @@ std::optional<JumpgatePlaybackResumeToken> CJumpgatePlaybackHistoryState::BeginR
   {
     return std::nullopt;
   }
-  return JumpgatePlaybackResumeToken{generation, m_resumeSerial, m_active->identity.profileId,
-                                     m_active->identity.contentKey};
+  return JumpgatePlaybackResumeToken{generation, m_resumeSerial,
+                                     m_active->identity.historyNamespace,
+                                     m_active->identity.profileId, m_active->identity.contentKey,
+                                     m_active->appliedResumePositionMs};
 }
 
 bool CJumpgatePlaybackHistoryState::ApplyResume(const JumpgatePlaybackResumeToken& token,
@@ -144,12 +208,15 @@ bool CJumpgatePlaybackHistoryState::ApplyResume(const JumpgatePlaybackResumeToke
   std::lock_guard<std::mutex> lock(m_mutex);
   if (!m_active || m_active->resumeApplied || m_active->finalSnapshot ||
       token.generation != m_generation || token.generation != m_active->identity.generation ||
-      token.serial != m_resumeSerial || token.profileId != m_active->identity.profileId ||
+      token.serial != m_resumeSerial ||
+      token.historyNamespace != m_active->identity.historyNamespace ||
+      token.profileId != m_active->identity.profileId ||
       token.contentKey != m_active->identity.contentKey)
   {
     return false;
   }
   m_active->resumeApplied = true;
+  m_active->appliedResumePositionMs = positionMs;
   apply(positionMs);
   return true;
 }

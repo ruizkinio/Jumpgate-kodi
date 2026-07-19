@@ -16,9 +16,12 @@
 #include <iomanip>
 #include <iterator>
 #include <mutex>
+#include <random>
 #include <regex>
 #include <sstream>
+#include <stdexcept>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -102,21 +105,54 @@ class CTemporaryDirectory final
 public:
   CTemporaryDirectory()
   {
-    static std::atomic<std::uint64_t> next{1};
-    m_path = std::filesystem::temp_directory_path() /
-             ("kodi-jumpgate-subtitle-test-" + std::to_string(next.fetch_add(1)));
     std::error_code error;
-    std::filesystem::remove_all(m_path, error);
-    EXPECT_TRUE(std::filesystem::create_directories(m_path));
+    const std::filesystem::path parent = std::filesystem::temp_directory_path(error);
+    if (error)
+      throw std::runtime_error("Failed to locate the temporary directory: " + error.message());
+
+    std::random_device random;
+    std::uniform_int_distribution<std::uint64_t> nonce;
+    constexpr int maxAttempts = 256;
+    for (int attempt = 0; attempt < maxAttempts; ++attempt)
+    {
+      std::ostringstream name;
+      name << "kodi-jumpgate-subtitle-test-" << std::hex << std::setfill('0') << std::setw(16)
+           << nonce(random) << '-' << attempt;
+      std::filesystem::path candidate = parent / name.str();
+      error.clear();
+      // Atomic creation, rather than the random suffix, establishes ownership.
+      if (!std::filesystem::create_directory(candidate, error))
+      {
+        if (!error || error == std::errc::file_exists)
+          continue;
+        throw std::runtime_error("Failed to create temporary directory '" + candidate.string() +
+                                 "': " + error.message());
+      }
+
 #if !defined(_WIN32)
-    std::filesystem::permissions(m_path, std::filesystem::perms::owner_all,
-                                 std::filesystem::perm_options::replace, error);
-    EXPECT_FALSE(error) << error.message();
+      std::filesystem::permissions(candidate, std::filesystem::perms::owner_all,
+                                   std::filesystem::perm_options::replace, error);
+      if (error)
+      {
+        const std::string message = "Failed to secure temporary directory '" +
+                                    candidate.string() + "': " + error.message();
+        std::error_code cleanupError;
+        std::filesystem::remove_all(candidate, cleanupError);
+        throw std::runtime_error(message);
+      }
 #endif
+      m_path = std::move(candidate);
+      return;
+    }
+
+    throw std::runtime_error("Failed to acquire an isolated temporary directory after " +
+                             std::to_string(maxAttempts) + " atomic attempts");
   }
 
   ~CTemporaryDirectory()
   {
+    if (m_path.empty())
+      return;
     std::error_code error;
     std::filesystem::remove_all(m_path, error);
   }

@@ -707,7 +707,8 @@ bool CApplicationMessageHandling::OnMessage(const CGUIMessage& message)
 #endif
 
 #ifdef TARGET_ANDROID
-      CXBMCApp::Get().DeliverPendingExternalPlayerResult();
+      if (CXBMCApp::HasInstance())
+        CXBMCApp::Get().QueuePendingExternalPlayerResult();
 #endif
 
       playCountIncrementedHandler.HandlePlaycountIncremented();
@@ -773,7 +774,8 @@ bool CApplicationMessageHandling::OnMessage(const CGUIMessage& message)
           m_app.GetComponent<CApplicationPlayer>()->ClosePlayer();
 
 #ifdef TARGET_ANDROID
-          CXBMCApp::Get().DeliverPendingExternalPlayerResult();
+          if (CXBMCApp::HasInstance())
+            CXBMCApp::Get().QueuePendingExternalPlayerResult();
 #endif
         }
 

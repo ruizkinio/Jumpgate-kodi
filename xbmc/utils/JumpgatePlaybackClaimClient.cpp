@@ -34,6 +34,30 @@ constexpr std::size_t MAX_REQUEST_BODY_BYTES = 8 * 1024;
 constexpr std::size_t MAX_RESPONSE_BODY_BYTES = 2 * 1024 * 1024;
 constexpr std::int64_t MAX_DATE_MILLISECONDS = 8640000000000000LL;
 
+bool IsCanonicalUuid(std::string_view value)
+{
+  static const std::regex pattern(
+      "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$");
+  return std::regex_match(value.begin(), value.end(), pattern);
+}
+
+bool IsHistoryGrant(std::string_view value)
+{
+  if (value.size() < 26 || value.size() > 132 || value.substr(0, 4) != "hg1_")
+    return false;
+  return std::all_of(value.begin() + 4, value.end(),
+                     [](char item)
+                     {
+                       return (item >= 'A' && item <= 'Z') || (item >= 'a' && item <= 'z') ||
+                              (item >= '0' && item <= '9') || item == '_' || item == '-';
+                     });
+}
+
+bool IsHistoryGrantKind(std::string_view value)
+{
+  return value == "canonical" || value == "local" || value == "negative";
+}
+
 void SecureClear(std::string& value)
 {
   volatile char* data = value.empty() ? nullptr : value.data();
@@ -246,10 +270,24 @@ bool IsCanonicalTimestamp(std::string_view value)
   return day >= 1 && day <= maximumDay;
 }
 
+bool ReadPositiveSafeInteger(const CVariant& value, std::uint64_t& result)
+{
+  constexpr std::uint64_t MAX_SAFE_INTEGER = 9007199254740991ULL;
+  if (value.isUnsignedInteger())
+    result = value.asUnsignedInteger();
+  else if (value.isSignedInteger() && value.asInteger() > 0)
+    result = static_cast<std::uint64_t>(value.asInteger());
+  else
+    return false;
+
+  return result > 0 && result <= MAX_SAFE_INTEGER;
+}
+
 bool IsValidClaimRequest(const PlaybackClaimRequest& request)
 {
   if (!IsCanonicalOrigin(request.bridgeOrigin) || !IsOpaqueAscii(request.deviceToken, 32, 128) ||
-      request.fingerprints.empty() || request.fingerprints.size() > MAX_FINGERPRINTS ||
+      !IsCanonicalUuid(request.attemptId) || request.fingerprints.empty() ||
+      request.fingerprints.size() > MAX_FINGERPRINTS ||
       !std::all_of(request.fingerprints.begin(), request.fingerprints.end(), IsExactFingerprint) ||
       !IsLowerHexDigest(request.intentUrlHash) || request.launchedAt <= 0 ||
       request.launchedAt > MAX_DATE_MILLISECONDS)
@@ -264,12 +302,13 @@ bool IsValidClaimRequest(const PlaybackClaimRequest& request)
 bool IsValidReleaseRequest(const PlaybackReleaseRequest& request)
 {
   return IsCanonicalOrigin(request.bridgeOrigin) && IsOpaqueAscii(request.deviceToken, 32, 128) &&
-         IsOpaqueAscii(request.sessionId, 8, 128);
+         IsOpaqueAscii(request.sessionId, 8, 128) && IsCanonicalUuid(request.terminalReceiptId);
 }
 
 bool SerializeClaimRequest(const PlaybackClaimRequest& request, std::string& body)
 {
   CVariant root{CVariant::VariantTypeObject};
+  root["attemptId"] = request.attemptId;
   root["fingerprints"] = request.fingerprints;
   root["intentUrlHash"] = request.intentUrlHash;
   root["launchedAt"] = request.launchedAt;
@@ -287,6 +326,7 @@ bool SerializeReleaseRequest(const PlaybackReleaseRequest& request, std::string&
 {
   CVariant root{CVariant::VariantTypeObject};
   root["sessionId"] = request.sessionId;
+  root["terminalReceiptId"] = request.terminalReceiptId;
   return CJSONVariantWriter::Write(root, body, true) && body.size() <= MAX_REQUEST_BODY_BYTES;
 }
 
@@ -319,21 +359,44 @@ bool ParseClaimResponse(const std::string& body, PlaybackClaimResult& result)
   const std::string status = root["status"].asString();
   if (status == "ambiguous" || status == "expired" || status == "not_found")
   {
-    if (root.size() != 1 || !HasOnlyMembers(root, {"status"}))
+    std::uint64_t sessionRevision = 0;
+    if (root.size() != 5 ||
+        !HasOnlyMembers(
+            root, {"status", "sessionId", "sessionRevision", "historyGrant", "historyGrantKind"}) ||
+        !root.isMember("sessionId") || !root["sessionId"].isString() ||
+        !IsOpaqueAscii(root["sessionId"].asString(), 8, 128) || !root.isMember("sessionRevision") ||
+        !ReadPositiveSafeInteger(root["sessionRevision"], sessionRevision) ||
+        !root.isMember("historyGrant") || !root["historyGrant"].isString() ||
+        !IsHistoryGrant(root["historyGrant"].asString()) || !root.isMember("historyGrantKind") ||
+        !root["historyGrantKind"].isString() || root["historyGrantKind"].asString() != "negative")
+    {
       return false;
+    }
     if (status == "ambiguous")
       result.status = PlaybackClaimStatus::Ambiguous;
     else if (status == "expired")
       result.status = PlaybackClaimStatus::Expired;
     else
       result.status = PlaybackClaimStatus::NotFound;
+    result.claim.sessionId = root["sessionId"].asString();
+    result.claim.sessionRevision = sessionRevision;
+    result.claim.historyGrant = root["historyGrant"].asString();
+    result.claim.historyGrantKind = root["historyGrantKind"].asString();
     return true;
   }
 
-  if (status != "claimed" || root.size() != 5 ||
-      !HasOnlyMembers(root, {"status", "sessionId", "context", "claimedAt", "expiresAt"}) ||
+  std::uint64_t sessionRevision = 0;
+  if (status != "claimed" || root.size() != 8 ||
+      !HasOnlyMembers(root, {"status", "sessionId", "sessionRevision", "historyGrant",
+                             "historyGrantKind", "context", "claimedAt", "expiresAt"}) ||
       !root.isMember("sessionId") || !root["sessionId"].isString() ||
-      !IsOpaqueAscii(root["sessionId"].asString(), 8, 128) || !root.isMember("context") ||
+      !IsOpaqueAscii(root["sessionId"].asString(), 8, 128) || !root.isMember("sessionRevision") ||
+      !ReadPositiveSafeInteger(root["sessionRevision"], sessionRevision) ||
+      !root.isMember("historyGrant") || !root["historyGrant"].isString() ||
+      !IsHistoryGrant(root["historyGrant"].asString()) || !root.isMember("historyGrantKind") ||
+      !root["historyGrantKind"].isString() ||
+      !IsHistoryGrantKind(root["historyGrantKind"].asString()) ||
+      root["historyGrantKind"].asString() == "negative" || !root.isMember("context") ||
       !root["context"].isObject() || root["context"].empty() || !root.isMember("claimedAt") ||
       !root["claimedAt"].isString() || !IsCanonicalTimestamp(root["claimedAt"].asString()) ||
       !root.isMember("expiresAt") || !root["expiresAt"].isString() ||
@@ -345,6 +408,9 @@ bool ParseClaimResponse(const std::string& body, PlaybackClaimResult& result)
 
   result.status = PlaybackClaimStatus::Claimed;
   result.claim.sessionId = root["sessionId"].asString();
+  result.claim.sessionRevision = sessionRevision;
+  result.claim.historyGrant = root["historyGrant"].asString();
+  result.claim.historyGrantKind = root["historyGrantKind"].asString();
   result.claim.context = root["context"];
   result.claim.claimedAt = root["claimedAt"].asString();
   result.claim.expiresAt = root["expiresAt"].asString();
@@ -384,6 +450,12 @@ JumpgatePlaybackHttpRequest::~JumpgatePlaybackHttpRequest()
 void JumpgatePlaybackHttpRequest::ClearSensitive()
 {
   SecureClear(authorization);
+  for (auto& header : headers)
+  {
+    SecureClear(header.name);
+    SecureClear(header.value);
+  }
+  headers.clear();
   SecureClear(body);
 }
 
@@ -401,6 +473,31 @@ CJumpgatePlaybackClaimClient::CJumpgatePlaybackClaimClient(
     IJumpgatePlaybackClaimTransport& transport)
   : m_transport(transport)
 {
+}
+
+void PlaybackClaim::ClearSensitive()
+{
+  SecureClear(sessionId);
+  SecureClear(historyGrant);
+  historyGrantKind.clear();
+  context.clear();
+  claimedAt.clear();
+  expiresAt.clear();
+  sessionRevision = 0;
+}
+
+void PlaybackClaimResult::ClearSensitive()
+{
+  claim.ClearSensitive();
+  httpStatus = 0;
+}
+
+void PlaybackReleaseRequest::ClearSensitive()
+{
+  bridgeOrigin.clear();
+  SecureClear(deviceToken);
+  SecureClear(sessionId);
+  SecureClear(terminalReceiptId);
 }
 
 PlaybackClaimResult CJumpgatePlaybackClaimClient::Claim(const PlaybackClaimRequest& request) const

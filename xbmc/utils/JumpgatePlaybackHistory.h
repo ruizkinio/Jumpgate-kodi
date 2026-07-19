@@ -17,6 +17,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace KODI::JUMPGATE
@@ -24,6 +25,21 @@ namespace KODI::JUMPGATE
 
 constexpr std::size_t JUMPGATE_HISTORY_MAX_ENTRIES = 256;
 constexpr std::size_t JUMPGATE_HISTORY_MAX_BYTES = 512 * 1024;
+constexpr std::size_t JUMPGATE_HISTORY_PROFILE_PROTECTION_RESERVE_BYTES = 4 * 1024;
+
+enum class JumpgatePlaybackHistoryNamespace
+{
+  AuthenticatedProfile,
+  LocalSource,
+};
+
+struct JumpgatePlaybackHistoryKey
+{
+  JumpgatePlaybackHistoryNamespace historyNamespace{
+      JumpgatePlaybackHistoryNamespace::AuthenticatedProfile};
+  std::string profileId;
+  std::string contentKey;
+};
 
 struct JumpgatePlaybackHistoryDisplay
 {
@@ -35,6 +51,8 @@ struct JumpgatePlaybackHistoryDisplay
 
 struct JumpgatePlaybackHistoryEntry
 {
+  JumpgatePlaybackHistoryNamespace historyNamespace{
+      JumpgatePlaybackHistoryNamespace::AuthenticatedProfile};
   std::string profileId;
   std::string contentKey;
   std::optional<JumpgateCanonicalIdentity> canonicalIdentity;
@@ -51,11 +69,18 @@ struct JumpgatePlaybackHistoryDocument
   std::vector<JumpgatePlaybackHistoryEntry> entries;
   std::vector<std::string> blockedProfiles;
   std::vector<std::string> forgottenProfiles;
+  bool loadedFromLegacySchema{false};
 };
 
 bool IsValidJumpgateHistoryProfileId(const std::string& profileId);
 bool IsValidJumpgateHistoryContentKey(const std::string& contentKey);
 bool IsValidJumpgateHistoryCanonicalIdentity(const JumpgateCanonicalIdentity& identity);
+bool IsValidJumpgatePlaybackHistoryKey(const JumpgatePlaybackHistoryKey& key);
+JumpgatePlaybackHistoryKey GetJumpgatePlaybackHistoryKey(const JumpgatePlaybackHistoryEntry& entry);
+const char* ToString(JumpgatePlaybackHistoryNamespace historyNamespace);
+std::optional<std::string> DeriveJumpgateLocalSourceHistoryKey(
+    const std::vector<std::string>& canonicalFingerprints);
+std::string DeriveJumpgateLocalSourceFallbackHistoryKey(std::string_view rawLaunchUri);
 bool IsJumpgatePlaybackThresholdReached(int64_t positionMs, int64_t durationMs, int percentage);
 int64_t GetJumpgatePlaybackResumePosition(const JumpgatePlaybackHistoryEntry& entry);
 
@@ -71,11 +96,10 @@ class CJumpgatePlaybackHistoryStore final
 public:
   explicit CJumpgatePlaybackHistoryStore(IJumpgateProfileStorage& storage);
 
-  bool Get(const std::string& profileId,
-           const std::string& contentKey,
+  bool Get(const JumpgatePlaybackHistoryKey& key,
            std::optional<JumpgatePlaybackHistoryEntry>& entry,
            std::string& error) const;
-  bool Save(const std::string& expectedProfileId,
+  bool Save(const JumpgatePlaybackHistoryKey& expectedKey,
             JumpgatePlaybackHistoryEntry entry,
             std::string& error);
   bool ClearProfile(const std::string& profileId, std::string& error);
@@ -93,9 +117,11 @@ public:
 private:
   bool Load(JumpgatePlaybackHistoryDocument& document, std::string& error) const;
   bool WriteCandidate(JumpgatePlaybackHistoryDocument& document,
-                      const std::string& retainedProfileId,
-                      const std::string& retainedContentKey,
+                      const JumpgatePlaybackHistoryKey& retainedKey,
                       std::string& error);
+  bool WriteDestructiveProtectionCandidate(JumpgatePlaybackHistoryDocument& document,
+                                           const std::string& affectedProfileId,
+                                           std::string& error);
   bool WriteExact(const JumpgatePlaybackHistoryDocument& document, std::string& error);
 
   IJumpgateProfileStorage& m_storage;

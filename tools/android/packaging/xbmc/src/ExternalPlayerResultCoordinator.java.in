@@ -61,6 +61,56 @@ public final class ExternalPlayerResultCoordinator {
     }
   }
 
+  public static final class Admission {
+    private final long mGeneration;
+    private final String mRequestId;
+    private final boolean mCancellationRequested;
+
+    private Admission(long generation, String requestId, boolean cancellationRequested) {
+      mGeneration = generation;
+      mRequestId = requestId;
+      mCancellationRequested = cancellationRequested;
+    }
+
+    public long generation() {
+      return mGeneration;
+    }
+
+    public String requestId() {
+      return mRequestId;
+    }
+
+    public boolean wasCancellationRequested() {
+      return mCancellationRequested;
+    }
+  }
+
+  public static final class TerminalReservation {
+    private final Producer mProducer;
+    private final Terminal mTerminal;
+    private final boolean mPreparedRejection;
+    private boolean mOpen = true;
+
+    private TerminalReservation(
+        Producer producer, Terminal terminal, boolean preparedRejection) {
+      mProducer = producer;
+      mTerminal = terminal;
+      mPreparedRejection = preparedRejection;
+    }
+
+    public Terminal terminal() {
+      return mTerminal;
+    }
+
+    public boolean commit() {
+      return mProducer.commit(this);
+    }
+
+    public boolean rollback() {
+      return mProducer.rollback(this);
+    }
+  }
+
   public static final class ProcessExitState {
     private String mRequestId;
     private long mGeneration;
@@ -185,9 +235,67 @@ public final class ExternalPlayerResultCoordinator {
     private boolean mExitAcknowledged;
     private boolean mExitScheduled;
     private boolean mOwnerCanceled;
+    private String mPreparedRequestId = "";
+    private boolean mPreparedCancellation;
+    private TerminalReservation mTerminalReservation;
+
+    public synchronized boolean prepare(String requestId) {
+      if (!isValidRequestId(requestId)) return false;
+      if (!mPreparedRequestId.isEmpty()) return mPreparedRequestId.equals(requestId);
+      if (mGeneration > 0 && mRequestId.equals(requestId)) return true;
+
+      mPreparedRequestId = requestId;
+      mPreparedCancellation = false;
+      return true;
+    }
+
+    public synchronized boolean cancelPrepared(String requestId) {
+      if (!isValidRequestId(requestId) || !mPreparedRequestId.equals(requestId)) return false;
+
+      mPreparedCancellation = true;
+      return true;
+    }
+
+    public synchronized Admission admitPrepared(long generation, String requestId) {
+      if (generation <= mGeneration
+          || !isValidRequestId(requestId)
+          || !mPreparedRequestId.equals(requestId)
+          || mTerminalReservation != null
+          || (mGeneration > 0 && !mTerminalClaimed)) return null;
+
+      boolean cancellationRequested = mPreparedCancellation;
+      if (!begin(generation, requestId)) return null;
+      mPreparedRequestId = "";
+      mPreparedCancellation = false;
+      mOwnerCanceled = cancellationRequested;
+      return new Admission(generation, requestId, cancellationRequested);
+    }
+
+    public synchronized TerminalReservation reservePreparedRejection(
+        long generation, String requestId) {
+      if (generation <= 0
+          || !isValidRequestId(requestId)
+          || !mPreparedRequestId.equals(requestId)
+          || mTerminalReservation != null) return null;
+
+      return reserve(new Terminal(requestId, generation, 0, 0, false, false), true);
+    }
+
+    public synchronized Terminal rejectPrepared(long generation, String requestId) {
+      TerminalReservation reservation = reservePreparedRejection(generation, requestId);
+      if (reservation == null) return null;
+
+      Terminal terminal = reservation.terminal();
+      if (reservation.commit()) return terminal;
+      reservation.rollback();
+      return null;
+    }
 
     public synchronized boolean begin(long generation, String requestId) {
-      if (generation <= mGeneration || !isValidRequestId(requestId)) return false;
+      if (generation <= mGeneration
+          || !isValidRequestId(requestId)
+          || mTerminalReservation != null
+          || (mGeneration > 0 && !mTerminalClaimed)) return false;
 
       mGeneration = generation;
       mRequestId = requestId;
@@ -199,6 +307,23 @@ public final class ExternalPlayerResultCoordinator {
       return true;
     }
 
+    public synchronized TerminalReservation reserveFinish(
+        long generation,
+        String requestId,
+        long positionMs,
+        long durationMs,
+        boolean completed,
+        boolean exitProcess) {
+      if (!matches(generation, requestId)
+          || mTerminalClaimed
+          || mTerminalReservation != null) return null;
+
+      return reserve(
+          new Terminal(
+              requestId, generation, positionMs, durationMs, completed, exitProcess),
+          false);
+    }
+
     public synchronized Terminal finish(
         long generation,
         String requestId,
@@ -206,11 +331,20 @@ public final class ExternalPlayerResultCoordinator {
         long durationMs,
         boolean completed,
         boolean exitProcess) {
-      if (!matches(generation, requestId) || mTerminalClaimed) return null;
+      TerminalReservation reservation =
+          reserveFinish(
+              generation, requestId, positionMs, durationMs, completed, exitProcess);
+      if (reservation == null) return null;
 
-      mTerminalClaimed = true;
-      mExitProcess = exitProcess;
-      return new Terminal(requestId, generation, positionMs, durationMs, completed, exitProcess);
+      Terminal terminal = reservation.terminal();
+      if (reservation.commit()) return terminal;
+      reservation.rollback();
+      return null;
+    }
+
+    public synchronized TerminalReservation reserveSupersede(
+        long generation, String requestId) {
+      return reserveFinish(generation, requestId, 0, 0, false, false);
     }
 
     public synchronized Terminal supersede(long generation, String requestId) {
@@ -222,7 +356,24 @@ public final class ExternalPlayerResultCoordinator {
     }
 
     public synchronized boolean ownsRequest(String requestId) {
-      return mGeneration > 0 && mRequestId.equals(requestId);
+      return (mGeneration > 0 && mRequestId.equals(requestId))
+          || (!mPreparedRequestId.isEmpty() && mPreparedRequestId.equals(requestId));
+    }
+
+    public synchronized boolean isPrepared(String requestId) {
+      return isValidRequestId(requestId) && mPreparedRequestId.equals(requestId);
+    }
+
+    public synchronized long activeGeneration() {
+      return mGeneration;
+    }
+
+    public synchronized String activeRequestId() {
+      return mRequestId;
+    }
+
+    public synchronized String preparedRequestId() {
+      return mPreparedRequestId;
     }
 
     public synchronized boolean acknowledgeExit(long generation, String requestId) {
@@ -259,7 +410,7 @@ public final class ExternalPlayerResultCoordinator {
     }
 
     public synchronized void clear(long generation, String requestId) {
-      if (!matches(generation, requestId)) return;
+      if (!matches(generation, requestId) || mTerminalReservation != null) return;
 
       mGeneration = 0;
       mRequestId = "";
@@ -268,6 +419,158 @@ public final class ExternalPlayerResultCoordinator {
       mExitAcknowledged = false;
       mExitScheduled = false;
       mOwnerCanceled = false;
+      if (mPreparedRequestId.equals(requestId)) {
+        mPreparedRequestId = "";
+        mPreparedCancellation = false;
+      }
+    }
+
+    private TerminalReservation reserve(Terminal terminal, boolean preparedRejection) {
+      TerminalReservation reservation =
+          new TerminalReservation(this, terminal, preparedRejection);
+      mTerminalReservation = reservation;
+      return reservation;
+    }
+
+    private synchronized boolean commit(TerminalReservation reservation) {
+      if (!isOpenReservation(reservation)) return false;
+
+      Terminal terminal = reservation.mTerminal;
+      if (reservation.mPreparedRejection) {
+        if (!mPreparedRequestId.equals(terminal.requestId)) return false;
+        mPreparedRequestId = "";
+        mPreparedCancellation = false;
+      } else {
+        if (!matches(terminal.generation, terminal.requestId) || mTerminalClaimed) return false;
+        mTerminalClaimed = true;
+        mExitProcess = terminal.exitProcess;
+      }
+
+      close(reservation);
+      return true;
+    }
+
+    private synchronized boolean rollback(TerminalReservation reservation) {
+      if (!isOpenReservation(reservation)) return false;
+
+      close(reservation);
+      return true;
+    }
+
+    private boolean isOpenReservation(TerminalReservation reservation) {
+      return reservation != null
+          && reservation.mProducer == this
+          && reservation.mOpen
+          && mTerminalReservation == reservation;
+    }
+
+    private void close(TerminalReservation reservation) {
+      reservation.mOpen = false;
+      mTerminalReservation = null;
+    }
+  }
+
+  public static final class MainState {
+    private final Producer mProducer = new Producer();
+
+    public synchronized boolean ownsRequest(String requestId) {
+      return mProducer.ownsRequest(requestId);
+    }
+
+    public synchronized boolean prepare(String requestId) {
+      return mProducer.prepare(requestId);
+    }
+
+    public synchronized boolean isPrepared(String requestId) {
+      return mProducer.isPrepared(requestId);
+    }
+
+    public synchronized Admission admitPrepared(long generation, String requestId) {
+      return mProducer.admitPrepared(generation, requestId);
+    }
+
+    public synchronized TerminalReservation reservePreparedRejection(
+        long generation, String requestId) {
+      return mProducer.reservePreparedRejection(generation, requestId);
+    }
+
+    public synchronized Terminal rejectPrepared(long generation, String requestId) {
+      return mProducer.rejectPrepared(generation, requestId);
+    }
+
+    public synchronized Terminal supersede(long generation, String requestId) {
+      return mProducer.supersede(generation, requestId);
+    }
+
+    public synchronized TerminalReservation reserveSupersede(
+        long generation, String requestId) {
+      return mProducer.reserveSupersede(generation, requestId);
+    }
+
+    public synchronized TerminalReservation reserveFinish(
+        long generation,
+        String requestId,
+        long positionMs,
+        long durationMs,
+        boolean completed,
+        boolean exitProcess) {
+      return mProducer.reserveFinish(
+          generation, requestId, positionMs, durationMs, completed, exitProcess);
+    }
+
+    public synchronized Terminal finish(
+        long generation,
+        String requestId,
+        long positionMs,
+        long durationMs,
+        boolean completed,
+        boolean exitProcess) {
+      return mProducer.finish(
+          generation, requestId, positionMs, durationMs, completed, exitProcess);
+    }
+
+    public synchronized boolean cancelEarlyBack() {
+      String preparedRequestId = mProducer.preparedRequestId();
+      if (isValidRequestId(preparedRequestId)
+          && mProducer.cancelPrepared(preparedRequestId)) return true;
+      return mProducer.activeGeneration() > 0
+          && mProducer.cancelOwner(mProducer.activeGeneration(), mProducer.activeRequestId());
+    }
+
+    public synchronized boolean cancelOwner(long generation, String requestId) {
+      return mProducer.cancelOwner(generation, requestId);
+    }
+
+    public synchronized boolean isOwnerCanceled(long generation, String requestId) {
+      return mProducer.isOwnerCanceled(generation, requestId);
+    }
+
+    public synchronized boolean acknowledgeExit(long generation, String requestId) {
+      return mProducer.acknowledgeExit(generation, requestId);
+    }
+
+    public synchronized boolean claimProcessExit(long generation, String requestId) {
+      return mProducer.claimProcessExit(generation, requestId);
+    }
+
+    public synchronized boolean shouldExitProcess(long generation, String requestId) {
+      return mProducer.shouldExitProcess(generation, requestId);
+    }
+
+    public synchronized void clear(long generation, String requestId) {
+      mProducer.clear(generation, requestId);
+    }
+
+    public synchronized long activeGeneration() {
+      return mProducer.activeGeneration();
+    }
+
+    public synchronized String activeRequestId() {
+      return mProducer.activeRequestId();
+    }
+
+    public synchronized String preparedRequestId() {
+      return mProducer.preparedRequestId();
     }
   }
 

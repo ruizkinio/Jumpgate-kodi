@@ -19,6 +19,7 @@
 #include "platform/xbmc.h"
 #include "threads/Event.h"
 #include "utils/Geometry.h"
+#include "utils/JumpgateBackCoordinator.h"
 #include "utils/JumpgatePlaybackAuthority.h"
 #include "utils/JumpgatePlaybackHistory.h"
 #include "utils/JumpgatePlaybackHistoryState.h"
@@ -29,7 +30,9 @@
 #include <atomic>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -44,6 +47,7 @@
 // forward declares
 class CAESinkAUDIOTRACK;
 class CVariant;
+class CFileItem;
 class IInputDeviceCallbacks;
 class IInputDeviceEventHandler;
 class CVideoSyncAndroid;
@@ -58,6 +62,11 @@ class CJumpgateProfileRuntime;
 class CJumpgateProfileStorage;
 class CJumpgatePlaybackClaimCoordinator;
 } // namespace KODI::JUMPGATE
+
+namespace KODI::MESSAGING
+{
+class COwnedThreadMessagePayload;
+}
 
 typedef struct _JNIEnv JNIEnv;
 
@@ -101,17 +110,55 @@ class CXBMCApp : public IActivityHandler,
                  public jni::CJNIMainActivity,
                  public CJNIBroadcastReceiver,
                  public ANNOUNCEMENT::IAnnouncer,
-                 public CJNISurfaceHolderCallback
+                 public CJNISurfaceHolderCallback,
+                 public std::enable_shared_from_this<CXBMCApp>,
+                 private KODI::JUMPGATE::CJumpgateBackDispatcher::ISink
 {
 public:
   static CXBMCApp& Create(ANativeActivity* nativeActivity, IInputHandler& inputhandler)
   {
-    m_appinstance.reset(new CXBMCApp(nativeActivity, inputhandler));
+    if (m_appinstance)
+      Destroy();
+
+    auto app = std::shared_ptr<CXBMCApp>(new CXBMCApp(nativeActivity, inputhandler));
+    auto& dispatcher = CJNIMainActivity::GetJumpgateBackDispatcher();
+    auto sink = std::shared_ptr<KODI::JUMPGATE::CJumpgateBackDispatcher::ISink>(
+        app, static_cast<KODI::JUMPGATE::CJumpgateBackDispatcher::ISink*>(app.get()));
+    app->m_jumpgateBackPublicationToken =
+        dispatcher.PublishSink(app->m_jumpgateBackLifecycleToken, std::move(sink));
+    if (app->m_jumpgateBackPublicationToken ==
+        KODI::JUMPGATE::CJumpgateBackDispatcher::INVALID_PUBLICATION_TOKEN)
+      throw std::runtime_error("Unable to publish CXBMCApp Back sink");
+
+    auto jniTarget = std::shared_ptr<CJNIMainActivity>(
+        app, static_cast<CJNIMainActivity*>(app.get()));
+    app->m_jumpgateAppPublicationToken = CJNIMainActivity::PublishAppInstance(
+        app->m_jumpgateBackLifecycleToken, std::move(jniTarget));
+    if (app->m_jumpgateAppPublicationToken == 0)
+    {
+      dispatcher.UnpublishSink(app->m_jumpgateBackLifecycleToken,
+                               app->m_jumpgateBackPublicationToken);
+      throw std::runtime_error("Unable to publish CXBMCApp JNI target");
+    }
+
+    m_appinstance = app;
     return *m_appinstance;
   }
   static CXBMCApp& Get() { return *m_appinstance; }
   static bool HasInstance() { return m_appinstance != nullptr; }
-  static void Destroy() { m_appinstance.reset(); }
+  static void Destroy()
+  {
+    if (m_appinstance)
+    {
+      CJNIMainActivity::RetireAppInstance(m_appinstance->m_jumpgateBackLifecycleToken,
+                                          m_appinstance->m_jumpgateAppPublicationToken,
+                                          m_appinstance.get());
+      CJNIMainActivity::GetJumpgateBackDispatcher().UnpublishSink(
+          m_appinstance->m_jumpgateBackLifecycleToken,
+          m_appinstance->m_jumpgateBackPublicationToken);
+    }
+    m_appinstance.reset();
+  }
 
   CXBMCApp() = delete;
   ~CXBMCApp() override;
@@ -123,13 +170,14 @@ public:
                 const CVariant& data) override;
 
   void onReceive(CJNIIntent intent) override;
-  void onNewIntent(CJNIIntent intent) override;
+  void onNewIntent(CJNIIntent intent, std::string preparedRequestId) override;
+  void onBackLifecycleRetiring(
+      KODI::JUMPGATE::CJumpgateBackDispatcher::LifecycleToken lifecycleToken) override;
   void onActivityResult(int requestCode, int resultCode, CJNIIntent resultData) override;
   void onVolumeChanged(int volume) override;
   virtual void onAudioFocusChange(int focusChange);
   void doFrame(int64_t frameTimeNanos) override;
   void onVisibleBehindCanceled() override;
-  void onOpenSettingsRequested() override;
 
   // implementation of CJNIInputManagerInputDeviceListener
   void onInputDeviceAdded(int deviceId) override;
@@ -202,17 +250,22 @@ public:
   void OnPlayBackStopped(bool completed = false);
   void CommitExternalPlaybackOpenFailure(uint64_t token);
   void CommitExternalPlaybackTerminal(bool completed, uint64_t token, bool started);
+  void QueuePendingExternalPlayerResult();
   void DeliverPendingExternalPlayerResult();
   std::optional<uint64_t> BeginExternalPlaybackContinuation();
   bool IsLatestExternalPlaybackAdmission(uint64_t token);
 
   // External player mode
   bool IsExternalPlayerMode() const { return m_externalPlayerMode.load(std::memory_order_relaxed); }
-  void SetExternalPlayerMode(bool mode)
-  {
-    m_externalPlayerMode.store(mode, std::memory_order_relaxed);
-  }
+  void SetExternalPlayerMode(bool mode);
   void ReturnToStandaloneMode();
+
+  bool onBackInputEvent(const AInputEvent* event) override;
+  void SetJumpgateBackInputReady(bool ready);
+  KODI::JUMPGATE::CJumpgateBackDispatcher::LifecycleToken GetJumpgateBackLifecycleToken() const
+  {
+    return m_jumpgateBackLifecycleToken;
+  }
 
   // Version
   static constexpr const char* JUMPGATE_VERSION = "3.0.0";
@@ -274,7 +327,7 @@ protected:
   void RequestVisibleBehind(bool requested);
 
 private:
-  static std::unique_ptr<CXBMCApp> m_appinstance;
+  static std::shared_ptr<CXBMCApp> m_appinstance;
 
   CXBMCApp(ANativeActivity* nativeActivity, IInputHandler& inputhandler);
 
@@ -301,7 +354,7 @@ private:
       int64_t launchedAtMs,
       std::string resultRequestId,
       KODI::JUMPGATE::CJumpgatePlaybackResultState::LifecycleOperation& lifecycleOperation);
-  void CommitExternalPlaybackAdmissionFailure(uint64_t token);
+  bool CommitExternalPlaybackAdmissionFailure(uint64_t token);
   void DeliverRejectedExternalPlaybackResult(
       std::string resultRequestId,
       KODI::JUMPGATE::CJumpgatePlaybackResultState::LifecycleOperation& lifecycleOperation);
@@ -312,8 +365,8 @@ private:
   void ProcessJumpgateSubtitles();
   void StopJumpgateSubtitleController(bool playerMayRead, bool waitForCompletion = true);
   bool SavePairedPlaybackHistory(bool explicitEnd, uint64_t generation = 0);
-  void LoadAndApplyPairedPlaybackResume(uint64_t generation);
-  void ReleasePlaybackSourceClaim();
+  void LoadAndApplyPairedPlaybackResume(uint64_t generation, bool allowPlayerSeek = true);
+  bool ReleasePlaybackSourceClaim(bool completed = false);
   void StopPlaybackClaimCoordinator(bool drainRelease);
   void ExitExternalPlayerMode(
       const KODI::JUMPGATE::JumpgatePlaybackResult& result,
@@ -326,12 +379,67 @@ private:
   static void SetDisplayModeCallback(void* modeVariant);
   static void KeepScreenOnCallback(void* onVariant);
   static void SetViewBackgroundColorCallback(void* mapVariant);
+  bool DispatchExternalBack(
+      const KODI::JUMPGATE::CJumpgateBackDispatcher::CommandContext& context) override;
+  bool DispatchKodiBack(const KODI::JUMPGATE::CJumpgateBackDispatcher::CommandContext& context,
+                        bool longPress) override;
+  bool OpenExternalSettings(
+      const KODI::JUMPGATE::CJumpgateBackDispatcher::CommandContext& context) override;
+  enum class BackCommand
+  {
+    EXTERNAL_BACK,
+    CANCEL_PENDING_PLAYBACK,
+    KODI_SHORT_BACK,
+    KODI_LONG_BACK,
+    OPEN_SETTINGS,
+  };
+  bool DispatchBackCommand(const KODI::JUMPGATE::CJumpgateBackDispatcher::CommandContext& context,
+                           BackCommand command);
+  struct QueuedBackCommand;
+  struct QueuedExternalPlayback;
+  struct QueuedExternalPlayerResult;
+  bool QueueBackCommand(BackCommand command,
+                         uint64_t playbackGeneration = 0,
+                         uint64_t playbackToken = 0,
+                         std::optional<KODI::JUMPGATE::CJumpgateBackDispatcher::CommandContext>
+                             context = std::nullopt);
+  bool ExecuteQueuedBackCommand(QueuedBackCommand& command);
+  void CancelQueuedBackCommand(const QueuedBackCommand& command) noexcept;
+  bool QueueExternalPlayback(std::unique_ptr<CFileItem> item,
+                              uint64_t admissionGeneration,
+                              uint64_t admissionToken,
+                              std::string resultRequestId);
+  void ExecuteQueuedExternalPlayback(QueuedExternalPlayback& playback);
+  void CancelQueuedExternalPlayback(const QueuedExternalPlayback& playback) noexcept;
+  void CancelQueuedMediaPlayback(
+      KODI::JUMPGATE::CJumpgateBackDispatcher::LifecycleToken lifecycleToken,
+      uint64_t admissionGeneration,
+      uint64_t admissionToken,
+      const std::string& resultRequestId) noexcept;
+  void CancelExternalPlaybackForLifecycleTeardown() noexcept;
+  bool QueueExternalPlayerResult(uint64_t generation,
+                                 std::string requestId,
+                                 bool wasStandalone);
+  void ExecuteQueuedExternalPlayerResult(const QueuedExternalPlayerResult& result);
+  void CancelQueuedExternalPlayerResult(const QueuedExternalPlayerResult& result) noexcept;
+  void PostJavaExternalPlayerCancellation(uint64_t generation,
+                                          const std::string& requestId,
+                                          bool wasStandalone) noexcept;
+  bool CancelPendingExternalPlaybackFromBack();
+  bool ExecuteExternalBackCommand();
+  bool ExecuteKodiBackCommand(bool longPress);
+  bool ExecuteOpenExternalSettingsCommand();
 
   static void RegisterDisplayListenerCallback(void*);
   void UnregisterDisplayListener();
 
   ANativeActivity* m_activity{nullptr};
   IInputHandler& m_inputHandler;
+  KODI::JUMPGATE::CJumpgateBackDispatcher::LifecycleToken m_jumpgateBackLifecycleToken{
+      KODI::JUMPGATE::CJumpgateBackDispatcher::INVALID_LIFECYCLE_TOKEN};
+  KODI::JUMPGATE::CJumpgateBackDispatcher::PublicationToken m_jumpgateBackPublicationToken{
+      KODI::JUMPGATE::CJumpgateBackDispatcher::INVALID_PUBLICATION_TOKEN};
+  CJNIMainActivity::AppInstancePublicationToken m_jumpgateAppPublicationToken{0};
   int m_batteryLevel{0};
   bool m_hasFocus{false};
   bool m_headsetPlugged{false};
@@ -374,6 +482,8 @@ private:
   std::atomic<int64_t> m_lastPlaybackDurationMs{0}; // F-003: atomic prevents torn reads on ARM32
   std::atomic<int64_t> m_resumePositionMs{0};
   std::atomic<bool> m_resumeApplied{false}; // Prevents double-seek from content-ID resume
+  std::atomic<uint64_t> m_externalPlaybackStartedGeneration{0};
+  std::atomic<int64_t> m_externalPlaybackStartedAtSteadyMs{0};
 
   // Resume store file
   static constexpr const char* RESUME_STORE_FILE = "special://profile/jumpgate_resume.json";
@@ -408,6 +518,14 @@ private:
   KODI::JUMPGATE::CJumpgatePlaybackAuthority m_playbackAuthority;
   std::atomic<uint64_t> m_ordinaryPlaybackAuthorityToken{0};
   KODI::JUMPGATE::CJumpgatePlaybackResultState m_playbackResultState;
+  std::mutex m_externalPlaybackQueueMutex;
+  uint64_t m_externalPlaybackDispatchGeneration{0};
+  uint64_t m_externalPlaybackDispatchToken{0};
+  std::string m_externalPlaybackDispatchRequestId;
+  std::shared_ptr<KODI::MESSAGING::COwnedThreadMessagePayload>
+      m_externalPlaybackDispatchPayload;
+  uint64_t m_pendingExternalPlaybackStopGeneration{0};
+  uint64_t m_pendingExternalPlaybackStopToken{0};
   std::atomic<uint64_t> m_rejectedPlaybackResultGeneration{1};
   KODI::JUMPGATE::CJumpgateShutdownCoordinator m_shutdownCoordinator;
   std::atomic<bool> m_settingsRequested{false};

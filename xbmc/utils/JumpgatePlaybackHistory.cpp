@@ -8,6 +8,7 @@
 
 #include "JumpgatePlaybackHistory.h"
 
+#include "Digest.h"
 #include "JSONVariantParser.h"
 #include "JSONVariantWriter.h"
 #include "Variant.h"
@@ -26,12 +27,63 @@ namespace KODI::JUMPGATE
 {
 namespace
 {
-constexpr int HISTORY_SCHEMA_VERSION = 1;
+constexpr int HISTORY_SCHEMA_VERSION = 2;
+constexpr int LEGACY_HISTORY_SCHEMA_VERSION = 1;
 constexpr std::size_t MAX_PROFILE_ID_LENGTH = 256;
 constexpr std::size_t MAX_CANONICAL_ID_LENGTH = 256;
 constexpr std::size_t MAX_TITLE_LENGTH = 8192;
 constexpr std::size_t MAX_BLOCKED_PROFILES = JUMPGATE_HISTORY_MAX_ENTRIES;
 constexpr std::size_t MAX_FORGOTTEN_PROFILES = JUMPGATE_HISTORY_MAX_ENTRIES;
+constexpr std::string_view LOCAL_SOURCE_FINGERPRINT_DOMAIN =
+    "jumpgate-history-local-source-fingerprints-v1";
+constexpr std::string_view LOCAL_SOURCE_FALLBACK_DOMAIN =
+    "jumpgate-history-local-source-raw-launch-uri-v1";
+
+void AppendUint64(std::string& output, uint64_t value)
+{
+  for (int shift = 56; shift >= 0; shift -= 8)
+    output.push_back(static_cast<char>((value >> shift) & 0xff));
+}
+
+void AppendLengthPrefixed(std::string& output, std::string_view value)
+{
+  AppendUint64(output, value.size());
+  output.append(value.data(), value.size());
+}
+
+std::string DigestLengthPrefixed(std::string_view domain,
+                                 const std::vector<std::string_view>& values)
+{
+  std::size_t size = sizeof(uint64_t) * (values.size() + 2) + domain.size();
+  for (const std::string_view value : values)
+    size += value.size();
+
+  std::string material;
+  material.reserve(size);
+  AppendLengthPrefixed(material, domain);
+  AppendUint64(material, values.size());
+  for (const std::string_view value : values)
+    AppendLengthPrefixed(material, value);
+  return KODI::UTILITY::CDigest::Calculate(KODI::UTILITY::CDigest::Type::SHA256, material);
+}
+
+bool ParseHistoryNamespace(const CVariant& value,
+                           JumpgatePlaybackHistoryNamespace& historyNamespace)
+{
+  if (!value.isString())
+    return false;
+  if (value.asString() == "authenticated_profile")
+  {
+    historyNamespace = JumpgatePlaybackHistoryNamespace::AuthenticatedProfile;
+    return true;
+  }
+  if (value.asString() == "local_source")
+  {
+    historyNamespace = JumpgatePlaybackHistoryNamespace::LocalSource;
+    return true;
+  }
+  return false;
+}
 
 bool ReadUtf8CodePoint(std::string_view value, std::size_t& offset, std::uint32_t& codePoint)
 {
@@ -162,6 +214,23 @@ bool SameIdentity(const JumpgateCanonicalIdentity& left, const JumpgateCanonical
          left.episode == right.episode;
 }
 
+bool SameEntryPayload(const JumpgatePlaybackHistoryEntry& left,
+                      const JumpgatePlaybackHistoryEntry& right)
+{
+  if (left.canonicalIdentity.has_value() != right.canonicalIdentity.has_value() ||
+      (left.canonicalIdentity &&
+       !SameIdentity(*left.canonicalIdentity, *right.canonicalIdentity)))
+  {
+    return false;
+  }
+  return left.historyNamespace == right.historyNamespace && left.profileId == right.profileId &&
+         left.contentKey == right.contentKey && left.display.title == right.display.title &&
+         left.display.year == right.display.year && left.display.season == right.display.season &&
+         left.display.episode == right.display.episode && left.positionMs == right.positionMs &&
+         left.durationMs == right.durationMs && left.completed == right.completed &&
+         left.watched == right.watched && left.updatedAtMs == right.updatedAtMs;
+}
+
 bool ParseCanonicalIdentity(const CVariant& value, JumpgateCanonicalIdentity& identity)
 {
   if (!HasOnlyKeys(value, {"provider", "id", "mediaType", "season", "episode"}) ||
@@ -265,12 +334,16 @@ bool ParseDisplay(const CVariant& value,
 
 bool ValidateEntry(const JumpgatePlaybackHistoryEntry& entry)
 {
-  if (!IsValidJumpgateHistoryProfileId(entry.profileId) ||
-      !IsValidJumpgateHistoryContentKey(entry.contentKey) ||
+  if (!IsValidJumpgatePlaybackHistoryKey(GetJumpgatePlaybackHistoryKey(entry)) ||
       (entry.canonicalIdentity &&
        !IsValidJumpgateHistoryCanonicalIdentity(*entry.canonicalIdentity)) ||
       !ValidateDisplay(entry.display, entry.canonicalIdentity) || entry.positionMs < 0 ||
       entry.durationMs < 0 || entry.updatedAtMs < 0)
+  {
+    return false;
+  }
+  if (entry.historyNamespace == JumpgatePlaybackHistoryNamespace::LocalSource &&
+      entry.canonicalIdentity)
   {
     return false;
   }
@@ -309,10 +382,21 @@ CVariant SerializeDisplay(const JumpgatePlaybackHistoryDisplay& display)
   return value;
 }
 
-CVariant SerializeEntry(const JumpgatePlaybackHistoryEntry& entry)
+CVariant SerializeEntry(const JumpgatePlaybackHistoryEntry& entry, int schemaVersion)
 {
   CVariant value(CVariant::VariantTypeObject);
-  value["profileId"] = entry.profileId;
+  if (schemaVersion == HISTORY_SCHEMA_VERSION)
+  {
+    value["namespace"] = ToString(entry.historyNamespace);
+    value["profileId"] =
+        entry.historyNamespace == JumpgatePlaybackHistoryNamespace::AuthenticatedProfile
+            ? CVariant{entry.profileId}
+            : CVariant{};
+  }
+  else
+  {
+    value["profileId"] = entry.profileId;
+  }
   value["contentKey"] = entry.contentKey;
   value["canonicalIdentity"] =
       entry.canonicalIdentity ? SerializeCanonicalIdentity(*entry.canonicalIdentity) : CVariant{};
@@ -325,19 +409,51 @@ CVariant SerializeEntry(const JumpgatePlaybackHistoryEntry& entry)
   return value;
 }
 
-bool ParseEntry(const CVariant& value, JumpgatePlaybackHistoryEntry& entry)
+bool ParseEntry(const CVariant& value, int schemaVersion, JumpgatePlaybackHistoryEntry& entry)
 {
-  if (!HasOnlyKeys(value, {"profileId", "contentKey", "canonicalIdentity", "display", "positionMs",
-                           "durationMs", "completed", "watched", "updatedAtMs"}) ||
-      !HasAllMembers(value, {"profileId", "contentKey", "canonicalIdentity", "display",
-                             "positionMs", "durationMs", "completed", "watched", "updatedAtMs"}) ||
-      !value["profileId"].isString() || !value["contentKey"].isString() ||
+  const bool legacy = schemaVersion == LEGACY_HISTORY_SCHEMA_VERSION;
+  const bool validKeys =
+      legacy
+          ? HasOnlyKeys(value, {"profileId", "contentKey", "canonicalIdentity", "display",
+                                "positionMs", "durationMs", "completed", "watched", "updatedAtMs"})
+          : HasOnlyKeys(value,
+                        {"namespace", "profileId", "contentKey", "canonicalIdentity", "display",
+                         "positionMs", "durationMs", "completed", "watched", "updatedAtMs"});
+  const bool hasMembers =
+      legacy ? HasAllMembers(value,
+                             {"profileId", "contentKey", "canonicalIdentity", "display",
+                              "positionMs", "durationMs", "completed", "watched", "updatedAtMs"})
+             : HasAllMembers(value, {"namespace", "profileId", "contentKey", "canonicalIdentity",
+                                     "display", "positionMs", "durationMs", "completed", "watched",
+                                     "updatedAtMs"});
+  if (!validKeys || !hasMembers || !value["contentKey"].isString() ||
       !value["completed"].isBoolean() || !value["watched"].isBoolean())
   {
     return false;
   }
 
-  entry.profileId = value["profileId"].asString();
+  if (legacy)
+  {
+    if (!value["profileId"].isString())
+      return false;
+    entry.historyNamespace = JumpgatePlaybackHistoryNamespace::AuthenticatedProfile;
+    entry.profileId = value["profileId"].asString();
+  }
+  else
+  {
+    if (!ParseHistoryNamespace(value["namespace"], entry.historyNamespace))
+      return false;
+    if (entry.historyNamespace == JumpgatePlaybackHistoryNamespace::AuthenticatedProfile)
+    {
+      if (!value["profileId"].isString())
+        return false;
+      entry.profileId = value["profileId"].asString();
+    }
+    else if (!value["profileId"].isNull())
+    {
+      return false;
+    }
+  }
   entry.contentKey = value["contentKey"].asString();
   if (!value["canonicalIdentity"].isNull())
   {
@@ -363,19 +479,26 @@ bool ParseEntry(const CVariant& value, JumpgatePlaybackHistoryEntry& entry)
 
 auto EntryIdentity(const JumpgatePlaybackHistoryEntry& entry)
 {
-  return std::tie(entry.profileId, entry.contentKey);
+  return std::tie(entry.historyNamespace, entry.profileId, entry.contentKey);
 }
 
 auto EntryAge(const JumpgatePlaybackHistoryEntry& entry)
 {
-  return std::tie(entry.updatedAtMs, entry.profileId, entry.contentKey);
+  return std::tie(entry.updatedAtMs, entry.historyNamespace, entry.profileId, entry.contentKey);
 }
 
 bool SerializeDocument(const JumpgatePlaybackHistoryDocument& document,
                        std::string& json,
                        bool enforceSize,
-                       std::string& error)
+                       std::string& error,
+                       int schemaVersion = HISTORY_SCHEMA_VERSION)
 {
+  if (schemaVersion != HISTORY_SCHEMA_VERSION &&
+      schemaVersion != LEGACY_HISTORY_SCHEMA_VERSION)
+  {
+    error = "Jumpgate playback history serialization schema is invalid";
+    return false;
+  }
   if (document.entries.size() > JUMPGATE_HISTORY_MAX_ENTRIES)
   {
     error = "Jumpgate playback history contains too many entries";
@@ -411,11 +534,14 @@ bool SerializeDocument(const JumpgatePlaybackHistoryDocument& document,
       return false;
     }
   }
-  std::set<std::pair<std::string, std::string>> uniqueEntries;
+  std::set<std::tuple<JumpgatePlaybackHistoryNamespace, std::string, std::string>> uniqueEntries;
   std::vector<JumpgatePlaybackHistoryEntry> ordered = document.entries;
   for (const JumpgatePlaybackHistoryEntry& entry : ordered)
   {
-    if (!ValidateEntry(entry) || !uniqueEntries.emplace(entry.profileId, entry.contentKey).second)
+    if (!ValidateEntry(entry) ||
+        (schemaVersion == LEGACY_HISTORY_SCHEMA_VERSION &&
+         entry.historyNamespace != JumpgatePlaybackHistoryNamespace::AuthenticatedProfile) ||
+        !uniqueEntries.emplace(entry.historyNamespace, entry.profileId, entry.contentKey).second)
     {
       error = "Jumpgate playback history contains an invalid or duplicate entry";
       return false;
@@ -425,7 +551,7 @@ bool SerializeDocument(const JumpgatePlaybackHistoryDocument& document,
             { return EntryIdentity(left) < EntryIdentity(right); });
 
   CVariant root(CVariant::VariantTypeObject);
-  root["schemaVersion"] = HISTORY_SCHEMA_VERSION;
+  root["schemaVersion"] = schemaVersion;
   CVariant blockedProfiles(CVariant::VariantTypeArray);
   for (const std::string& profileId : uniqueBlockedProfiles)
     blockedProfiles.push_back(profileId);
@@ -436,7 +562,7 @@ bool SerializeDocument(const JumpgatePlaybackHistoryDocument& document,
   root["forgottenProfiles"] = std::move(forgottenProfiles);
   CVariant entries(CVariant::VariantTypeArray);
   for (const JumpgatePlaybackHistoryEntry& entry : ordered)
-    entries.push_back(SerializeEntry(entry));
+    entries.push_back(SerializeEntry(entry, schemaVersion));
   root["entries"] = std::move(entries);
   if (!CJSONVariantWriter::Write(root, json, true))
   {
@@ -466,6 +592,68 @@ bool IsValidJumpgateHistoryContentKey(const std::string& contentKey)
                                                   return (character >= '0' && character <= '9') ||
                                                          (character >= 'a' && character <= 'f');
                                                 });
+}
+
+bool IsValidJumpgatePlaybackHistoryKey(const JumpgatePlaybackHistoryKey& key)
+{
+  if (!IsValidJumpgateHistoryContentKey(key.contentKey))
+    return false;
+  switch (key.historyNamespace)
+  {
+    case JumpgatePlaybackHistoryNamespace::AuthenticatedProfile:
+      return IsValidJumpgateHistoryProfileId(key.profileId);
+    case JumpgatePlaybackHistoryNamespace::LocalSource:
+      return key.profileId.empty();
+  }
+  return false;
+}
+
+JumpgatePlaybackHistoryKey GetJumpgatePlaybackHistoryKey(const JumpgatePlaybackHistoryEntry& entry)
+{
+  return {entry.historyNamespace, entry.profileId, entry.contentKey};
+}
+
+const char* ToString(JumpgatePlaybackHistoryNamespace historyNamespace)
+{
+  switch (historyNamespace)
+  {
+    case JumpgatePlaybackHistoryNamespace::AuthenticatedProfile:
+      return "authenticated_profile";
+    case JumpgatePlaybackHistoryNamespace::LocalSource:
+      return "local_source";
+  }
+  return "invalid";
+}
+
+std::optional<std::string> DeriveJumpgateLocalSourceHistoryKey(
+    const std::vector<std::string>& canonicalFingerprints)
+{
+  if (canonicalFingerprints.empty() || canonicalFingerprints.size() > 64)
+    return std::nullopt;
+
+  std::vector<std::string> ordered = canonicalFingerprints;
+  for (const std::string& fingerprint : ordered)
+  {
+    if (fingerprint.empty() || fingerprint.size() > 4096 ||
+        !std::all_of(fingerprint.begin(), fingerprint.end(), [](unsigned char character)
+                     { return character >= 0x21 && character <= 0x7e; }))
+    {
+      return std::nullopt;
+    }
+  }
+  std::sort(ordered.begin(), ordered.end());
+  ordered.erase(std::unique(ordered.begin(), ordered.end()), ordered.end());
+
+  std::vector<std::string_view> material;
+  material.reserve(ordered.size());
+  for (const std::string& fingerprint : ordered)
+    material.emplace_back(fingerprint);
+  return DigestLengthPrefixed(LOCAL_SOURCE_FINGERPRINT_DOMAIN, material);
+}
+
+std::string DeriveJumpgateLocalSourceFallbackHistoryKey(std::string_view rawLaunchUri)
+{
+  return DigestLengthPrefixed(LOCAL_SOURCE_FALLBACK_DOMAIN, {rawLaunchUri});
 }
 
 bool IsValidJumpgateHistoryCanonicalIdentity(const JumpgateCanonicalIdentity& identity)
@@ -537,8 +725,9 @@ bool ParseJumpgatePlaybackHistory(const std::string& json,
   if (!CJSONVariantParser::Parse(json, root) ||
       !HasOnlyKeys(root, {"schemaVersion", "entries", "blockedProfiles", "forgottenProfiles"}) ||
       !HasAllMembers(root, {"schemaVersion", "entries"}) || !root["schemaVersion"].isInteger() ||
-      root["schemaVersion"].asInteger(-1) != HISTORY_SCHEMA_VERSION || !root["entries"].isArray() ||
-      root["entries"].size() > JUMPGATE_HISTORY_MAX_ENTRIES)
+      (root["schemaVersion"].asInteger(-1) != HISTORY_SCHEMA_VERSION &&
+       root["schemaVersion"].asInteger(-1) != LEGACY_HISTORY_SCHEMA_VERSION) ||
+      !root["entries"].isArray() || root["entries"].size() > JUMPGATE_HISTORY_MAX_ENTRIES)
   {
     error = "Jumpgate playback history has an invalid schema";
     return false;
@@ -589,13 +778,15 @@ bool ParseJumpgatePlaybackHistory(const std::string& json,
     }
   }
 
-  std::set<std::pair<std::string, std::string>> uniqueEntries;
+  const int schemaVersion = root["schemaVersion"].asInteger();
+  document.loadedFromLegacySchema = schemaVersion == LEGACY_HISTORY_SCHEMA_VERSION;
+  std::set<std::tuple<JumpgatePlaybackHistoryNamespace, std::string, std::string>> uniqueEntries;
   document.entries.reserve(root["entries"].size());
   for (auto item = root["entries"].begin_array(); item != root["entries"].end_array(); ++item)
   {
     JumpgatePlaybackHistoryEntry entry;
-    if (!ParseEntry(*item, entry) ||
-        !uniqueEntries.emplace(entry.profileId, entry.contentKey).second)
+    if (!ParseEntry(*item, schemaVersion, entry) ||
+        !uniqueEntries.emplace(entry.historyNamespace, entry.profileId, entry.contentKey).second)
     {
       document = {};
       error = "Jumpgate playback history contains an invalid or duplicate entry";
@@ -635,20 +826,21 @@ bool CJumpgatePlaybackHistoryStore::Load(JumpgatePlaybackHistoryDocument& docume
   return ParseJumpgatePlaybackHistory(contents, document, error);
 }
 
-bool CJumpgatePlaybackHistoryStore::Get(const std::string& profileId,
-                                        const std::string& contentKey,
+bool CJumpgatePlaybackHistoryStore::Get(const JumpgatePlaybackHistoryKey& key,
                                         std::optional<JumpgatePlaybackHistoryEntry>& entry,
                                         std::string& error) const
 {
   entry.reset();
-  if (!IsValidJumpgateHistoryProfileId(profileId) || !IsValidJumpgateHistoryContentKey(contentKey))
+  if (!IsValidJumpgatePlaybackHistoryKey(key))
   {
     error = "Jumpgate playback history lookup identity is invalid";
     return false;
   }
   std::lock_guard<std::mutex> lock(m_mutex);
-  if (m_blockedProfiles.find(profileId) != m_blockedProfiles.end() ||
-      m_forgottenProfiles.find(profileId) != m_forgottenProfiles.end())
+  const bool profileBound =
+      key.historyNamespace == JumpgatePlaybackHistoryNamespace::AuthenticatedProfile;
+  if (profileBound && (m_blockedProfiles.find(key.profileId) != m_blockedProfiles.end() ||
+                       m_forgottenProfiles.find(key.profileId) != m_forgottenProfiles.end()))
   {
     error.clear();
     return true;
@@ -656,30 +848,34 @@ bool CJumpgatePlaybackHistoryStore::Get(const std::string& profileId,
   JumpgatePlaybackHistoryDocument document;
   if (!Load(document, error))
     return false;
-  if (std::find(document.blockedProfiles.begin(), document.blockedProfiles.end(), profileId) !=
-          document.blockedProfiles.end() ||
-      std::find(document.forgottenProfiles.begin(), document.forgottenProfiles.end(), profileId) !=
-          document.forgottenProfiles.end())
+  if (profileBound &&
+      (std::find(document.blockedProfiles.begin(), document.blockedProfiles.end(), key.profileId) !=
+           document.blockedProfiles.end() ||
+       std::find(document.forgottenProfiles.begin(), document.forgottenProfiles.end(),
+                 key.profileId) != document.forgottenProfiles.end()))
   {
-    m_blockedProfiles.emplace(profileId);
+    m_blockedProfiles.emplace(key.profileId);
     if (std::find(document.forgottenProfiles.begin(), document.forgottenProfiles.end(),
-                  profileId) != document.forgottenProfiles.end())
+                  key.profileId) != document.forgottenProfiles.end())
     {
-      m_forgottenProfiles.emplace(profileId);
+      m_forgottenProfiles.emplace(key.profileId);
     }
     error.clear();
     return true;
   }
-  const auto found = std::find_if(
-      document.entries.begin(), document.entries.end(),
-      [&profileId, &contentKey](const auto& candidate)
-      { return candidate.profileId == profileId && candidate.contentKey == contentKey; });
+  const auto found = std::find_if(document.entries.begin(), document.entries.end(),
+                                  [&key](const auto& candidate)
+                                  {
+                                    return candidate.historyNamespace == key.historyNamespace &&
+                                           candidate.profileId == key.profileId &&
+                                           candidate.contentKey == key.contentKey;
+                                  });
   if (found != document.entries.end())
     entry = *found;
   return true;
 }
 
-bool CJumpgatePlaybackHistoryStore::Save(const std::string& expectedProfileId,
+bool CJumpgatePlaybackHistoryStore::Save(const JumpgatePlaybackHistoryKey& expectedKey,
                                          JumpgatePlaybackHistoryEntry entry,
                                          std::string& error)
 {
@@ -690,15 +886,22 @@ bool CJumpgatePlaybackHistoryStore::Save(const std::string& expectedProfileId,
   entry.completed = explicitCompletion || thresholdCompletion;
   entry.watched =
       entry.watched || IsJumpgatePlaybackThresholdReached(entry.positionMs, entry.durationMs, 80);
-  if (entry.profileId != expectedProfileId || !ValidateEntry(entry))
+  const JumpgatePlaybackHistoryKey entryKey = GetJumpgatePlaybackHistoryKey(entry);
+  if (!IsValidJumpgatePlaybackHistoryKey(expectedKey) ||
+      expectedKey.historyNamespace != entryKey.historyNamespace ||
+      expectedKey.profileId != entryKey.profileId ||
+      expectedKey.contentKey != entryKey.contentKey || !ValidateEntry(entry))
   {
-    error = "Jumpgate playback history profile mismatch or invalid entry";
+    error = "Jumpgate playback history identity mismatch or invalid entry";
     return false;
   }
 
   std::lock_guard<std::mutex> lock(m_mutex);
-  if (m_blockedProfiles.find(expectedProfileId) != m_blockedProfiles.end() ||
-      m_forgottenProfiles.find(expectedProfileId) != m_forgottenProfiles.end())
+  const bool profileBound =
+      expectedKey.historyNamespace == JumpgatePlaybackHistoryNamespace::AuthenticatedProfile;
+  if (profileBound &&
+      (m_blockedProfiles.find(expectedKey.profileId) != m_blockedProfiles.end() ||
+       m_forgottenProfiles.find(expectedKey.profileId) != m_forgottenProfiles.end()))
   {
     error = "Jumpgate playback history profile was cleared";
     return false;
@@ -707,15 +910,16 @@ bool CJumpgatePlaybackHistoryStore::Save(const std::string& expectedProfileId,
   if (!Load(document, error))
     return false;
   const bool persistedForgotten =
+      profileBound &&
       std::find(document.forgottenProfiles.begin(), document.forgottenProfiles.end(),
-                expectedProfileId) != document.forgottenProfiles.end();
-  if (std::find(document.blockedProfiles.begin(), document.blockedProfiles.end(),
-                expectedProfileId) != document.blockedProfiles.end() ||
-      persistedForgotten)
+                expectedKey.profileId) != document.forgottenProfiles.end();
+  if (profileBound && (std::find(document.blockedProfiles.begin(), document.blockedProfiles.end(),
+                                 expectedKey.profileId) != document.blockedProfiles.end() ||
+                       persistedForgotten))
   {
-    m_blockedProfiles.emplace(expectedProfileId);
+    m_blockedProfiles.emplace(expectedKey.profileId);
     if (persistedForgotten)
-      m_forgottenProfiles.emplace(expectedProfileId);
+      m_forgottenProfiles.emplace(expectedKey.profileId);
     error = "Jumpgate playback history profile is blocked";
     return false;
   }
@@ -735,11 +939,6 @@ bool CJumpgatePlaybackHistoryStore::Save(const std::string& expectedProfileId,
       error = "Jumpgate playback history canonical identity changed";
       return false;
     }
-    if (entry.updatedAtMs == found->updatedAtMs)
-    {
-      error.clear();
-      return true;
-    }
     if (!entry.canonicalIdentity)
       entry.canonicalIdentity = found->canonicalIdentity;
     if (!explicitCompletion && !thresholdCompletion)
@@ -750,13 +949,23 @@ bool CJumpgatePlaybackHistoryStore::Save(const std::string& expectedProfileId,
       entry.positionMs = found->positionMs;
       entry.durationMs = found->durationMs;
     }
+    if (entry.updatedAtMs == found->updatedAtMs)
+    {
+      if (!SameEntryPayload(entry, *found))
+      {
+        error = "Jumpgate playback history update timestamp conflicts with persisted state";
+        return false;
+      }
+      error.clear();
+      return true;
+    }
     *found = entry;
   }
   else
   {
     document.entries.emplace_back(entry);
   }
-  return WriteCandidate(document, entry.profileId, entry.contentKey, error);
+  return WriteCandidate(document, entryKey, error);
 }
 
 bool CJumpgatePlaybackHistoryStore::ClearProfile(const std::string& profileId, std::string& error)
@@ -780,11 +989,16 @@ bool CJumpgatePlaybackHistoryStore::ClearProfile(const std::string& profileId, s
   {
     document.forgottenProfiles.emplace_back(profileId);
   }
-  document.entries.erase(std::remove_if(document.entries.begin(), document.entries.end(),
-                                        [&profileId](const auto& entry)
-                                        { return entry.profileId == profileId; }),
-                         document.entries.end());
-  if (!WriteCandidate(document, "", "", error))
+  document.entries.erase(
+      std::remove_if(document.entries.begin(), document.entries.end(),
+                     [&profileId](const auto& entry)
+                     {
+                       return entry.historyNamespace ==
+                                  JumpgatePlaybackHistoryNamespace::AuthenticatedProfile &&
+                              entry.profileId == profileId;
+                     }),
+      document.entries.end());
+  if (!WriteDestructiveProtectionCandidate(document, profileId, error))
   {
     m_blockedProfiles.emplace(profileId);
     return false;
@@ -919,7 +1133,7 @@ bool CJumpgatePlaybackHistoryStore::PurgeBlockedProfile(const std::string& profi
   }
   // Persist forgotten provenance independently from the destructive purge so
   // a failed second atomic write cannot make later pairing resurrect records.
-  if (!WriteCandidate(document, "", "", error))
+  if (!WriteDestructiveProtectionCandidate(document, profileId, error))
   {
     m_blockedProfiles.emplace(profileId);
     m_forgottenProfiles.emplace(profileId);
@@ -927,11 +1141,16 @@ bool CJumpgatePlaybackHistoryStore::PurgeBlockedProfile(const std::string& profi
   }
   m_blockedProfiles.emplace(profileId);
   m_forgottenProfiles.emplace(profileId);
-  document.entries.erase(std::remove_if(document.entries.begin(), document.entries.end(),
-                                        [&profileId](const auto& entry)
-                                        { return entry.profileId == profileId; }),
-                         document.entries.end());
-  if (!WriteCandidate(document, "", "", error))
+  document.entries.erase(
+      std::remove_if(document.entries.begin(), document.entries.end(),
+                     [&profileId](const auto& entry)
+                     {
+                       return entry.historyNamespace ==
+                                  JumpgatePlaybackHistoryNamespace::AuthenticatedProfile &&
+                              entry.profileId == profileId;
+                     }),
+      document.entries.end());
+  if (!WriteExact(document, error))
   {
     return false;
   }
@@ -956,7 +1175,12 @@ bool CJumpgatePlaybackHistoryStore::CompleteProfileRepair(const std::string& pro
           document.forgottenProfiles.end();
   if (forgotten &&
       std::any_of(document.entries.begin(), document.entries.end(),
-                  [&profileId](const auto& entry) { return entry.profileId == profileId; }))
+                  [&profileId](const auto& entry)
+                  {
+                    return entry.historyNamespace ==
+                               JumpgatePlaybackHistoryNamespace::AuthenticatedProfile &&
+                           entry.profileId == profileId;
+                  }))
   {
     error = "Jumpgate playback history profile must be purged before repair";
     return false;
@@ -986,10 +1210,15 @@ bool CJumpgatePlaybackHistoryStore::ResetProfile(const std::string& profileId, s
   JumpgatePlaybackHistoryDocument document;
   if (!Load(document, error))
     return false;
-  document.entries.erase(std::remove_if(document.entries.begin(), document.entries.end(),
-                                        [&profileId](const auto& entry)
-                                        { return entry.profileId == profileId; }),
-                         document.entries.end());
+  document.entries.erase(
+      std::remove_if(document.entries.begin(), document.entries.end(),
+                     [&profileId](const auto& entry)
+                     {
+                       return entry.historyNamespace ==
+                                  JumpgatePlaybackHistoryNamespace::AuthenticatedProfile &&
+                              entry.profileId == profileId;
+                     }),
+      document.entries.end());
   document.blockedProfiles.erase(
       std::remove(document.blockedProfiles.begin(), document.blockedProfiles.end(), profileId),
       document.blockedProfiles.end());
@@ -1007,15 +1236,24 @@ bool CJumpgatePlaybackHistoryStore::WriteExact(const JumpgatePlaybackHistoryDocu
                                                std::string& error)
 {
   std::string json;
-  if (!SerializeDocument(document, json, true, error))
+  if (!SerializeDocument(document, json, false, error))
     return false;
+  if (json.size() > JUMPGATE_HISTORY_MAX_BYTES)
+  {
+    if (!document.loadedFromLegacySchema)
+    {
+      error = "Jumpgate playback history exceeds the size limit";
+      return false;
+    }
+    if (!SerializeDocument(document, json, true, error, LEGACY_HISTORY_SCHEMA_VERSION))
+      return false;
+  }
   return m_storage.WriteAtomic(json, error);
 }
 
 bool CJumpgatePlaybackHistoryStore::WriteCandidate(JumpgatePlaybackHistoryDocument& document,
-                                                   const std::string& retainedProfileId,
-                                                   const std::string& retainedContentKey,
-                                                   std::string& error)
+                                                    const JumpgatePlaybackHistoryKey& retainedKey,
+                                                    std::string& error)
 {
   std::string json;
   while (true)
@@ -1029,7 +1267,8 @@ bool CJumpgatePlaybackHistoryStore::WriteCandidate(JumpgatePlaybackHistoryDocume
     }
     if (!SerializeDocument(document, json, false, error))
       return false;
-    if (json.size() <= JUMPGATE_HISTORY_MAX_BYTES)
+    if (json.size() <= JUMPGATE_HISTORY_MAX_BYTES -
+                           JUMPGATE_HISTORY_PROFILE_PROTECTION_RESERVE_BYTES)
       break;
     if (document.entries.empty())
     {
@@ -1042,18 +1281,60 @@ bool CJumpgatePlaybackHistoryStore::WriteCandidate(JumpgatePlaybackHistoryDocume
     document.entries.erase(oldest);
   }
 
-  if (!retainedProfileId.empty() &&
-      std::none_of(document.entries.begin(), document.entries.end(),
-                   [&retainedProfileId, &retainedContentKey](const auto& entry)
+  if (std::none_of(document.entries.begin(), document.entries.end(),
+                   [&retainedKey](const auto& entry)
                    {
-                     return entry.profileId == retainedProfileId &&
-                            entry.contentKey == retainedContentKey;
+                     return entry.historyNamespace == retainedKey.historyNamespace &&
+                            entry.profileId == retainedKey.profileId &&
+                            entry.contentKey == retainedKey.contentKey;
                    }))
   {
     error = "Jumpgate playback history update was older than the retained entries";
     return false;
   }
   return m_storage.WriteAtomic(json, error);
+}
+
+bool CJumpgatePlaybackHistoryStore::WriteDestructiveProtectionCandidate(
+    JumpgatePlaybackHistoryDocument& document,
+    const std::string& affectedProfileId,
+    std::string& error)
+{
+  std::string json;
+  while (true)
+  {
+    if (!SerializeDocument(document, json, false, error))
+      return false;
+    if (json.size() <= JUMPGATE_HISTORY_MAX_BYTES)
+      return m_storage.WriteAtomic(json, error);
+
+    if (document.loadedFromLegacySchema)
+    {
+      if (!SerializeDocument(document, json, false, error, LEGACY_HISTORY_SCHEMA_VERSION))
+        return false;
+      if (json.size() <= JUMPGATE_HISTORY_MAX_BYTES)
+        return m_storage.WriteAtomic(json, error);
+    }
+
+    auto oldest = document.entries.end();
+    for (auto candidate = document.entries.begin(); candidate != document.entries.end(); ++candidate)
+    {
+      if (candidate->historyNamespace !=
+              JumpgatePlaybackHistoryNamespace::AuthenticatedProfile ||
+          candidate->profileId != affectedProfileId)
+      {
+        continue;
+      }
+      if (oldest == document.entries.end() || EntryAge(*candidate) < EntryAge(*oldest))
+        oldest = candidate;
+    }
+    if (oldest == document.entries.end())
+    {
+      error = "Jumpgate playback history protection markers cannot fit within the size limit";
+      return false;
+    }
+    document.entries.erase(oldest);
+  }
 }
 
 } // namespace KODI::JUMPGATE

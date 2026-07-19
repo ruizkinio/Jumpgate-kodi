@@ -60,28 +60,74 @@ CApplicationMessenger::~CApplicationMessenger()
 
 void CApplicationMessenger::Cleanup()
 {
-  std::unique_lock lock(m_critSection);
-
-  while (!m_vecMessages.empty())
+  m_asyncCallbackExecutor.Stop();
+  std::vector<ThreadMessage*> messages;
   {
-    ThreadMessage* pMsg = m_vecMessages.front();
+    std::unique_lock lock(m_critSection);
+    m_bStop = true;
+    m_ownedCallbackGate.Stop();
 
-    if (pMsg->waitEvent)
-      pMsg->waitEvent->Set();
+    while (!m_vecMessages.empty())
+    {
+      messages.push_back(m_vecMessages.front());
+      m_vecMessages.pop();
+    }
 
-    delete pMsg;
-    m_vecMessages.pop();
+    while (!m_vecWindowMessages.empty())
+    {
+      messages.push_back(m_vecWindowMessages.front());
+      m_vecWindowMessages.pop();
+    }
   }
 
-  while (!m_vecWindowMessages.empty())
+  for (ThreadMessage* message : messages)
   {
-    ThreadMessage* pMsg = m_vecWindowMessages.front();
+    if (message->waitEvent)
+      message->waitEvent->Set();
+    if (message->ownedCallback)
+      message->ownedCallback->Cancel();
+    delete message;
+  }
+}
 
-    if (pMsg->waitEvent)
-      pMsg->waitEvent->Set();
+void CApplicationMessenger::Stop()
+{
+  m_asyncCallbackExecutor.Stop();
+  {
+    std::unique_lock lock(m_critSection);
+    m_bStop = true;
+    m_ownedCallbackGate.Stop();
+  }
+  CancelPendingOwnedCallbacks();
+}
 
-    delete pMsg;
-    m_vecWindowMessages.pop();
+void CApplicationMessenger::CancelPendingOwnedCallbacks()
+{
+  std::vector<ThreadMessage*> cancelled;
+  {
+    std::unique_lock lock(m_critSection);
+    const auto extractOwned = [&cancelled](std::queue<ThreadMessage*>& queue)
+    {
+      const std::size_t count = queue.size();
+      for (std::size_t index = 0; index < count; ++index)
+      {
+        ThreadMessage* message = queue.front();
+        queue.pop();
+        if (message->dwMessage == TMSG_OWNED_CALLBACK || message->ownedPayload)
+          cancelled.push_back(message);
+        else
+          queue.push(message);
+      }
+    };
+    extractOwned(m_vecMessages);
+    extractOwned(m_vecWindowMessages);
+  }
+
+  for (ThreadMessage* message : cancelled)
+  {
+    if (message->ownedCallback)
+      message->ownedCallback->Cancel();
+    delete message;
   }
 }
 
@@ -112,17 +158,16 @@ int CApplicationMessenger::SendMsg(ThreadMessage&& message, bool wait)
   }
 
 
+  std::unique_ptr<ThreadMessage> msg = std::make_unique<ThreadMessage>(std::move(message));
+
+  std::unique_lock lock(m_critSection);
   if (m_bStop)
     return -1;
 
-  ThreadMessage* msg = new ThreadMessage(std::move(message));
-
-  std::unique_lock lock(m_critSection);
-
   if (msg->dwMessage == TMSG_GUI_MESSAGE)
-    m_vecWindowMessages.push(msg);
+    m_vecWindowMessages.push(msg.release());
   else
-    m_vecMessages.push(msg);
+    m_vecMessages.push(msg.release());
   lock.unlock(); // this releases the lock on the vec of messages and
       //   allows the ProcessMessage to execute and therefore
       //   delete the message itself. Therefore any access
@@ -200,6 +245,56 @@ void CApplicationMessenger::PostMsg(uint32_t messageId, int param1, int param2, 
           false);
 }
 
+bool CApplicationMessenger::PostOwnedMsg(ThreadMessage&& message)
+{
+  CBoundedApplicationCallbackGate::ReservationPtr reservation =
+      m_ownedCallbackGate.TryReserve();
+  if (!reservation || !message.ownedPayload)
+    return false;
+
+  message.queueReservation = std::move(reservation);
+  auto queued = std::make_unique<ThreadMessage>(std::move(message));
+  std::unique_lock lock(m_critSection);
+  if (m_bStop)
+    return false;
+
+  if (queued->dwMessage == TMSG_GUI_MESSAGE)
+    m_vecWindowMessages.push(queued.release());
+  else
+    m_vecMessages.push(queued.release());
+  return true;
+}
+
+bool CApplicationMessenger::PostCallback(std::shared_ptr<IApplicationCallback> callback)
+{
+  if (!callback)
+    return false;
+
+  CBoundedApplicationCallbackGate::ReservationPtr reservation =
+      m_ownedCallbackGate.TryReserve();
+  if (!reservation)
+  {
+    callback->Cancel();
+    return false;
+  }
+
+  auto owned = std::make_shared<COwnedApplicationCallback>(std::move(callback), reservation);
+  auto message = std::make_unique<ThreadMessage>(TMSG_OWNED_CALLBACK);
+  message->ownedCallback = owned;
+  {
+    std::unique_lock lock(m_critSection);
+    if (m_bStop)
+      return false;
+    m_vecMessages.push(message.release());
+  }
+  return true;
+}
+
+bool CApplicationMessenger::PostAsyncCallback(std::shared_ptr<IApplicationCallback> callback)
+{
+  return m_asyncCallbackExecutor.Post(std::move(callback));
+}
+
 void CApplicationMessenger::ProcessMessages()
 {
   // process threadmessages
@@ -233,6 +328,12 @@ void CApplicationMessenger::ProcessMessage(ThreadMessage *pMsg)
   {
     ThreadMessageCallback *callback = static_cast<ThreadMessageCallback*>(pMsg->lpVoid);
     callback->callback(callback->userptr);
+    return;
+  }
+  if (pMsg->dwMessage == TMSG_OWNED_CALLBACK)
+  {
+    if (pMsg->ownedCallback)
+      pMsg->ownedCallback->Execute();
     return;
   }
 

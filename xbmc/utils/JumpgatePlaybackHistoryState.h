@@ -16,6 +16,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace KODI::JUMPGATE
 {
@@ -23,6 +24,8 @@ namespace KODI::JUMPGATE
 struct JumpgatePlaybackHistoryIdentity
 {
   uint64_t generation{0};
+  JumpgatePlaybackHistoryNamespace historyNamespace{
+      JumpgatePlaybackHistoryNamespace::AuthenticatedProfile};
   std::string profileId;
   std::string contentKey;
   std::optional<JumpgateCanonicalIdentity> canonicalIdentity;
@@ -33,17 +36,28 @@ struct JumpgatePlaybackResumeToken
 {
   uint64_t generation{0};
   uint64_t serial{0};
+  JumpgatePlaybackHistoryNamespace historyNamespace{
+      JumpgatePlaybackHistoryNamespace::AuthenticatedProfile};
   std::string profileId;
   std::string contentKey;
+  std::optional<int64_t> previouslyAppliedPositionMs;
 };
 
 std::optional<int64_t> ParseJumpgatePositiveInt64(std::string_view value);
+bool IsJumpgateResumeCorrectionWithinWindow(int64_t playbackStartedAtMs,
+                                            int64_t observedAtMs,
+                                            int64_t windowMs);
 
 class CJumpgatePlaybackHistoryState final
 {
 public:
   bool AdvanceGeneration(uint64_t generation);
   bool Activate(JumpgatePlaybackHistoryIdentity identity, int64_t activatedAtMs);
+  bool ActivateLocalSource(uint64_t generation,
+                           const std::vector<std::string>& canonicalFingerprints,
+                           std::string_view rawLaunchUri,
+                           int64_t activatedAtMs);
+  bool Promote(JumpgatePlaybackHistoryIdentity identity);
   bool UpdateProgress(uint64_t generation,
                       int64_t positionMs,
                       int64_t durationMs,
@@ -65,6 +79,7 @@ private:
     int64_t durationMs{0};
     int64_t updatedAtMs{0};
     bool resumeApplied{false};
+    std::optional<int64_t> appliedResumePositionMs;
     std::optional<JumpgatePlaybackHistoryEntry> finalSnapshot;
   };
 

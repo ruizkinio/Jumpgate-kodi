@@ -27,6 +27,7 @@ set(SOURCES TestAlarmClock.cpp
             TestJSONVariantParser.cpp
             TestJSONVariantWriter.cpp
             TestJumpgateApplicationLifecycleStatic.cpp
+            TestJumpgateBackCoordinator.cpp
             TestJumpgateGuiMessageRemoval.cpp
             TestJumpgatePlaybackAttemptState.cpp
             TestJumpgatePlaybackHistory.cpp
@@ -39,8 +40,10 @@ set(SOURCES TestAlarmClock.cpp
             TestJumpgateSubtitleCoordinator.cpp
             TestJumpgatePlaybackContext.cpp
             TestJumpgatePlaybackAuthority.cpp
-            TestJumpgateScrobbleStartCoordinator.cpp
-            TestJumpgateScrobbleDispatcher.cpp
+            TestJumpgateHistoryEventClient.cpp
+            TestJumpgateHistoryEventDispatcher.cpp
+            TestJumpgateHistoryWireFixture.cpp
+            TestJumpgateWatchedTimeState.cpp
             TestJumpgateShutdownCoordinator.cpp
             TestJumpgateProfileRuntime.cpp
             TestJumpgateProfileHistoryPolicy.cpp

@@ -38,6 +38,7 @@ set(SOURCES ActorProtocol.cpp
             InfoLoader.cpp
             JSONVariantParser.cpp
             JSONVariantWriter.cpp
+            JumpgateBackCoordinator.cpp
             JumpgatePlaybackAttemptState.cpp
             JumpgatePlaybackHistory.cpp
             JumpgatePlaybackHistoryState.cpp
@@ -49,8 +50,10 @@ set(SOURCES ActorProtocol.cpp
             JumpgateSubtitleCoordinator.cpp
             JumpgatePlaybackContext.cpp
             JumpgatePlaybackAuthority.cpp
-            JumpgateScrobbleStartCoordinator.cpp
-            JumpgateScrobbleDispatcher.cpp
+            JumpgateHistoryEventClient.cpp
+            JumpgateHistoryEventDispatcher.cpp
+            JumpgateHistoryEventState.cpp
+            JumpgateWatchedTimeState.cpp
             JumpgateThreadRegistry.cpp
             JumpgateShutdownCoordinator.cpp
             JumpgateProfileHistoryPolicy.cpp
@@ -153,6 +156,7 @@ set(HEADERS ActorProtocol.h
             IXmlDeserializable.h
             JSONVariantParser.h
             JSONVariantWriter.h
+            JumpgateBackCoordinator.h
             JumpgatePlaybackAttemptState.h
             JumpgatePlaybackHistory.h
             JumpgatePlaybackHistoryState.h
@@ -164,8 +168,10 @@ set(HEADERS ActorProtocol.h
             JumpgateSubtitleCoordinator.h
             JumpgatePlaybackContext.h
             JumpgatePlaybackAuthority.h
-            JumpgateScrobbleStartCoordinator.h
-            JumpgateScrobbleDispatcher.h
+            JumpgateHistoryEventClient.h
+            JumpgateHistoryEventDispatcher.h
+            JumpgateHistoryEventState.h
+            JumpgateWatchedTimeState.h
             JumpgateThreadRegistry.h
             JumpgateShutdownCoordinator.h
             JumpgateProfileHistoryPolicy.h

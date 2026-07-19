@@ -40,11 +40,16 @@
 #include "filesystem/SpecialProtocol.h"
 #include "filesystem/VideoDatabaseFile.h"
 #include "guilib/GUIComponent.h"
+#include "guilib/GUIDialog.h"
 #include "guilib/GUIKeyboardFactory.h"
 #include "guilib/GUIWindowManager.h"
 #include "guilib/guiinfo/GUIInfoLabels.h"
+#include "input/InputManager.h"
 #include "input/actions/Action.h"
 #include "input/actions/ActionIDs.h"
+#include "input/keyboard/Key.h"
+#include "input/keyboard/KeyboardTypes.h"
+#include "input/keyboard/XBMC_vkeys.h"
 #include "input/mouse/MouseStat.h"
 #include "interfaces/AnnouncementManager.h"
 #include "messaging/ApplicationMessenger.h"
@@ -152,6 +157,15 @@ using namespace std::chrono_literals;
 static void SaveLegacyResumeForContentLocal(
     const std::string& imdbId, int season, int episode, int64_t posMs, int64_t durMs);
 
+constexpr int64_t JUMPGATE_AUTHENTICATED_RESUME_CORRECTION_WINDOW_MS = 60000;
+
+static int64_t SteadyClockNowMs()
+{
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
 static std::string NoRedirectUrl(const std::string& url)
 {
   CURL requestUrl(url);
@@ -221,6 +235,16 @@ public:
     XFILE::CCurlFile curl;
     curl.SetRequestHeader("Content-Type", request.contentType);
     curl.SetRequestHeader("Authorization", request.authorization);
+    for (const auto& header : request.headers)
+    {
+      if (header.name.empty() || header.value.empty() ||
+          header.name.find_first_of("\r\n:") != std::string::npos ||
+          header.value.find_first_of("\r\n") != std::string::npos)
+      {
+        return false;
+      }
+      curl.SetRequestHeader(header.name, header.value);
+    }
     curl.SetTimeout(3);
     curl.SetTotalTimeout(3);
 
@@ -361,7 +385,78 @@ int32_t CNativeWindow::GetHeight() const
   return -1;
 }
 
-std::unique_ptr<CXBMCApp> CXBMCApp::m_appinstance;
+std::shared_ptr<CXBMCApp> CXBMCApp::m_appinstance;
+
+struct CXBMCApp::QueuedBackCommand final : KODI::MESSAGING::IApplicationCallback
+{
+  void Execute() override
+  {
+    if (!app)
+      return;
+    if (context)
+      context->Execute([this] { return app->ExecuteQueuedBackCommand(*this); });
+    else
+      app->ExecuteQueuedBackCommand(*this);
+  }
+
+  void Cancel() noexcept override
+  {
+    if (context)
+      context->Reject();
+    if (app)
+      app->CancelQueuedBackCommand(*this);
+  }
+
+  std::shared_ptr<CXBMCApp> app;
+  std::optional<KODI::JUMPGATE::CJumpgateBackDispatcher::CommandContext> context;
+  BackCommand command{BackCommand::EXTERNAL_BACK};
+  KODI::JUMPGATE::CJumpgateBackDispatcher::LifecycleToken lifecycleToken{0};
+  uint64_t playbackGeneration{0};
+  uint64_t playbackToken{0};
+};
+
+struct CXBMCApp::QueuedExternalPlayback final : KODI::MESSAGING::IApplicationCallback
+{
+  void Execute() override
+  {
+    if (app)
+      app->ExecuteQueuedExternalPlayback(*this);
+  }
+
+  void Cancel() noexcept override
+  {
+    if (app)
+      app->CancelQueuedExternalPlayback(*this);
+  }
+
+  std::shared_ptr<CXBMCApp> app;
+  std::unique_ptr<CFileItem> item;
+  KODI::JUMPGATE::CJumpgateBackDispatcher::LifecycleToken lifecycleToken{0};
+  uint64_t admissionGeneration{0};
+  uint64_t admissionToken{0};
+  std::string resultRequestId;
+};
+
+struct CXBMCApp::QueuedExternalPlayerResult final : KODI::MESSAGING::IApplicationCallback
+{
+  void Execute() override
+  {
+    if (app)
+      app->ExecuteQueuedExternalPlayerResult(*this);
+  }
+
+  void Cancel() noexcept override
+  {
+    if (app)
+      app->CancelQueuedExternalPlayerResult(*this);
+  }
+
+  std::shared_ptr<CXBMCApp> app;
+  KODI::JUMPGATE::CJumpgateBackDispatcher::LifecycleToken lifecycleToken{0};
+  uint64_t generation{0};
+  std::string requestId;
+  bool wasStandalone{false};
+};
 
 CXBMCApp::CXBMCApp(ANativeActivity* nativeActivity, IInputHandler& inputHandler)
   : CJNIMainActivity(nativeActivity),
@@ -375,6 +470,14 @@ CXBMCApp::CXBMCApp(ANativeActivity* nativeActivity, IInputHandler& inputHandler)
     exit(1);
     return;
   }
+
+  m_jumpgateBackLifecycleToken = GetJumpgateBackLifecycleToken(nativeActivity);
+  if (m_jumpgateBackLifecycleToken ==
+      KODI::JUMPGATE::CJumpgateBackDispatcher::INVALID_LIFECYCLE_TOKEN)
+  {
+    throw std::runtime_error("CXBMCApp has no native Back lifecycle token");
+  }
+
   // Android lifecycle callbacks and Kodi's main thread can overlap. Keep the
   // object address stable for the app lifetime and toggle only its internally
   // synchronized initialized state when entering/leaving external-player mode.
@@ -390,6 +493,10 @@ CXBMCApp::CXBMCApp(ANativeActivity* nativeActivity, IInputHandler& inputHandler)
 
 CXBMCApp::~CXBMCApp()
 {
+  CJNIMainActivity::RetireAppInstance(m_jumpgateBackLifecycleToken, m_jumpgateAppPublicationToken,
+                                      this);
+  CJNIMainActivity::GetJumpgateBackDispatcher().UnpublishSink(m_jumpgateBackLifecycleToken,
+                                                              m_jumpgateBackPublicationToken);
   StopBridgePairingWorker(true);
   StopPlaybackClaimCoordinator(false);
 }
@@ -463,7 +570,7 @@ void CXBMCApp::onStart()
     jboolean extMode = call_method<jboolean>(m_context, "isExternalPlayerMode", "()Z");
     if (extMode)
     {
-      m_externalPlayerMode.store(true, std::memory_order_relaxed);
+      SetExternalPlayerMode(true);
       android_printf("CXBMCApp: External player mode detected at startup");
     }
 
@@ -555,6 +662,8 @@ void CXBMCApp::onResume()
 
   const auto& components = CServiceBroker::GetAppComponents();
   const auto appPlayer = components.GetComponent<CApplicationPlayer>();
+  if (m_externalPlayerMode.load(std::memory_order_relaxed) && m_traktScrobbler)
+    m_traktScrobbler->SetBackgrounded(false);
   if (m_bResumePlayback && appPlayer->IsPlaying())
   {
     if (appPlayer->HasVideo())
@@ -578,6 +687,8 @@ void CXBMCApp::onPause()
 
   const auto& components = CServiceBroker::GetAppComponents();
   const auto appPlayer = components.GetComponent<CApplicationPlayer>();
+  if (m_externalPlayerMode.load(std::memory_order_relaxed) && m_traktScrobbler)
+    m_traktScrobbler->SetBackgrounded(true);
   if (appPlayer->IsPlaying())
   {
     if (appPlayer->HasVideo())
@@ -622,21 +733,21 @@ void CXBMCApp::onStop()
 void CXBMCApp::onDestroy()
 {
   android_printf("%s", __PRETTY_FUNCTION__);
+  CancelExternalPlaybackForLifecycleTeardown();
+  CJNIMainActivity::GetJumpgateBackDispatcher().UnpublishSink(m_jumpgateBackLifecycleToken,
+                                                              m_jumpgateBackPublicationToken);
 
   StopBridgePairingWorker(true, false);
 
   {
     auto authorityTransaction = m_playbackAuthority.BeginTransaction();
 
-    // The destroy safety net is local-only. Paired history is keyed only by the
-    // authenticated profile/content key retained after claim application.
-    if (m_externalPlayerMode.load(std::memory_order_relaxed) && m_traktScrobbler)
+    // The exact source namespace remains available even when no claim or profile
+    // exists. Legacy metadata history is retained only for the compatibility path.
+    if (m_externalPlayerMode.load(std::memory_order_relaxed))
     {
-      if (m_traktScrobbler->IsBridgeProfileBacked())
-      {
-        SavePairedPlaybackHistory(false);
-      }
-      else
+      SavePairedPlaybackHistory(false);
+      if (m_traktScrobbler && !m_traktScrobbler->IsBridgeProfileBacked())
       {
         std::string imdb = m_traktScrobbler->GetImdbId();
         if (!imdb.empty())
@@ -717,6 +828,7 @@ void CXBMCApp::onResizeWindow()
 void CXBMCApp::onDestroyWindow()
 {
   android_printf("%s: ", __PRETTY_FUNCTION__);
+  SetJumpgateBackInputReady(false);
 }
 
 void CXBMCApp::onGainFocus()
@@ -804,8 +916,7 @@ void CXBMCApp::Deinitialize()
         StopJumpgateSubtitleController(false);
         if (m_traktScrobbler)
           m_traktScrobbler->Deinitialize(true);
-        if (!KODI::JUMPGATE::CJumpgateThreadRegistry::Global()->JoinAll(
-                std::chrono::seconds{12}))
+        if (!KODI::JUMPGATE::CJumpgateThreadRegistry::Global()->JoinAll(std::chrono::seconds{12}))
         {
           CLog::Log(LOGERROR, "CXBMCApp: bounded Jumpgate worker drain expired");
         }
@@ -1253,11 +1364,21 @@ void CXBMCApp::OnPlayBackStarted(bool resumed, uint64_t token)
     CLog::Log(LOGINFO, "CXBMCApp: Playback started — overlay will hide when frames render");
   }
   uint64_t subtitleGeneration = 0;
+  uint64_t playbackStartedGeneration = 0;
+  bool playbackAuthorityAccepted = true;
   if (resumed)
   {
     auto authorityTransaction = m_playbackAuthority.BeginTransaction();
-    if (!authorityTransaction.CommitPlaybackResumed())
+    const auto resumedEvent = authorityTransaction.CommitPlaybackResumed();
+    if (!resumedEvent)
+    {
+      playbackAuthorityAccepted = false;
       CLog::Log(LOGDEBUG, "CXBMCApp: Ignoring resume without an active playback token");
+    }
+    else
+    {
+      playbackStartedGeneration = resumedEvent->generation;
+    }
   }
   else
   {
@@ -1268,6 +1389,7 @@ void CXBMCApp::OnPlayBackStarted(bool resumed, uint64_t token)
     const auto started = authorityTransaction.CommitPlaybackStarted(continuationGeneration, token);
     if (!started)
     {
+      playbackAuthorityAccepted = false;
       CLog::Log(LOGWARNING,
                 "CXBMCApp: Ignoring playback start during a profile authority transition");
     }
@@ -1278,10 +1400,47 @@ void CXBMCApp::OnPlayBackStarted(bool resumed, uint64_t token)
     else if (m_externalPlayerMode.load(std::memory_order_relaxed))
     {
       subtitleGeneration = started->generation;
+      playbackStartedGeneration = started->generation;
     }
+  }
+  if (playbackAuthorityAccepted && !resumed && playbackStartedGeneration != 0 &&
+      m_externalPlayerMode.load(std::memory_order_relaxed))
+  {
+    m_externalPlaybackStartedGeneration.store(playbackStartedGeneration, std::memory_order_relaxed);
+    m_externalPlaybackStartedAtSteadyMs.store(SteadyClockNowMs(), std::memory_order_relaxed);
+  }
+  bool stopCanceledDispatch = false;
+  if (token != 0)
+  {
+    std::lock_guard lock(m_externalPlaybackQueueMutex);
+    if (m_externalPlaybackDispatchToken == token)
+    {
+      stopCanceledDispatch =
+          m_pendingExternalPlaybackStopGeneration == m_externalPlaybackDispatchGeneration &&
+          m_pendingExternalPlaybackStopToken == token;
+      if (stopCanceledDispatch)
+      {
+        m_pendingExternalPlaybackStopGeneration = 0;
+        m_pendingExternalPlaybackStopToken = 0;
+      }
+      m_externalPlaybackDispatchGeneration = 0;
+      m_externalPlaybackDispatchToken = 0;
+      m_externalPlaybackDispatchRequestId.clear();
+      m_externalPlaybackDispatchPayload.reset();
+    }
+  }
+  if (stopCanceledDispatch)
+  {
+    CServiceBroker::GetAppMessenger()->PostMsg(TMSG_GUI_ACTION, WINDOW_INVALID, -1,
+                                               static_cast<void*>(new CAction(ACTION_STOP)));
   }
   if (subtitleGeneration != 0 && m_jumpgateSubtitleController)
     m_jumpgateSubtitleController->MarkPlaybackReady(subtitleGeneration);
+  if (playbackAuthorityAccepted && m_externalPlayerMode.load(std::memory_order_relaxed) &&
+      m_traktScrobbler)
+  {
+    m_traktScrobbler->OnPlaybackStarted(resumed);
+  }
 }
 
 void CXBMCApp::OnPlayBackPaused()
@@ -1294,6 +1453,8 @@ void CXBMCApp::OnPlayBackPaused()
 
   RequestVisibleBehind(false);
   ReleaseAudioFocus();
+  if (m_externalPlayerMode.load(std::memory_order_relaxed) && m_traktScrobbler)
+    m_traktScrobbler->OnPlaybackPaused();
 }
 
 void CXBMCApp::OnPlayBackStopped(bool completed)
@@ -1358,6 +1519,13 @@ void CXBMCApp::CommitExternalPlaybackTerminal(bool completed, uint64_t token, bo
     m_lastPlaybackDurationMs.store(durationMs, std::memory_order_relaxed);
   }
 
+  if (m_traktScrobbler)
+  {
+    const auto terminal = m_traktScrobbler->StopForReplacement(completed);
+    if (terminal.status == KODI::JUMPGATE::JumpgateHistoryTerminalStatus::Rejected)
+      CLog::Log(LOGWARNING, "CXBMCApp: Bridge history terminal event was rejected");
+  }
+
   const int64_t observedAtMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                                    std::chrono::system_clock::now().time_since_epoch())
                                    .count();
@@ -1367,10 +1535,23 @@ void CXBMCApp::CommitExternalPlaybackTerminal(bool completed, uint64_t token, bo
   m_playbackResultState.Finish(terminal->generation, completed);
 }
 
+void CXBMCApp::QueuePendingExternalPlayerResult()
+{
+  std::optional<KODI::JUMPGATE::JumpgatePlaybackResultOwner> owner;
+  {
+    auto lifecycleOperation = m_playbackResultState.BeginLifecycleOperation();
+    owner = m_playbackResultState.CurrentOwner(lifecycleOperation);
+  }
+  if (!owner)
+    return;
+
+  QueueExternalPlayerResult(owner->generation, owner->requestId,
+                            m_wasStandalone.load(std::memory_order_relaxed));
+}
+
 void CXBMCApp::DeliverPendingExternalPlayerResult()
 {
-  auto lifecycleOperation = m_playbackResultState.BeginLifecycleOperation();
-  DeliverPendingExternalPlayerResult(lifecycleOperation);
+  QueuePendingExternalPlayerResult();
 }
 
 void CXBMCApp::DeliverPendingExternalPlayerResult(
@@ -1404,9 +1585,9 @@ void CXBMCApp::ExitExternalPlayerMode(
 
   // Save resume position before exiting
   SaveResumePosition(result.completed);
-  StopJumpgateSubtitleController(false);
-  ReleasePlaybackSourceClaim();
-  StopPlaybackClaimCoordinator(true);
+  StopJumpgateSubtitleController(false, false);
+  ReleasePlaybackSourceClaim(result.completed);
+  StopPlaybackClaimCoordinator(false);
 
   bool wasStandalone = m_wasStandalone.load(std::memory_order_relaxed);
 
@@ -1429,7 +1610,7 @@ void CXBMCApp::ExitExternalPlayerMode(
     // instance before returning from the lifecycle operation so a waiting
     // onNewIntent cannot admit work that the old generation will kill.
     m_playbackResultState.CloseAdmissions();
-    m_externalPlayerMode.store(false, std::memory_order_relaxed); // prevent re-entry
+    SetExternalPlayerMode(false); // prevent re-entry
 
     // Call Java-side with wasStandalone=false (cold launch: finish + killProcess)
     call_method<void>(m_context, "exitExternalPlayerMode", "(JLjava/lang/String;JJZZ)V",
@@ -1437,6 +1618,12 @@ void CXBMCApp::ExitExternalPlayerMode(
                       static_cast<jlong>(posMs), static_cast<jlong>(durMs),
                       static_cast<jboolean>(result.completed), static_cast<jboolean>(false));
   }
+}
+
+void CXBMCApp::SetExternalPlayerMode(bool mode)
+{
+  m_externalPlayerMode.store(mode, std::memory_order_relaxed);
+  CJNIMainActivity::GetJumpgateBackDispatcher().SetExternalMode(m_jumpgateBackLifecycleToken, mode);
 }
 
 void CXBMCApp::ReturnToStandaloneMode()
@@ -1461,9 +1648,11 @@ void CXBMCApp::ReturnToStandaloneMode()
   m_jumpgateSubtitleController.reset();
 
   // Reset external player state
-  m_externalPlayerMode.store(false, std::memory_order_relaxed);
+  SetExternalPlayerMode(false);
   m_resumePositionMs.store(0, std::memory_order_relaxed);
   m_resumeApplied.store(false, std::memory_order_relaxed);
+  m_externalPlaybackStartedGeneration.store(0, std::memory_order_relaxed);
+  m_externalPlaybackStartedAtSteadyMs.store(0, std::memory_order_relaxed);
   m_lastPlaybackTimeMs.store(0, std::memory_order_relaxed);
   m_lastPlaybackDurationMs.store(0, std::memory_order_relaxed);
   m_wasStandalone.store(false, std::memory_order_relaxed);
@@ -1492,16 +1681,18 @@ bool CXBMCApp::SavePairedPlaybackHistory(bool explicitEnd, uint64_t generation)
     return false;
 
   std::string error;
-  if (!m_jumpgatePlaybackHistoryStore->Save(entry->profileId, std::move(*entry), error))
+  const KODI::JUMPGATE::JumpgatePlaybackHistoryKey key =
+      KODI::JUMPGATE::GetJumpgatePlaybackHistoryKey(*entry);
+  if (!m_jumpgatePlaybackHistoryStore->Save(key, std::move(*entry), error))
   {
-    CLog::Log(LOGERROR, "CXBMCApp: Paired playback history save failed: {}", error);
+    CLog::Log(LOGERROR, "CXBMCApp: Playback history save failed: {}", error);
     return false;
   }
-  CLog::Log(LOGINFO, "CXBMCApp: Paired playback history saved locally");
+  CLog::Log(LOGINFO, "CXBMCApp: Playback history saved locally");
   return true;
 }
 
-void CXBMCApp::LoadAndApplyPairedPlaybackResume(uint64_t generation)
+void CXBMCApp::LoadAndApplyPairedPlaybackResume(uint64_t generation, bool allowPlayerSeek)
 {
   const std::optional<KODI::JUMPGATE::JumpgatePlaybackResumeToken> token =
       m_playbackHistoryState.BeginResume(generation);
@@ -1512,28 +1703,50 @@ void CXBMCApp::LoadAndApplyPairedPlaybackResume(uint64_t generation)
 
   std::optional<KODI::JUMPGATE::JumpgatePlaybackHistoryEntry> entry;
   std::string error;
-  if (!m_jumpgatePlaybackHistoryStore->Get(token->profileId, token->contentKey, entry, error))
+  const KODI::JUMPGATE::JumpgatePlaybackHistoryKey key{token->historyNamespace, token->profileId,
+                                                       token->contentKey};
+  if (!m_jumpgatePlaybackHistoryStore->Get(key, entry, error))
   {
-    CLog::Log(LOGERROR, "CXBMCApp: Paired playback history load failed: {}", error);
+    CLog::Log(LOGERROR, "CXBMCApp: Playback history load failed: {}", error);
     return;
   }
 
+  const bool historyEntryFound = entry.has_value();
   const int64_t resumePosition =
       entry ? KODI::JUMPGATE::GetJumpgatePlaybackResumePosition(*entry) : 0;
+  const std::optional<int64_t> previouslyAppliedPositionMs = token->previouslyAppliedPositionMs;
   m_playbackHistoryState.ApplyResume(
       *token, resumePosition,
-      [this](int64_t positionMs)
+      [this, allowPlayerSeek, historyEntryFound, generation,
+       previouslyAppliedPositionMs](int64_t positionMs)
       {
+        if (!historyEntryFound)
+          return;
         m_resumeApplied.store(true, std::memory_order_relaxed);
         m_resumePositionMs.store(positionMs, std::memory_order_relaxed);
-        if (positionMs <= 0)
+        if (!allowPlayerSeek ||
+            (previouslyAppliedPositionMs && *previouslyAppliedPositionMs == positionMs) ||
+            (positionMs == 0 &&
+             (!previouslyAppliedPositionMs || *previouslyAppliedPositionMs == 0)))
           return;
+        const uint64_t startedGeneration =
+            m_externalPlaybackStartedGeneration.load(std::memory_order_relaxed);
+        if (startedGeneration != 0 && startedGeneration != generation)
+          return;
+        const int64_t startedAtMs =
+            m_externalPlaybackStartedAtSteadyMs.load(std::memory_order_relaxed);
+        if (!KODI::JUMPGATE::IsJumpgateResumeCorrectionWithinWindow(
+                startedAtMs, SteadyClockNowMs(),
+                JUMPGATE_AUTHENTICATED_RESUME_CORRECTION_WINDOW_MS))
+        {
+          CLog::Log(LOGINFO,
+                    "CXBMCApp: Ignored authenticated resume correction outside the claim window");
+          return;
+        }
         const auto appPlayer =
             CServiceBroker::GetAppComponents().GetComponent<CApplicationPlayer>();
-        if (appPlayer->GetTime() >= 60000)
-          return;
         appPlayer->SeekTime(positionMs);
-        CLog::Log(LOGINFO, "CXBMCApp: Applied paired local resume at {} ms", positionMs);
+        CLog::Log(LOGINFO, "CXBMCApp: Applied authenticated playback resume at {} ms", positionMs);
         CGUIDialogKaiToast::QueueNotification(CGUIDialogKaiToast::Info, "Jumpgate",
                                               "Resuming playback", 3000, true);
       });
@@ -1541,14 +1754,12 @@ void CXBMCApp::LoadAndApplyPairedPlaybackResume(uint64_t generation)
 
 void CXBMCApp::SaveResumePosition(bool explicitEnd)
 {
+  SavePairedPlaybackHistory(explicitEnd);
   if (!m_traktScrobbler)
     return;
 
   if (m_traktScrobbler->IsBridgeProfileBacked())
-  {
-    SavePairedPlaybackHistory(explicitEnd);
     return;
-  }
 
   std::string imdb = m_traktScrobbler->GetImdbId();
   if (imdb.empty())
@@ -1830,12 +2041,21 @@ uint64_t CXBMCApp::QueuePlaybackSourceClaim(const std::string& rawLaunchUri, int
     generation = ++m_playbackClaimGeneration;
     m_pendingPlaybackClaim.reset();
   }
+  m_externalPlaybackStartedGeneration.store(0, std::memory_order_relaxed);
+  m_externalPlaybackStartedAtSteadyMs.store(0, std::memory_order_relaxed);
   m_playbackHistoryState.AdvanceGeneration(generation);
 
   std::vector<std::string> fingerprints;
-  if (rawLaunchUri.empty() || launchedAtMs <= 0 ||
-      !KODI::UTILITY::CJumpgateSourceFingerprint::FingerprintPlaybackUrl(rawLaunchUri,
-                                                                         fingerprints))
+  const bool fingerprinted =
+      !rawLaunchUri.empty() &&
+      KODI::UTILITY::CJumpgateSourceFingerprint::FingerprintPlaybackUrl(rawLaunchUri, fingerprints);
+  if (!m_playbackHistoryState.ActivateLocalSource(generation, fingerprints, rawLaunchUri,
+                                                  std::max<int64_t>(0, launchedAtMs)))
+  {
+    CLog::Log(LOGERROR, "CXBMCApp: Device-local playback history could not be activated");
+  }
+
+  if (!fingerprinted || launchedAtMs <= 0)
   {
     CLog::Log(LOGWARNING,
               "CXBMCApp: Playback source cannot be fingerprinted; paired Trakt is fail-closed");
@@ -1879,13 +2099,41 @@ std::optional<KODI::JUMPGATE::CJumpgatePlaybackAuthority::Event> CXBMCApp::
 
 void CXBMCApp::CommitExternalPlaybackOpenFailure(uint64_t token)
 {
-  if (token != 0)
-    CommitExternalPlaybackAdmissionFailure(token);
+  if (token == 0)
+    return;
+
+  uint64_t generation = 0;
+  std::string requestId;
+  {
+    std::lock_guard lock(m_externalPlaybackQueueMutex);
+    if (m_externalPlaybackDispatchToken == token)
+    {
+      generation = m_externalPlaybackDispatchGeneration;
+      requestId = m_externalPlaybackDispatchRequestId;
+      m_externalPlaybackDispatchGeneration = 0;
+      m_externalPlaybackDispatchToken = 0;
+      m_externalPlaybackDispatchRequestId.clear();
+      m_externalPlaybackDispatchPayload.reset();
+      if (m_pendingExternalPlaybackStopToken == token)
+      {
+        m_pendingExternalPlaybackStopGeneration = 0;
+        m_pendingExternalPlaybackStopToken = 0;
+      }
+    }
+  }
+  const bool failed = CommitExternalPlaybackAdmissionFailure(token);
+  if (failed && generation != 0 && !requestId.empty())
+  {
+    QueueExternalPlayerResult(generation, std::move(requestId),
+                              m_wasStandalone.load(std::memory_order_relaxed));
+  }
 }
 
 std::optional<uint64_t> CXBMCApp::BeginExternalPlaybackContinuation()
 {
-  auto lifecycleOperation = m_playbackResultState.BeginLifecycleOperation();
+  auto lifecycleOperation = m_playbackResultState.TryBeginLifecycleOperation();
+  if (!lifecycleOperation)
+    return std::nullopt;
   if (!m_externalPlayerMode.load(std::memory_order_relaxed) ||
       m_playbackResultState.AdmissionsClosed())
   {
@@ -1900,7 +2148,7 @@ std::optional<uint64_t> CXBMCApp::BeginExternalPlaybackContinuation()
   {
     auto authorityTransaction = m_playbackAuthority.BeginTransaction();
     admission = authorityTransaction.CommitAdmission(generation);
-    if (admission && !m_playbackResultState.Begin(lifecycleOperation, generation))
+    if (admission && !m_playbackResultState.Begin(*lifecycleOperation, generation))
     {
       authorityTransaction.CancelPendingAdmissionByToken(admission->token);
       admission.reset();
@@ -1920,10 +2168,10 @@ bool CXBMCApp::IsLatestExternalPlaybackAdmission(uint64_t token)
   return authorityTransaction.IsLatestPendingAdmission(token);
 }
 
-void CXBMCApp::CommitExternalPlaybackAdmissionFailure(uint64_t token)
+bool CXBMCApp::CommitExternalPlaybackAdmissionFailure(uint64_t token)
 {
   if (token == 0)
-    return;
+    return false;
 
   std::optional<KODI::JUMPGATE::CJumpgatePlaybackAuthority::Event> canceled;
   bool superseded = false;
@@ -1942,6 +2190,7 @@ void CXBMCApp::CommitExternalPlaybackAdmissionFailure(uint64_t token)
     m_traktScrobbler->CancelPlaybackGeneration(canceled->generation, canceled->token);
   if (canceled && !superseded && m_jumpgateSubtitleController)
     m_jumpgateSubtitleController->OnPlaybackTerminal(canceled->generation);
+  return canceled.has_value() && !superseded;
 }
 
 void CXBMCApp::DeliverRejectedExternalPlaybackResult(
@@ -1970,13 +2219,14 @@ void CXBMCApp::DeliverRejectedExternalPlaybackResult(
   const auto owner = m_playbackResultState.CurrentOwner(lifecycleOperation);
   if (!owner)
     return;
-  call_method<void>(m_context, "beginExternalPlayerMode", "(JLjava/lang/String;Z)V",
-                    static_cast<jlong>(generation), jcast<jhstring>(owner->requestId),
-                    static_cast<jboolean>(returnToStandalone));
+  static_cast<void>(call_method<jboolean>(m_context, "beginExternalPlayerMode",
+                                          "(JLjava/lang/String;Z)Z", static_cast<jlong>(generation),
+                                          jcast<jhstring>(owner->requestId),
+                                          static_cast<jboolean>(returnToStandalone)));
   if (!returnToStandalone)
   {
     m_playbackResultState.CloseAdmissions();
-    m_externalPlayerMode.store(false, std::memory_order_relaxed);
+    SetExternalPlayerMode(false);
   }
   call_method<void>(m_context, "exitExternalPlayerMode", "(JLjava/lang/String;JJZZ)V",
                     static_cast<jlong>(generation), jcast<jhstring>(owner->requestId),
@@ -2016,6 +2266,7 @@ void CXBMCApp::ProcessPlaybackSourceClaim()
       KODI::JUMPGATE::PlaybackClaimRequest request;
       request.bridgeOrigin = active.bridgeOrigin;
       request.deviceToken = active.deviceToken;
+      request.attemptId = StringUtils::CreateUUID();
       request.fingerprints = std::move(pending->fingerprints);
       request.intentUrlHash = std::move(pending->intentUrlHash);
       request.launchedAt = pending->launchedAtMs;
@@ -2073,6 +2324,7 @@ void CXBMCApp::ProcessPlaybackSourceClaim()
     std::unique_lock lock(m_playbackClaimMutex);
     if (m_playbackClaimCoordinator)
       m_playbackClaimCoordinator->RejectCompletion(generation);
+    completion->result.ClearSensitive();
     active.ClearSecrets();
     CLog::Log(LOGINFO, "CXBMCApp: Discarded stale playback claim after authority change");
     return;
@@ -2086,6 +2338,7 @@ void CXBMCApp::ProcessPlaybackSourceClaim()
       if (m_playbackClaimCoordinator)
         m_playbackClaimCoordinator->AcceptCompletion(generation);
     }
+    completion->result.ClearSensitive();
     active.ClearSecrets();
     CLog::Log(LOGWARNING, "CXBMCApp: Playback source claim failed closed ({})",
               PlaybackClaimStatusName(status));
@@ -2106,28 +2359,12 @@ void CXBMCApp::ProcessPlaybackSourceClaim()
     std::unique_lock lock(m_playbackClaimMutex);
     if (m_playbackClaimCoordinator)
       m_playbackClaimCoordinator->RejectCompletion(generation);
+    completion->result.ClearSensitive();
     active.ClearSecrets();
     CLog::Log(LOGERROR,
               "CXBMCApp: Bridge returned a playback context outside the active profile authority");
     return;
   }
-
-  bool accepted = false;
-  {
-    std::unique_lock lock(m_playbackClaimMutex);
-    if (generation == m_playbackClaimGeneration && m_playbackClaimCoordinator &&
-        m_playbackClaimCoordinator->AcceptCompletion(generation))
-    {
-      m_activePlaybackClaimSessionId = completion->result.claim.sessionId;
-      m_activePlaybackClaimProfileId = active.profileId;
-      m_activePlaybackClaimDeviceId = active.deviceId;
-      m_activePlaybackClaimOrigin = active.bridgeOrigin;
-      accepted = true;
-    }
-  }
-  active.ClearSecrets();
-  if (!accepted)
-    return;
 
   std::string provider;
   std::string canonicalId;
@@ -2147,18 +2384,51 @@ void CXBMCApp::ProcessPlaybackSourceClaim()
   const int year = context->display.year.value_or(0);
 
   const bool applied =
-      m_traktScrobbler && m_traktScrobbler->SetClaimedContentInfo(
-                              generation, provider, canonicalId, mediaType, title, logoUrl, year,
-                              season, episode, context->traktEligible);
+      m_traktScrobbler &&
+      m_traktScrobbler->SetClaimedContentInfo(
+          generation, active.profileId, active.deviceId, active.bridgeOrigin, active.deviceToken,
+          completion->result.claim.sessionId, completion->result.claim.historyGrant,
+          completion->result.claim.historyGrantKind, completion->result.claim.sessionRevision,
+          provider, canonicalId, mediaType, title, logoUrl, year, season, episode,
+          context->traktEligible);
   if (!applied)
   {
-    ReleasePlaybackSourceClaim();
+    std::unique_lock lock(m_playbackClaimMutex);
+    if (m_playbackClaimCoordinator)
+      m_playbackClaimCoordinator->RejectCompletion(generation);
+    completion->result.ClearSensitive();
+    active.ClearSecrets();
     CLog::Log(LOGINFO, "CXBMCApp: Discarded claim that lost the playback generation race");
+    return;
+  }
+
+  bool accepted = false;
+  {
+    std::unique_lock lock(m_playbackClaimMutex);
+    const bool transferred =
+        m_playbackClaimCoordinator && m_playbackClaimCoordinator->AcceptCompletion(generation);
+    if (transferred && generation == m_playbackClaimGeneration)
+    {
+      m_activePlaybackClaimSessionId = completion->result.claim.sessionId;
+      m_activePlaybackClaimProfileId = active.profileId;
+      m_activePlaybackClaimDeviceId = active.deviceId;
+      m_activePlaybackClaimOrigin = active.bridgeOrigin;
+      accepted = true;
+    }
+  }
+  completion->result.ClearSensitive();
+  active.ClearSecrets();
+  if (!accepted)
+  {
+    m_traktScrobbler->StopForReplacement(false);
+    CLog::Log(LOGINFO, "CXBMCApp: Bound claim was terminated after losing its generation race");
     return;
   }
 
   KODI::JUMPGATE::JumpgatePlaybackHistoryIdentity historyIdentity;
   historyIdentity.generation = generation;
+  historyIdentity.historyNamespace =
+      KODI::JUMPGATE::JumpgatePlaybackHistoryNamespace::AuthenticatedProfile;
   historyIdentity.profileId = context->profileId;
   historyIdentity.contentKey = *context->contentKey;
   historyIdentity.canonicalIdentity = context->canonicalIdentity;
@@ -2176,13 +2446,10 @@ void CXBMCApp::ProcessPlaybackSourceClaim()
       return;
     }
   }
-  const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::system_clock::now().time_since_epoch())
-                            .count();
-  if (!m_playbackHistoryState.Activate(std::move(historyIdentity), nowMs))
+  if (!m_playbackHistoryState.Promote(std::move(historyIdentity)))
   {
     ReleasePlaybackSourceClaim();
-    CLog::Log(LOGERROR, "CXBMCApp: Authenticated history identity could not be activated");
+    CLog::Log(LOGERROR, "CXBMCApp: Authenticated history identity could not be promoted");
     return;
   }
 
@@ -2274,70 +2541,23 @@ void CXBMCApp::StopJumpgateSubtitleController(bool playerMayRead, bool waitForCo
     m_jumpgateSubtitleController->Stop(playerMayRead, waitForCompletion);
 }
 
-void CXBMCApp::ReleasePlaybackSourceClaim()
+bool CXBMCApp::ReleasePlaybackSourceClaim(bool completed)
 {
-  std::string sessionId;
-  std::string profileId;
-  std::string deviceId;
-  std::string origin;
+  if (m_traktScrobbler)
+  {
+    const auto terminal = m_traktScrobbler->StopForReplacement(completed);
+    if (terminal.status == KODI::JUMPGATE::JumpgateHistoryTerminalStatus::Rejected)
+      CLog::Log(LOGWARNING, "CXBMCApp: Playback claim terminal history event was rejected");
+  }
+
   {
     std::unique_lock lock(m_playbackClaimMutex);
-    sessionId = std::move(m_activePlaybackClaimSessionId);
-    profileId = std::move(m_activePlaybackClaimProfileId);
-    deviceId = std::move(m_activePlaybackClaimDeviceId);
-    origin = std::move(m_activePlaybackClaimOrigin);
-    m_activePlaybackClaimSessionId.clear();
+    ClearSensitiveString(m_activePlaybackClaimSessionId);
     m_activePlaybackClaimProfileId.clear();
     m_activePlaybackClaimDeviceId.clear();
     m_activePlaybackClaimOrigin.clear();
   }
-  if (sessionId.empty() || !m_jumpgateProfileRuntime)
-    return;
-
-  KODI::JUMPGATE::ActiveProfile active = m_jumpgateProfileRuntime->GetActive();
-  if (!active.selected || !active.sourceBacked || !active.credentialsValid ||
-      active.profileId != profileId || active.deviceId != deviceId ||
-      active.bridgeOrigin != origin || active.deviceToken.empty())
-  {
-    active.ClearSecrets();
-    ClearSensitiveString(sessionId);
-    CLog::Log(LOGWARNING,
-              "CXBMCApp: Playback claim release skipped after profile authority changed");
-    return;
-  }
-
-  KODI::JUMPGATE::PlaybackReleaseRequest release{active.bridgeOrigin, active.deviceToken,
-                                                 sessionId};
-  active.ClearSecrets();
-  ClearSensitiveString(sessionId);
-  std::unique_ptr<KODI::JUMPGATE::CJumpgatePlaybackClaimCoordinator> rejectedCoordinator;
-  bool queued = false;
-  {
-    std::unique_lock lock(m_playbackClaimMutex);
-    if (!m_playbackClaimCoordinator)
-    {
-      m_playbackClaimCoordinator =
-          std::make_unique<KODI::JUMPGATE::CJumpgatePlaybackClaimCoordinator>(
-              std::make_shared<CAndroidPlaybackClaimTransport>());
-    }
-    queued = m_playbackClaimCoordinator->QueueRelease(release);
-    if (!queued)
-    {
-      rejectedCoordinator = std::move(m_playbackClaimCoordinator);
-      m_playbackClaimCoordinator =
-          std::make_unique<KODI::JUMPGATE::CJumpgatePlaybackClaimCoordinator>(
-              std::make_shared<CAndroidPlaybackClaimTransport>());
-      queued = m_playbackClaimCoordinator->QueueRelease(std::move(release));
-    }
-  }
-  if (rejectedCoordinator)
-    rejectedCoordinator->Stop(false);
-  ClearSensitiveString(release.deviceToken);
-  if (!queued)
-  {
-    CLog::Log(LOGERROR,
-              "CXBMCApp: Mandatory playback claim release remains pending after queue failure");
-  }
+  return true;
 }
 
 void CXBMCApp::StopPlaybackClaimCoordinator(bool drainRelease)
@@ -2404,9 +2624,9 @@ void CXBMCApp::ApplyActiveJumpgateProfile()
   KODI::JUMPGATE::ActiveProfile active = m_jumpgateProfileRuntime->GetActive();
   if (active.selected)
   {
-    m_traktScrobbler->SetBridgeProfile(active.profileId, active.bridgeOrigin, active.bridgeBaseUrl,
-                                       active.deviceToken,
-                                       active.traktEnabled && active.credentialsValid);
+    m_traktScrobbler->SetBridgeProfile(active.profileId, active.deviceId, active.bridgeOrigin,
+                                       active.sourceBacked, active.credentialsValid,
+                                       active.traktEnabled);
   }
   else
   {
@@ -2434,17 +2654,21 @@ std::optional<KODI::JUMPGATE::CJumpgatePlaybackAuthority::Token> CXBMCApp::
 
 void CXBMCApp::PrepareJumpgateProfileAuthorityTransition()
 {
-  if (m_traktScrobbler)
-  {
-    m_traktScrobbler->StopForReplacement();
-    m_traktScrobbler->Deinitialize(false);
-  }
   SavePairedPlaybackHistory(false);
   StopJumpgateSubtitleController(false);
-  ReleasePlaybackSourceClaim();
+  const bool releaseReady = ReleasePlaybackSourceClaim();
+  if (!releaseReady)
+  {
+    CLog::Log(LOGERROR,
+              "CXBMCApp: Profile transition withheld playback release after terminal timeout");
+  }
+  if (m_traktScrobbler)
+    m_traktScrobbler->Deinitialize(false);
   StopPlaybackClaimCoordinator(true);
   m_resumeApplied.store(false, std::memory_order_relaxed);
   m_resumePositionMs.store(0, std::memory_order_relaxed);
+  m_externalPlaybackStartedGeneration.store(0, std::memory_order_relaxed);
+  m_externalPlaybackStartedAtSteadyMs.store(0, std::memory_order_relaxed);
 }
 
 bool CXBMCApp::FinishJumpgateProfileAuthorityTransition(
@@ -2906,14 +3130,9 @@ void CXBMCApp::CheckForUpdate()
   if (!m_traktScrobbler)
     return;
 
-  std::string bridgeUrl = m_traktScrobbler->GetBridgeUrl();
-  if (bridgeUrl.empty())
-    return;
-
-  // Configured Bridge URLs include /_c/<config>; version endpoint lives at host root.
-  std::string bridgeOrigin = GetBridgeOriginFromUrl(bridgeUrl);
+  const std::string bridgeOrigin = m_traktScrobbler->GetBridgeOrigin();
   if (bridgeOrigin.empty())
-    bridgeOrigin = bridgeUrl;
+    return;
 
   XFILE::CCurlFile curl;
   curl.SetTimeout(3);
@@ -4035,7 +4254,7 @@ static void SaveLegacyResumeForContentLocal(
   }
 }
 
-void CXBMCApp::onNewIntent(CJNIIntent intent)
+void CXBMCApp::onNewIntent(CJNIIntent intent, std::string preparedRequestId)
 {
   if (!intent)
   {
@@ -4043,18 +4262,41 @@ void CXBMCApp::onNewIntent(CJNIIntent intent)
     return;
   }
 
-  // Admission and result delivery own this same operation. Callback threads
-  // may finalize an exact generation, but cannot run exit/reset side effects.
-  auto lifecycleOperation = m_playbackResultState.BeginLifecycleOperation();
-
   std::string action = intent.getAction();
   CLog::Log(LOGDEBUG, "CXBMCApp::onNewIntent - Got intent. Action: {}", action);
   const CJNIURI rawData = intent.getData();
   const std::string rawLaunchUri = rawData ? rawData.toString() : "";
-  const std::string resultRequestId =
+  const std::string intentResultRequestId =
       intent.hasExtra("jumpgate_external_result_request_id")
           ? intent.getStringExtra("jumpgate_external_result_request_id")
           : "";
+  const std::string resultRequestId = std::move(preparedRequestId);
+  std::optional<KODI::JUMPGATE::CJumpgatePlaybackResultState::LifecycleOperation>
+      lifecycleOperation;
+  if (action == CJNIIntent::ACTION_VIEW)
+  {
+    if (resultRequestId.empty() || resultRequestId != intentResultRequestId)
+    {
+      const std::string rejectedRequestId =
+          !resultRequestId.empty() ? resultRequestId : intentResultRequestId;
+      call_method<void>(m_context, "postDeferredExternalPlayerRejection", "(JLjava/lang/String;)V",
+                        static_cast<jlong>(m_jumpgateBackLifecycleToken),
+                        jcast<jhstring>(rejectedRequestId));
+      return;
+    }
+
+    // Admission and result delivery own this same operation. Android callbacks
+    // never wait for a terminal worker that still owns the previous generation.
+    lifecycleOperation = m_playbackResultState.TryBeginLifecycleOperation();
+    if (!lifecycleOperation)
+    {
+      call_method<void>(m_context, "postNativeExternalIntentRetry",
+                        "(JLandroid/content/Intent;Ljava/lang/String;)V",
+                        static_cast<jlong>(m_jumpgateBackLifecycleToken), intent.get_raw(),
+                        jcast<jhstring>(resultRequestId));
+      return;
+    }
+  }
   int64_t launchedAtMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                              std::chrono::system_clock::now().time_since_epoch())
                              .count();
@@ -4074,7 +4316,7 @@ void CXBMCApp::onNewIntent(CJNIIntent intent)
   if (action == CJNIIntent::ACTION_VIEW && targetFile.empty())
   {
     CLog::Log(LOGWARNING, "CXBMCApp: External playback rejected because the target is empty");
-    DeliverRejectedExternalPlaybackResult(resultRequestId, lifecycleOperation);
+    DeliverRejectedExternalPlaybackResult(resultRequestId, *lifecycleOperation);
     return;
   }
   uint64_t admissionGeneration = 0;
@@ -4086,14 +4328,14 @@ void CXBMCApp::onNewIntent(CJNIIntent intent)
   // (ACTION_GET_CONTENT is Kodi's internal leanback navigation, not external player)
   if (!targetFile.empty() && action == CJNIIntent::ACTION_VIEW)
   {
-    const auto previousResultOwner = m_playbackResultState.CurrentOwner(lifecycleOperation);
+    const auto previousResultOwner = m_playbackResultState.CurrentOwner(*lifecycleOperation);
     const auto admission = BeginExternalPlaybackAdmission(rawLaunchUri, launchedAtMs,
-                                                          resultRequestId, lifecycleOperation);
+                                                          resultRequestId, *lifecycleOperation);
     if (!admission)
     {
       CLog::Log(LOGWARNING,
                 "CXBMCApp: External playback rejected during a profile authority transition");
-      DeliverRejectedExternalPlaybackResult(resultRequestId, lifecycleOperation);
+      DeliverRejectedExternalPlaybackResult(resultRequestId, *lifecycleOperation);
       return;
     }
     admissionGeneration = admission->generation;
@@ -4127,10 +4369,19 @@ void CXBMCApp::onNewIntent(CJNIIntent intent)
     {
       CLog::Log(LOGINFO, "CXBMCApp: External player mode activated (cold launch)");
     }
-    m_externalPlayerMode.store(true, std::memory_order_relaxed);
-    call_method<void>(m_context, "beginExternalPlayerMode", "(JLjava/lang/String;Z)V",
-                      static_cast<jlong>(admissionGeneration), jcast<jhstring>(resultRequestId),
-                      static_cast<jboolean>(m_wasStandalone.load(std::memory_order_relaxed)));
+    SetExternalPlayerMode(true);
+    const bool cancellationRequested =
+        call_method<jboolean>(
+            m_context, "beginExternalPlayerMode", "(JLjava/lang/String;Z)Z",
+            static_cast<jlong>(admissionGeneration), jcast<jhstring>(resultRequestId),
+            static_cast<jboolean>(m_wasStandalone.load(std::memory_order_relaxed))) == JNI_TRUE;
+    if (cancellationRequested)
+    {
+      CommitExternalPlaybackAdmissionFailure(admissionToken);
+      QueueExternalPlayerResult(admissionGeneration, resultRequestId,
+                                m_wasStandalone.load(std::memory_order_relaxed));
+      return;
+    }
 
     ApplyActiveJumpgateProfile();
     m_traktScrobbler->Initialize();
@@ -4248,6 +4499,7 @@ void CXBMCApp::onNewIntent(CJNIIntent intent)
     m_resumePositionMs.store(resumePositionMs, std::memory_order_relaxed);
     m_resumeApplied.store((resumePositionMs > 0),
                           std::memory_order_relaxed); // Mark applied if we got it from intent/store
+    LoadAndApplyPairedPlaybackResume(admissionGeneration, false);
   }
 
   if (!targetFile.empty() &&
@@ -4287,7 +4539,10 @@ void CXBMCApp::onNewIntent(CJNIIntent intent)
     {
       auto item = std::make_unique<CFileItem>(targetFile, false);
       if (action == CJNIIntent::ACTION_VIEW)
+      {
         item->SetProperty("jumpgate.playback_token", CVariant{admissionToken});
+        item->SetProperty("jumpgate.lifecycle_token", CVariant{m_jumpgateBackLifecycleToken});
+      }
       if (IsVideoDb(*item))
       {
         *(item->GetVideoInfoTag()) = XFILE::CVideoDatabaseFile::GetVideoTag(item->GetURL());
@@ -4302,9 +4557,8 @@ void CXBMCApp::onNewIntent(CJNIIntent intent)
       }
       if (action == CJNIIntent::ACTION_VIEW)
       {
-        const int playResult = CServiceBroker::GetAppMessenger()->SendMsg(
-            TMSG_MEDIA_PLAY, 0, 0, static_cast<void*>(item.release()));
-        playbackAccepted = playResult == 1;
+        playbackAccepted = QueueExternalPlayback(std::move(item), admissionGeneration,
+                                                 admissionToken, resultRequestId);
       }
       else
       {
@@ -4316,7 +4570,8 @@ void CXBMCApp::onNewIntent(CJNIIntent intent)
     if (action == CJNIIntent::ACTION_VIEW && externalPlaybackPrepared && !playbackAccepted)
     {
       CommitExternalPlaybackAdmissionFailure(admissionToken);
-      DeliverPendingExternalPlayerResult(lifecycleOperation);
+      QueueExternalPlayerResult(admissionGeneration, resultRequestId,
+                                m_wasStandalone.load(std::memory_order_relaxed));
     }
   }
   else if (action == ACTION_XBMC_RESUME)
@@ -4326,7 +4581,7 @@ void CXBMCApp::onNewIntent(CJNIIntent intent)
       if (m_playback_state & PLAYBACK_STATE_VIDEO)
         RequestVisibleBehind(true);
       if (!(m_playback_state & PLAYBACK_STATE_PLAYING))
-        CServiceBroker::GetAppMessenger()->SendMsg(TMSG_GUI_ACTION, WINDOW_INVALID, -1,
+        CServiceBroker::GetAppMessenger()->PostMsg(TMSG_GUI_ACTION, WINDOW_INVALID, -1,
                                                    static_cast<void*>(new CAction(ACTION_PAUSE)));
     }
   }
@@ -4353,13 +4608,569 @@ void CXBMCApp::onVisibleBehindCanceled()
   }
 }
 
-void CXBMCApp::onOpenSettingsRequested()
+void CXBMCApp::onBackLifecycleRetiring(
+    KODI::JUMPGATE::CJumpgateBackDispatcher::LifecycleToken lifecycleToken)
+{
+  if (lifecycleToken == m_jumpgateBackLifecycleToken)
+    CancelExternalPlaybackForLifecycleTeardown();
+}
+
+bool CXBMCApp::DispatchExternalBack(
+    const KODI::JUMPGATE::CJumpgateBackDispatcher::CommandContext& context)
+{
+  bool playbackStarted = false;
+  {
+    auto authorityTransaction = m_playbackAuthority.BeginTransaction();
+    playbackStarted = authorityTransaction.GetActiveToken() != 0;
+  }
+  if (!playbackStarted)
+  {
+    return context.Execute(
+        [this]
+        {
+          const bool requestCancellation =
+              call_method<jboolean>(m_context, "recordEarlyExternalPlayerBack", "()Z") == JNI_TRUE;
+          return CancelPendingExternalPlaybackFromBack() || requestCancellation;
+        });
+  }
+  return DispatchBackCommand(context, BackCommand::EXTERNAL_BACK);
+}
+
+bool CXBMCApp::DispatchKodiBack(
+    const KODI::JUMPGATE::CJumpgateBackDispatcher::CommandContext& context, bool longPress)
+{
+  return DispatchBackCommand(context, longPress ? BackCommand::KODI_LONG_BACK
+                                                : BackCommand::KODI_SHORT_BACK);
+}
+
+bool CXBMCApp::OpenExternalSettings(
+    const KODI::JUMPGATE::CJumpgateBackDispatcher::CommandContext& context)
+{
+  return DispatchBackCommand(context, BackCommand::OPEN_SETTINGS);
+}
+
+bool CXBMCApp::DispatchBackCommand(
+    const KODI::JUMPGATE::CJumpgateBackDispatcher::CommandContext& context, BackCommand command)
+{
+  return QueueBackCommand(command, 0, 0, context);
+}
+
+bool CXBMCApp::QueueBackCommand(
+    BackCommand command,
+    uint64_t playbackGeneration,
+    uint64_t playbackToken,
+    std::optional<KODI::JUMPGATE::CJumpgateBackDispatcher::CommandContext> context)
+{
+  const auto messenger = CServiceBroker::GetAppMessenger();
+  if (messenger == nullptr)
+    return false;
+
+  auto payload = std::make_unique<QueuedBackCommand>();
+  payload->app = shared_from_this();
+  payload->context = std::move(context);
+  payload->command = command;
+  payload->lifecycleToken = m_jumpgateBackLifecycleToken;
+  const uint64_t currentGeneration = m_playbackResultState.CurrentGeneration();
+  payload->playbackGeneration = playbackGeneration != 0 ? playbackGeneration : currentGeneration;
+  payload->playbackToken = playbackToken;
+
+  if (command == BackCommand::EXTERNAL_BACK && payload->playbackToken == 0)
+  {
+    auto authorityTransaction = m_playbackAuthority.BeginTransaction();
+    payload->playbackToken = authorityTransaction.GetActiveToken();
+  }
+  if ((command == BackCommand::EXTERNAL_BACK || command == BackCommand::CANCEL_PENDING_PLAYBACK) &&
+      (payload->playbackGeneration == 0 || payload->playbackToken == 0))
+  {
+    return false;
+  }
+
+  return messenger->PostCallback(
+      std::shared_ptr<KODI::MESSAGING::IApplicationCallback>(std::move(payload)));
+}
+
+bool CXBMCApp::ExecuteQueuedBackCommand(QueuedBackCommand& payload)
+{
+  if (payload.command == BackCommand::CANCEL_PENDING_PLAYBACK)
+  {
+    {
+      std::lock_guard lock(m_externalPlaybackQueueMutex);
+      if (m_pendingExternalPlaybackStopGeneration != payload.playbackGeneration ||
+          m_pendingExternalPlaybackStopToken != payload.playbackToken)
+      {
+        return false;
+      }
+      m_pendingExternalPlaybackStopGeneration = 0;
+      m_pendingExternalPlaybackStopToken = 0;
+    }
+
+    const CFileItem& currentItem = g_application.CurrentFileItem();
+    const CVariant& currentLifecycle = currentItem.GetProperty("jumpgate.lifecycle_token");
+    const CVariant& currentPlayback = currentItem.GetProperty("jumpgate.playback_token");
+    const uint64_t lifecycleToken =
+        currentLifecycle.isUnsignedInteger() ? currentLifecycle.asUnsignedInteger() : 0;
+    const uint64_t playbackToken =
+        currentPlayback.isUnsignedInteger() ? currentPlayback.asUnsignedInteger() : 0;
+    if (lifecycleToken != payload.lifecycleToken || playbackToken != payload.playbackToken)
+      return false;
+
+    g_application.OnAction(CAction(ACTION_STOP));
+    return true;
+  }
+
+  auto& dispatcher = CJNIMainActivity::GetJumpgateBackDispatcher();
+  if (!dispatcher.IsCurrentLifecycle(payload.lifecycleToken))
+  {
+    CancelQueuedBackCommand(payload);
+    return false;
+  }
+
+  if (payload.command == BackCommand::KODI_SHORT_BACK ||
+      payload.command == BackCommand::KODI_LONG_BACK)
+  {
+    return ExecuteKodiBackCommand(payload.command == BackCommand::KODI_LONG_BACK);
+  }
+
+  if (payload.command == BackCommand::OPEN_SETTINGS)
+    return ExecuteOpenExternalSettingsCommand();
+
+  if (payload.command != BackCommand::EXTERNAL_BACK ||
+      !m_externalPlayerMode.load(std::memory_order_relaxed) ||
+      !m_playbackResultState.IsCurrent(payload.playbackGeneration))
+  {
+    return false;
+  }
+
+  {
+    auto authorityTransaction = m_playbackAuthority.BeginTransaction();
+    if (authorityTransaction.GetActiveToken() != payload.playbackToken)
+      return false;
+  }
+
+  CGUIComponent* gui = CServiceBroker::GetGUI();
+  if (gui == nullptr)
+    return false;
+
+  CGUIDialog* videoOsd = gui->GetWindowManager().GetDialog(WINDOW_DIALOG_VIDEO_OSD);
+  const bool osdVisible = videoOsd != nullptr && videoOsd->IsDialogRunning();
+  if (osdVisible)
+  {
+    videoOsd->Close(true);
+    return true;
+  }
+  if (CancelPendingExternalPlaybackFromBack())
+    return true;
+  g_application.OnAction(CAction(ACTION_STOP));
+  return true;
+}
+
+void CXBMCApp::CancelQueuedBackCommand(const QueuedBackCommand& payload) noexcept
+{
+  // A rejected late-stop callback must leave the exact stop marker for the
+  // in-flight playback callback to consume after PlayFile returns.
+  static_cast<void>(payload);
+}
+
+bool CXBMCApp::QueueExternalPlayback(std::unique_ptr<CFileItem> item,
+                                     uint64_t admissionGeneration,
+                                     uint64_t admissionToken,
+                                     std::string resultRequestId)
+{
+  const auto messenger = CServiceBroker::GetAppMessenger();
+  if (messenger == nullptr || !item || admissionGeneration == 0 || admissionToken == 0)
+    return false;
+
+  auto payload = std::make_unique<QueuedExternalPlayback>();
+  payload->app = shared_from_this();
+  payload->item = std::move(item);
+  payload->lifecycleToken = m_jumpgateBackLifecycleToken;
+  payload->admissionGeneration = admissionGeneration;
+  payload->admissionToken = admissionToken;
+  payload->resultRequestId = std::move(resultRequestId);
+  return messenger->PostCallback(
+      std::shared_ptr<KODI::MESSAGING::IApplicationCallback>(std::move(payload)));
+}
+
+void CXBMCApp::ExecuteQueuedExternalPlayback(QueuedExternalPlayback& payload)
+{
+  const auto failAdmission = [&]
+  {
+    if (CommitExternalPlaybackAdmissionFailure(payload.admissionToken))
+    {
+      QueueExternalPlayerResult(payload.admissionGeneration, payload.resultRequestId,
+                                m_wasStandalone.load(std::memory_order_relaxed));
+    }
+  };
+
+  auto& dispatcher = CJNIMainActivity::GetJumpgateBackDispatcher();
+  if (!dispatcher.IsCurrentLifecycle(payload.lifecycleToken))
+  {
+    failAdmission();
+    return;
+  }
+  if (!m_externalPlayerMode.load(std::memory_order_relaxed) ||
+      !m_playbackResultState.IsCurrent(payload.admissionGeneration))
+  {
+    failAdmission();
+    return;
+  }
+
+  if (call_method<jboolean>(m_context, "isExternalPlayerResultCanceled", "(JLjava/lang/String;)Z",
+                            static_cast<jlong>(payload.admissionGeneration),
+                            jcast<jhstring>(payload.resultRequestId)) == JNI_TRUE)
+  {
+    failAdmission();
+    return;
+  }
+
+  const auto messenger = CServiceBroker::GetAppMessenger();
+  if (messenger == nullptr || !payload.item)
+  {
+    failAdmission();
+    return;
+  }
+
+  bool latestAdmission = false;
+  {
+    std::lock_guard lock(m_externalPlaybackQueueMutex);
+    latestAdmission = IsLatestExternalPlaybackAdmission(payload.admissionToken);
+    if (latestAdmission)
+    {
+      m_externalPlaybackDispatchGeneration = payload.admissionGeneration;
+      m_externalPlaybackDispatchToken = payload.admissionToken;
+      m_externalPlaybackDispatchRequestId = payload.resultRequestId;
+    }
+  }
+  if (!latestAdmission)
+  {
+    failAdmission();
+    return;
+  }
+
+  const auto app = shared_from_this();
+  auto mediaPayload = messenger->PostMsgOwned(
+      TMSG_MEDIA_PLAY, 0, 0, std::move(payload.item),
+      [app, lifecycleToken = payload.lifecycleToken,
+       admissionGeneration = payload.admissionGeneration, admissionToken = payload.admissionToken,
+       resultRequestId = payload.resultRequestId]
+      {
+        app->CancelQueuedMediaPlayback(lifecycleToken, admissionGeneration, admissionToken,
+                                       resultRequestId);
+      });
+  if (!mediaPayload)
+  {
+    failAdmission();
+    return;
+  }
+
+  bool cancelBeforeExecution = false;
+  {
+    std::lock_guard lock(m_externalPlaybackQueueMutex);
+    if (m_externalPlaybackDispatchGeneration != payload.admissionGeneration ||
+        m_externalPlaybackDispatchToken != payload.admissionToken)
+    {
+      cancelBeforeExecution = true;
+    }
+    else
+    {
+      m_externalPlaybackDispatchPayload = mediaPayload;
+      cancelBeforeExecution =
+          m_pendingExternalPlaybackStopGeneration == payload.admissionGeneration &&
+          m_pendingExternalPlaybackStopToken == payload.admissionToken;
+    }
+  }
+
+  if (cancelBeforeExecution)
+    mediaPayload->Cancel();
+}
+
+void CXBMCApp::CancelQueuedExternalPlayback(const QueuedExternalPlayback& payload) noexcept
+{
+  try
+  {
+    if (CommitExternalPlaybackAdmissionFailure(payload.admissionToken))
+    {
+      QueueExternalPlayerResult(payload.admissionGeneration, payload.resultRequestId,
+                                m_wasStandalone.load(std::memory_order_relaxed));
+    }
+  }
+  catch (...)
+  {
+    CLog::Log(LOGERROR, "CXBMCApp: Failed to terminalize rejected owned playback callback");
+  }
+}
+
+void CXBMCApp::CancelQueuedMediaPlayback(
+    KODI::JUMPGATE::CJumpgateBackDispatcher::LifecycleToken lifecycleToken,
+    uint64_t admissionGeneration,
+    uint64_t admissionToken,
+    const std::string& resultRequestId) noexcept
+{
+  try
+  {
+    {
+      std::lock_guard lock(m_externalPlaybackQueueMutex);
+      if (m_externalPlaybackDispatchGeneration == admissionGeneration &&
+          m_externalPlaybackDispatchToken == admissionToken)
+      {
+        m_externalPlaybackDispatchGeneration = 0;
+        m_externalPlaybackDispatchToken = 0;
+        m_externalPlaybackDispatchRequestId.clear();
+        m_externalPlaybackDispatchPayload.reset();
+      }
+      if (m_pendingExternalPlaybackStopGeneration == admissionGeneration &&
+          m_pendingExternalPlaybackStopToken == admissionToken)
+      {
+        m_pendingExternalPlaybackStopGeneration = 0;
+        m_pendingExternalPlaybackStopToken = 0;
+      }
+    }
+
+    if (!CJNIMainActivity::GetJumpgateBackDispatcher().IsCurrentLifecycle(lifecycleToken) ||
+        !CommitExternalPlaybackAdmissionFailure(admissionToken))
+    {
+      return;
+    }
+    QueueExternalPlayerResult(admissionGeneration, resultRequestId,
+                              m_wasStandalone.load(std::memory_order_relaxed));
+  }
+  catch (...)
+  {
+    CLog::Log(LOGERROR, "CXBMCApp: Failed to terminalize canceled owned media payload");
+  }
+}
+
+void CXBMCApp::CancelExternalPlaybackForLifecycleTeardown() noexcept
+{
+  try
+  {
+    uint64_t generation = 0;
+    uint64_t token = 0;
+    std::shared_ptr<KODI::MESSAGING::COwnedThreadMessagePayload> mediaPayload;
+    {
+      std::lock_guard lock(m_externalPlaybackQueueMutex);
+      generation = m_externalPlaybackDispatchGeneration;
+      token = m_externalPlaybackDispatchToken;
+      if (generation == 0 || token == 0)
+        return;
+
+      m_pendingExternalPlaybackStopGeneration = generation;
+      m_pendingExternalPlaybackStopToken = token;
+      mediaPayload = m_externalPlaybackDispatchPayload;
+    }
+
+    if (mediaPayload && mediaPayload->Cancel())
+      return;
+    QueueBackCommand(BackCommand::CANCEL_PENDING_PLAYBACK, generation, token);
+  }
+  catch (...)
+  {
+    CLog::Log(LOGERROR, "CXBMCApp: Failed to fence external playback during lifecycle teardown");
+  }
+}
+
+bool CXBMCApp::QueueExternalPlayerResult(uint64_t generation,
+                                         std::string requestId,
+                                         bool wasStandalone)
+{
+  if (generation == 0 || requestId.empty())
+    return false;
+
+  auto payload = std::make_shared<QueuedExternalPlayerResult>();
+  payload->app = shared_from_this();
+  payload->lifecycleToken = m_jumpgateBackLifecycleToken;
+  payload->generation = generation;
+  payload->requestId = std::move(requestId);
+  payload->wasStandalone = wasStandalone;
+
+  const auto messenger = CServiceBroker::GetAppMessenger();
+  if (messenger == nullptr)
+  {
+    payload->Cancel();
+    return false;
+  }
+  return messenger->PostAsyncCallback(payload);
+}
+
+void CXBMCApp::ExecuteQueuedExternalPlayerResult(const QueuedExternalPlayerResult& payload)
+{
+  const auto appTarget = CJNIMainActivity::AcquireAppInstance(payload.lifecycleToken);
+  if (!appTarget || appTarget.get() != static_cast<CJNIMainActivity*>(this))
+  {
+    return;
+  }
+
+  auto lifecycleOperation = m_playbackResultState.TryBeginLifecycleOperation();
+  if (!lifecycleOperation)
+  {
+    PostJavaExternalPlayerCancellation(payload.generation, payload.requestId,
+                                       payload.wasStandalone);
+    return;
+  }
+
+  const auto owner = m_playbackResultState.CurrentOwner(*lifecycleOperation);
+  if (!owner || owner->generation != payload.generation || owner->requestId != payload.requestId)
+    return;
+  DeliverPendingExternalPlayerResult(*lifecycleOperation);
+}
+
+void CXBMCApp::CancelQueuedExternalPlayerResult(const QueuedExternalPlayerResult& payload) noexcept
+{
+  const auto appTarget = CJNIMainActivity::AcquireAppInstance(payload.lifecycleToken);
+  if (!appTarget || appTarget.get() != static_cast<CJNIMainActivity*>(this))
+  {
+    return;
+  }
+  PostJavaExternalPlayerCancellation(payload.generation, payload.requestId, payload.wasStandalone);
+}
+
+void CXBMCApp::PostJavaExternalPlayerCancellation(uint64_t generation,
+                                                  const std::string& requestId,
+                                                  bool wasStandalone) noexcept
+{
+  try
+  {
+    call_method<void>(m_context, "postExternalPlayerCancellationResult", "(JLjava/lang/String;Z)V",
+                      static_cast<jlong>(generation), jcast<jhstring>(requestId),
+                      static_cast<jboolean>(wasStandalone));
+  }
+  catch (...)
+  {
+    CLog::Log(LOGERROR, "CXBMCApp: Failed to post exact external-player cancellation result");
+  }
+}
+
+bool CXBMCApp::CancelPendingExternalPlaybackFromBack()
+{
+  auto lifecycleOperation = m_playbackResultState.TryBeginLifecycleOperation();
+  if (!lifecycleOperation)
+    return false;
+  const uint64_t generation = m_playbackResultState.CurrentGeneration();
+  const auto owner = m_playbackResultState.CurrentOwner(*lifecycleOperation);
+  if (generation == 0 || !owner || owner->generation != generation)
+    return false;
+
+  std::optional<KODI::JUMPGATE::CJumpgatePlaybackAuthority::Event> canceled;
+  bool queueLateStop = false;
+  std::shared_ptr<KODI::MESSAGING::COwnedThreadMessagePayload> queuedMediaPayload;
+  {
+    std::lock_guard queueLock(m_externalPlaybackQueueMutex);
+    auto authorityTransaction = m_playbackAuthority.BeginTransaction();
+    canceled = authorityTransaction.CancelPendingAdmission(generation);
+    if (!canceled)
+      return false;
+
+    queueLateStop = m_externalPlaybackDispatchGeneration == canceled->generation &&
+                    m_externalPlaybackDispatchToken == canceled->token;
+    if (queueLateStop)
+    {
+      m_pendingExternalPlaybackStopGeneration = canceled->generation;
+      m_pendingExternalPlaybackStopToken = canceled->token;
+      queuedMediaPayload = m_externalPlaybackDispatchPayload;
+    }
+  }
+
+  if (queuedMediaPayload && queuedMediaPayload->Cancel())
+    queueLateStop = false;
+
+  if (!m_playbackResultState.Finish(canceled->generation, false))
+    return false;
+  if (m_traktScrobbler)
+    m_traktScrobbler->CancelPlaybackGeneration(canceled->generation, canceled->token);
+  if (m_jumpgateSubtitleController)
+    m_jumpgateSubtitleController->OnPlaybackTerminal(canceled->generation);
+
+  if (queueLateStop)
+  {
+    QueueBackCommand(BackCommand::CANCEL_PENDING_PLAYBACK, canceled->generation, canceled->token);
+  }
+
+  QueueExternalPlayerResult(canceled->generation, owner->requestId,
+                            m_wasStandalone.load(std::memory_order_relaxed));
+  return true;
+}
+
+bool CXBMCApp::ExecuteExternalBackCommand()
 {
   if (!m_externalPlayerMode.load(std::memory_order_relaxed))
-    return;
+    return false;
+  if (CancelPendingExternalPlaybackFromBack())
+    return true;
+  return QueueBackCommand(BackCommand::EXTERNAL_BACK);
+}
+
+bool CXBMCApp::ExecuteKodiBackCommand(bool longPress)
+{
+  if (!g_application.IsInitialized())
+    return false;
+
+  const uint32_t modifiers = longPress ? CKey::MODIFIER_LONG : 0;
+  const unsigned int held = longPress ? KODI::KEYBOARD::KEY_HOLD_TRESHOLD + 1 : 0;
+  const CKey key{XBMCK_BACKSPACE, XBMCVK_BACK, 0, 0, modifiers, 0, held};
+  CServiceBroker::GetInputManager().ProcessKeyPress(key);
+  return true;
+}
+
+bool CXBMCApp::ExecuteOpenExternalSettingsCommand()
+{
+  if (!m_externalPlayerMode.load(std::memory_order_relaxed))
+    return false;
 
   m_settingsRequested.store(true, std::memory_order_relaxed);
-  CLog::Log(LOGINFO, "CXBMCApp: Settings requested from Java long-press Back");
+  CLog::Log(LOGINFO, "CXBMCApp: Settings requested from native Back dispatcher");
+  return true;
+}
+
+bool CXBMCApp::onBackInputEvent(const AInputEvent* event)
+{
+  if (event == nullptr || AInputEvent_getType(event) != AINPUT_EVENT_TYPE_KEY ||
+      AKeyEvent_getKeyCode(event) != AKEYCODE_BACK)
+  {
+    return false;
+  }
+
+  auto& dispatcher = CJNIMainActivity::GetJumpgateBackDispatcher();
+  const int64_t downTime = AKeyEvent_getDownTime(event);
+  const int64_t eventTime = AKeyEvent_getEventTime(event);
+  const int64_t heldNanos = eventTime > downTime ? eventTime - downTime : 0;
+  const auto heldDuration =
+      std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::nanoseconds{heldNanos});
+  const uint64_t sequenceId = downTime > 0 ? static_cast<uint64_t>(downTime) : 0;
+  const int32_t flags = AKeyEvent_getFlags(event);
+  const bool cancelled =
+      (flags & AKEY_EVENT_FLAG_CANCELED) != 0 || (flags & AKEY_EVENT_FLAG_CANCELED_LONG_PRESS) != 0;
+  const int32_t action = AKeyEvent_getAction(event);
+  const bool down = action == AKEY_EVENT_ACTION_DOWN || action == AKEY_EVENT_ACTION_MULTIPLE;
+  const bool repeat = action == AKEY_EVENT_ACTION_MULTIPLE || AKeyEvent_getRepeatCount(event) > 0;
+
+  if (CJNIBuild::SDK_INT >= 36)
+  {
+    return dispatcher.OnApi36RawBack(m_jumpgateBackLifecycleToken, sequenceId, heldDuration, down,
+                                     repeat, cancelled);
+  }
+
+  switch (action)
+  {
+    case AKEY_EVENT_ACTION_DOWN:
+      if (cancelled)
+        return dispatcher.OnLegacyRawUp(m_jumpgateBackLifecycleToken, sequenceId, heldDuration,
+                                        true);
+      return dispatcher.OnLegacyRawDown(m_jumpgateBackLifecycleToken, sequenceId, heldDuration,
+                                        AKeyEvent_getRepeatCount(event) > 0);
+    case AKEY_EVENT_ACTION_UP:
+      return dispatcher.OnLegacyRawUp(m_jumpgateBackLifecycleToken, sequenceId, heldDuration,
+                                      cancelled);
+    case AKEY_EVENT_ACTION_MULTIPLE:
+      return dispatcher.OnLegacyRawDown(m_jumpgateBackLifecycleToken, sequenceId, heldDuration,
+                                        true);
+  }
+
+  return true;
+}
+
+void CXBMCApp::SetJumpgateBackInputReady(bool ready)
+{
+  CJNIMainActivity::GetJumpgateBackDispatcher().SetWindowReady(m_jumpgateBackLifecycleToken, ready);
 }
 
 void CXBMCApp::onVolumeChanged(int volume)
@@ -4603,8 +5414,8 @@ void CXBMCApp::UnregisterInputDeviceEventHandler()
 
 bool CXBMCApp::onInputDeviceEvent(const AInputEvent* event)
 {
-  // Intercept Menu/Guide keys in external player mode to show settings dialog.
-  // Phone long-press Back path is handled in Java Main.onKeyUp() and forwarded via JNI.
+  // This seam is reserved for joystick/peripheral traffic. Ordinary Back keys are
+  // coordinated in CEventLoop before CAndroidKey receives them.
   if (m_externalPlayerMode.load(std::memory_order_relaxed) &&
       AInputEvent_getType(event) == AINPUT_EVENT_TYPE_KEY)
   {

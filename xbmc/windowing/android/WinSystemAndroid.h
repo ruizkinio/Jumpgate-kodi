@@ -10,13 +10,15 @@
 
 #include "AndroidUtils.h"
 #include "rendering/gles/RenderSystemGLES.h"
-#include "system_egl.h"
 #include "threads/CriticalSection.h"
 #include "threads/Timer.h"
 #include "utils/HDRCapabilities.h"
+#include "utils/JumpgateBackCoordinator.h"
 #include "windowing/WinSystem.h"
 
 #include <memory>
+
+#include "system_egl.h"
 
 class CDecoderFilterManager;
 class IDispResource;
@@ -83,5 +85,7 @@ protected:
 
 private:
   bool m_HdmiModeTriggered = false;
+  KODI::JUMPGATE::CJumpgateBackDispatcher::LifecycleToken m_jumpgateBackLifecycleToken{
+      KODI::JUMPGATE::CJumpgateBackDispatcher::INVALID_LIFECYCLE_TOKEN};
   void UpdateResolutions(bool bUpdateDesktopRes);
 };

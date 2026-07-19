@@ -12,6 +12,7 @@
 
 struct ANativeWindow;
 typedef struct ANativeWindow ANativeWindow;
+struct AInputEvent;
 
 typedef enum
 {
@@ -41,5 +42,6 @@ public:
   virtual void onDestroyWindow() {}
   virtual void onGainFocus() {}
   virtual void onLostFocus() {}
+  virtual bool onBackInputEvent(const AInputEvent*) { return false; }
 };
 

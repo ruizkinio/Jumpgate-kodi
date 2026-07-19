@@ -58,10 +58,20 @@ private:
     PlaybackClaimRequest request;
   };
 
+  struct ClaimCleanupRequest
+  {
+    std::string bridgeOrigin;
+    std::string deviceToken;
+    std::string historyGrant;
+    std::string historyGrantKind;
+    std::string sessionId;
+    std::uint64_t sessionRevision{0};
+  };
+
   struct StoredCompletion
   {
     PlaybackClaimCompletion completion;
-    PlaybackReleaseRequest release;
+    ClaimCleanupRequest cleanup;
   };
 
   struct WorkerState
@@ -77,9 +87,9 @@ private:
     std::condition_variable finishedCondition;
     std::optional<ClaimJob> claim;
     std::deque<PlaybackReleaseRequest> releases;
-    std::deque<PlaybackReleaseRequest> deferredReleases;
-    std::set<std::string> pendingReleaseIds;
-    std::optional<PlaybackReleaseRequest> priorityRelease;
+    std::deque<ClaimCleanupRequest> cleanups;
+    std::set<std::string> pendingSessionIds;
+    std::optional<ClaimCleanupRequest> priorityCleanup;
     std::optional<StoredCompletion> completion;
     bool completionOffered{false};
     uint64_t latestGeneration{0};
@@ -89,12 +99,19 @@ private:
 
   static void ClearClaimRequest(PlaybackClaimRequest& request);
   static void ClearReleaseRequest(PlaybackReleaseRequest& request);
+  static void ClearCleanupRequest(ClaimCleanupRequest& request);
   static bool QueueReleaseLocked(WorkerState& state, PlaybackReleaseRequest& request);
+  static bool QueueCleanupLocked(WorkerState& state,
+                                 ClaimCleanupRequest& request,
+                                 bool priority = false);
   static bool ReleaseStoredCompletionLocked(WorkerState& state);
+  static void TerminateAndRelease(IJumpgatePlaybackClaimTransport& transport,
+                                  ClaimCleanupRequest& request);
   static void Run(const std::shared_ptr<WorkerState>& state);
+  static void RunLoop(const std::shared_ptr<WorkerState>& state);
+  static void Finalize(const std::shared_ptr<WorkerState>& state);
 
-  static constexpr std::size_t MAX_PENDING_RELEASES = 8;
-  static constexpr std::size_t MAX_RETAINED_RELEASES = 256;
+  static constexpr std::size_t MAX_PENDING_SESSIONS = 256;
 
   std::shared_ptr<WorkerState> m_state;
   std::shared_ptr<CJumpgateThreadRegistry> m_registry;

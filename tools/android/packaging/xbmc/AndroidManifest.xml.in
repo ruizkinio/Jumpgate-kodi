@@ -110,6 +110,7 @@
             android:finishOnTaskLaunch="false"
             android:launchMode="singleTask"
             android:exported="true"
+            android:enableOnBackInvokedCallback="@bool/enable_on_back_invoked_callback"
             android:screenOrientation="sensorLandscape"
             android:theme="@style/AppTheme">
 

@@ -186,6 +186,19 @@ public final class ExternalPlayerResultCoordinatorTest {
         new ExternalPlayerActivity.Controller(host, freshOwner(OLD_REQUEST_ID));
     require(controller.forwardOnce(), "old process launch");
     require(controller.bindGeneration(10), "old process binding");
+
+    host.persistSucceeds = false;
+    require(
+        !controller.recoverAfterProcessDeath(NEW_REQUEST_ID),
+        "replacement waits for durable owner persistence");
+    require(controller.needsProcessRecovery(), "failed replacement preserves recovery authority");
+    require(
+        OLD_REQUEST_ID.equals(controller.owner().requestId()),
+        "failed replacement preserves old in-memory owner");
+    require(host.clearExactCalls == 0, "failed replacement does not clear old durable owner");
+    require(host.startCalls == 1, "failed replacement does not launch Main");
+
+    host.persistSucceeds = true;
     require(controller.recoverAfterProcessDeath(NEW_REQUEST_ID), "dead process recovery forwards");
     require(host.clearExactCalls == 1, "stale exact owner cleared");
     require(host.clearedGeneration == 10, "stale generation cleared exactly");
@@ -225,7 +238,51 @@ public final class ExternalPlayerResultCoordinatorTest {
     require(controller.owner().wasLaunchForwarded(), "retry durable forwarding state");
   }
 
+  private static void failedDurableDeliveryCanRetrySafely() {
+    FakeHost host = new FakeHost();
+    ExternalPlayerActivity.Controller controller =
+        new ExternalPlayerActivity.Controller(
+            host,
+            new ExternalPlayerResultCoordinator.Owner(
+                OLD_REQUEST_ID, true, 22, false, false));
+    ExternalPlayerResultCoordinator.Terminal terminal =
+        new ExternalPlayerResultCoordinator.Terminal(
+            OLD_REQUEST_ID, 22, 25, 100, false, false);
+
+    host.persistSucceeds = false;
+    require(!controller.deliver(terminal), "delivery stops when completion is not durable");
+    require(!controller.owner().wasCompleted(), "failed durability leaves delivery retryable");
+    require(host.setTerminalResultCalls == 0, "failed durability exposes no caller result");
+    require(host.finishCalls == 0, "failed durability does not finish the owner");
+    require(host.clearExactCalls == 0, "failed durability does not clear the terminal");
+
+    host.persistSucceeds = true;
+    require(controller.deliver(terminal), "durable delivery retry succeeds");
+    require(!controller.deliver(terminal), "durable retry still delivers only once");
+    require(host.setTerminalResultCalls == 1, "retry exposes one caller result");
+    require(host.finishCalls == 1, "retry finishes the owner once");
+    require(host.clearExactCalls == 1, "retry clears the exact terminal once");
+  }
+
   private static void cancellationUsesExactGeneration() {
+    FakeHost retryHost = new FakeHost();
+    ExternalPlayerActivity.Controller retry =
+        new ExternalPlayerActivity.Controller(
+            retryHost,
+            new ExternalPlayerResultCoordinator.Owner(
+                OLD_REQUEST_ID, true, 19, false, false));
+    retryHost.persistSucceeds = false;
+    require(!retry.cancelForCaller(), "caller cancellation waits for durable persistence");
+    require(!retry.owner().wasCompleted(), "failed cancellation remains retryable");
+    require(retryHost.setCanceledResultCalls == 0, "failed cancellation exposes no result");
+    require(retryHost.finishCalls == 0, "failed cancellation does not finish owner");
+    require(retryHost.cancelNativeCalls == 0, "failed cancellation does not cancel native owner");
+    retryHost.persistSucceeds = true;
+    require(retry.cancelForCaller(), "durable caller cancellation retries");
+    require(retryHost.setCanceledResultCalls == 1, "retry exposes one canceled result");
+    require(retryHost.finishCalls == 1, "retry finishes owner once");
+    require(retryHost.cancelNativeCalls == 1, "retry cancels exact native owner once");
+
     FakeHost unforwardedHost = new FakeHost();
     ExternalPlayerActivity.Controller unforwarded =
         new ExternalPlayerActivity.Controller(unforwardedHost, freshOwner(OLD_REQUEST_ID));
@@ -258,16 +315,39 @@ public final class ExternalPlayerResultCoordinatorTest {
   }
 
   private static void overlappingLaunchesStayIsolated() {
-    ExternalPlayerResultCoordinator.Producer producer =
-        new ExternalPlayerResultCoordinator.Producer();
-    require(producer.begin(30, OLD_REQUEST_ID), "old generation admitted");
-    require(producer.ownsRequest(OLD_REQUEST_ID), "active request deduplicated before JNI");
-    require(!producer.ownsRequest(NEW_REQUEST_ID), "new request remains admissible");
-    ExternalPlayerResultCoordinator.Terminal superseded = producer.supersede(30, OLD_REQUEST_ID);
-    require(superseded != null && superseded.failedToStart(), "old generation superseded");
-    require(producer.begin(31, NEW_REQUEST_ID), "replacement generation admitted");
+    ExternalPlayerResultCoordinator.MainState state =
+        new ExternalPlayerResultCoordinator.MainState();
+    require(state.prepare(OLD_REQUEST_ID), "old request prepared through Main state");
+    require(state.admitPrepared(30, OLD_REQUEST_ID) != null, "old generation admitted");
+    require(state.ownsRequest(OLD_REQUEST_ID), "active request deduplicated before JNI");
+    require(state.prepare(NEW_REQUEST_ID), "replacement prepares while old generation is active");
+    require(state.activeGeneration() == 30, "preparation does not replace active generation");
+    require(OLD_REQUEST_ID.equals(state.activeRequestId()), "old request remains active");
+    ExternalPlayerResultCoordinator.TerminalReservation failedSupersession =
+        state.reserveSupersede(30, OLD_REQUEST_ID);
+    require(failedSupersession != null, "old supersession reserved");
     require(
-        producer.finish(30, OLD_REQUEST_ID, 10, 100, false, true) == null,
+        state.admitPrepared(31, NEW_REQUEST_ID) == null,
+        "replacement waits for durable old supersession");
+    require(failedSupersession.rollback(), "failed supersession rolls back");
+    require(
+        state.admitPrepared(31, NEW_REQUEST_ID) == null,
+        "rollback keeps the old owner active");
+
+    ExternalPlayerResultCoordinator.TerminalReservation supersession =
+        state.reserveSupersede(30, OLD_REQUEST_ID);
+    require(supersession != null, "exact supersession retry reserved");
+    ExternalPlayerResultCoordinator.Terminal superseded = supersession.terminal();
+    require(supersession.commit(), "durable supersession committed");
+    require(superseded != null && superseded.failedToStart(), "old generation superseded");
+    require(
+        state.reserveSupersede(30, OLD_REQUEST_ID) == null,
+        "old supersession is one-shot");
+    require(
+        state.admitPrepared(31, NEW_REQUEST_ID) != null,
+        "replacement generation admitted after old supersession");
+    require(
+        state.finish(30, OLD_REQUEST_ID, 10, 100, false, true) == null,
         "old native terminal rejected");
 
     FakeHost oldHost = new FakeHost();
@@ -282,9 +362,174 @@ public final class ExternalPlayerResultCoordinatorTest {
         new ExternalPlayerActivity.Controller(newHost, newOwner);
     require(oldController.deliver(superseded), "old owner gets old supersession");
     require(!newController.deliver(superseded), "replacement rejects old supersession");
+    ExternalPlayerResultCoordinator.Terminal replacement =
+        state.finish(31, NEW_REQUEST_ID, 80, 100, true, false);
     require(
-        newController.deliver(producer.finish(31, NEW_REQUEST_ID, 80, 100, true, false)),
+        newController.deliver(replacement),
         "replacement gets replacement terminal");
+    require(
+        state.finish(31, NEW_REQUEST_ID, 80, 100, true, false) == null,
+        "replacement terminal is one-shot");
+  }
+
+  private static void preparedRejectionReleasesOnlyExactRequest() {
+    ExternalPlayerResultCoordinator.MainState state =
+        new ExternalPlayerResultCoordinator.MainState();
+    require(state.prepare(OLD_REQUEST_ID), "old request prepared through Main state");
+    require(state.admitPrepared(32, OLD_REQUEST_ID) != null, "old request admitted");
+    require(state.prepare(NEW_REQUEST_ID), "incoming request prepared beside active owner");
+    require(
+        state.reservePreparedRejection(1L << 62, THIRD_REQUEST_ID) == null,
+        "wrong prepared request cannot be consumed");
+
+    ExternalPlayerResultCoordinator.TerminalReservation failedRejection =
+        state.reservePreparedRejection(1L << 62, NEW_REQUEST_ID);
+    require(failedRejection != null, "exact prepared rejection reserved");
+    require(
+        state.admitPrepared(33, NEW_REQUEST_ID) == null,
+        "prepared rejection reservation blocks admission");
+    require(failedRejection.rollback(), "failed prepared rejection rolls back");
+    require(state.isPrepared(NEW_REQUEST_ID), "failed rejection remains retryable");
+    require(state.activeGeneration() == 32, "failed rejection preserves active generation");
+    require(OLD_REQUEST_ID.equals(state.activeRequestId()), "failed rejection preserves owner");
+
+    ExternalPlayerResultCoordinator.TerminalReservation rejectionReservation =
+        state.reservePreparedRejection(1L << 62, NEW_REQUEST_ID);
+    require(rejectionReservation != null, "exact prepared rejection retries");
+    ExternalPlayerResultCoordinator.Terminal rejection = rejectionReservation.terminal();
+    require(rejectionReservation.commit(), "durable prepared rejection commits");
+    require(rejection != null && rejection.failedToStart(), "exact prepared request rejected");
+    require(
+        state.reservePreparedRejection((1L << 62) + 1, NEW_REQUEST_ID) == null,
+        "prepared rejection is one-shot");
+    require(state.activeGeneration() == 32, "rejection preserves active generation");
+    require(OLD_REQUEST_ID.equals(state.activeRequestId()), "rejection preserves active owner");
+    require(
+        state.finish(32, OLD_REQUEST_ID, 40, 100, false, false) != null,
+        "active owner still receives its terminal");
+
+    require(state.prepare(THIRD_REQUEST_ID), "later distinct request is not wedged");
+    require(
+        state.admitPrepared(33, THIRD_REQUEST_ID) != null,
+        "later distinct request is admitted normally");
+    require(
+        state.finish(33, THIRD_REQUEST_ID, 60, 100, true, false) != null,
+        "later owner receives one terminal");
+    require(
+        state.finish(33, THIRD_REQUEST_ID, 60, 100, true, false) == null,
+        "later owner cannot receive a duplicate terminal");
+  }
+
+  private static void earlyBackCancellationIsRequestOwnedUntilExactAdmission() {
+    ExternalPlayerResultCoordinator.Producer producer =
+        new ExternalPlayerResultCoordinator.Producer();
+    require(producer.prepare(OLD_REQUEST_ID), "cold request prepared before native admission");
+    require(
+        !producer.cancelPrepared(NEW_REQUEST_ID),
+        "wrong request cannot consume early Back ownership");
+    require(producer.cancelPrepared(OLD_REQUEST_ID), "exact early Back recorded once");
+    require(producer.cancelPrepared(OLD_REQUEST_ID), "duplicate early Back is idempotent");
+
+    ExternalPlayerResultCoordinator.Admission admission =
+        producer.admitPrepared(32, OLD_REQUEST_ID);
+    require(admission != null, "prepared request receives native generation");
+    require(admission.wasCancellationRequested(), "early Back follows exact admission");
+    require(
+        producer.admitPrepared(32, OLD_REQUEST_ID) == null,
+        "prepared cancellation is atomically consumed once");
+    require(
+        producer.finish(32, OLD_REQUEST_ID, 0, 0, false, true) != null,
+        "canceled admission still owns one caller terminal");
+
+    require(producer.prepare(NEW_REQUEST_ID), "replacement request prepares independently");
+    ExternalPlayerResultCoordinator.Admission replacement =
+        producer.admitPrepared(33, NEW_REQUEST_ID);
+    require(replacement != null, "replacement admission accepted");
+    require(!replacement.wasCancellationRequested(), "old cancellation cannot cross requests");
+  }
+
+  private static void normalTeardownTerminalizesExactOwnerOnce() {
+    FakeHost host = new FakeHost();
+    ExternalPlayerActivity.Controller controller =
+        new ExternalPlayerActivity.Controller(host, freshOwner(OLD_REQUEST_ID));
+    require(controller.forwardOnce(), "teardown owner forwarded");
+    require(controller.bindGeneration(34), "teardown owner bound");
+    require(
+        !controller.cancelForTeardown(NEW_REQUEST_ID, 34),
+        "wrong teardown request rejected");
+    require(
+        !controller.cancelForTeardown(OLD_REQUEST_ID, 35),
+        "wrong teardown generation rejected");
+
+    host.persistSucceeds = false;
+    require(
+        !controller.cancelForTeardown(OLD_REQUEST_ID, 34),
+        "teardown cancellation stops when persistence fails");
+    require(!controller.owner().wasCompleted(), "failed teardown remains retryable");
+    require(host.setCanceledResultCalls == 0, "failed teardown exposes no canceled result");
+    require(host.finishCalls == 0, "failed teardown does not finish owner");
+    require(host.clearExactCalls == 0, "failed teardown does not clear owner");
+
+    host.persistSucceeds = true;
+    require(
+        controller.cancelForTeardown(OLD_REQUEST_ID, 34),
+        "exact normal teardown canceled caller");
+    require(host.setCanceledResultCalls == 1, "teardown sets canceled result once");
+    require(host.finishCalls == 1, "teardown finishes owner once");
+    require(host.clearExactCalls == 1, "teardown clears exact durable owner");
+    require(host.cancelNativeCalls == 0, "normal teardown does not call retired native app");
+    require(
+        !controller.cancelForTeardown(OLD_REQUEST_ID, 34),
+        "duplicate teardown cannot redeliver result");
+  }
+
+  private static void activeTerminalReservationCanRetryAfterDurabilityFailure() {
+    ExternalPlayerResultCoordinator.MainState state =
+        new ExternalPlayerResultCoordinator.MainState();
+    require(state.prepare(OLD_REQUEST_ID), "teardown request prepared");
+    require(state.admitPrepared(35, OLD_REQUEST_ID) != null, "teardown request admitted");
+
+    ExternalPlayerResultCoordinator.TerminalReservation failed =
+        state.reserveFinish(35, OLD_REQUEST_ID, 20, 100, false, false);
+    require(failed != null, "teardown terminal reserved");
+    require(
+        state.reserveFinish(35, OLD_REQUEST_ID, 20, 100, false, false) == null,
+        "only one teardown terminal can be in flight");
+    require(failed.rollback(), "failed teardown publication rolls back");
+    require(state.activeGeneration() == 35, "failed teardown preserves generation");
+    require(OLD_REQUEST_ID.equals(state.activeRequestId()), "failed teardown preserves owner");
+
+    ExternalPlayerResultCoordinator.TerminalReservation retry =
+        state.reserveFinish(35, OLD_REQUEST_ID, 20, 100, false, false);
+    require(retry != null, "teardown terminal retries exactly");
+    require(retry.commit(), "durable teardown terminal commits");
+    require(!retry.commit(), "teardown reservation commits once");
+    require(
+        state.reserveFinish(35, OLD_REQUEST_ID, 20, 100, false, false) == null,
+        "teardown owner receives one terminal");
+  }
+
+  private static void normalTerminalReservationCanRetryAfterDurabilityFailure() {
+    ExternalPlayerResultCoordinator.MainState state =
+        new ExternalPlayerResultCoordinator.MainState();
+    require(state.prepare(OLD_REQUEST_ID), "normal terminal request prepared");
+    require(state.admitPrepared(36, OLD_REQUEST_ID) != null, "normal terminal admitted");
+
+    ExternalPlayerResultCoordinator.TerminalReservation failed =
+        state.reserveFinish(36, OLD_REQUEST_ID, 70, 100, true, true);
+    require(failed != null, "normal terminal reserved");
+    require(
+        !state.acknowledgeExit(36, OLD_REQUEST_ID),
+        "uncommitted terminal cannot be acknowledged");
+    require(failed.rollback(), "failed normal publication rolls back");
+
+    ExternalPlayerResultCoordinator.TerminalReservation retry =
+        state.reserveFinish(36, OLD_REQUEST_ID, 70, 100, true, true);
+    require(retry != null, "normal terminal retries exactly");
+    require(retry.commit(), "durable normal terminal commits");
+    require(state.acknowledgeExit(36, OLD_REQUEST_ID), "committed terminal acknowledges");
+    require(state.claimProcessExit(36, OLD_REQUEST_ID), "committed terminal exits once");
+    require(!state.claimProcessExit(36, OLD_REQUEST_ID), "normal process exit remains one-shot");
   }
 
   private static void coldExitRequiresExactAcknowledgement() {
@@ -409,9 +654,11 @@ public final class ExternalPlayerResultCoordinatorTest {
 
   private static void admissionRaceRejectsStaleTerminal() throws Exception {
     for (int iteration = 0; iteration < 1000; ++iteration) {
-      ExternalPlayerResultCoordinator.Producer producer =
-          new ExternalPlayerResultCoordinator.Producer();
-      require(producer.begin(50, OLD_REQUEST_ID), "race old begin");
+      ExternalPlayerResultCoordinator.MainState state =
+          new ExternalPlayerResultCoordinator.MainState();
+      require(state.prepare(OLD_REQUEST_ID), "race old prepare");
+      require(state.admitPrepared(50, OLD_REQUEST_ID) != null, "race old admission");
+      require(state.prepare(NEW_REQUEST_ID), "race replacement prepare");
       CountDownLatch replacementAdmitted = new CountDownLatch(1);
       AtomicInteger staleClaims = new AtomicInteger();
       AtomicReference<Throwable> failure = new AtomicReference<>();
@@ -421,7 +668,7 @@ public final class ExternalPlayerResultCoordinatorTest {
                 try {
                   if (!replacementAdmitted.await(5, TimeUnit.SECONDS))
                     throw new AssertionError("race admission timeout");
-                  if (producer.finish(50, OLD_REQUEST_ID, 10, 100, false, true) != null)
+                  if (state.finish(50, OLD_REQUEST_ID, 10, 100, false, true) != null)
                     staleClaims.incrementAndGet();
                 } catch (Throwable throwable) {
                   failure.set(throwable);
@@ -429,7 +676,11 @@ public final class ExternalPlayerResultCoordinatorTest {
               },
               "external-result-stale-terminal");
       staleTerminal.start();
-      require(producer.begin(51, NEW_REQUEST_ID), "race replacement begin");
+      ExternalPlayerResultCoordinator.TerminalReservation supersession =
+          state.reserveSupersede(50, OLD_REQUEST_ID);
+      require(supersession != null, "race supersession reserve");
+      require(supersession.commit(), "race supersession commit");
+      require(state.admitPrepared(51, NEW_REQUEST_ID) != null, "race replacement admission");
       replacementAdmitted.countDown();
       staleTerminal.join(TimeUnit.SECONDS.toMillis(5));
       require(!staleTerminal.isAlive(), "race worker completed");
@@ -443,8 +694,14 @@ public final class ExternalPlayerResultCoordinatorTest {
       recreationPreservesForwardingAndExactBinding();
       processDeathRotatesOwnerWithoutStaleReplay();
       forwardingFailureCanRetrySafely();
+      failedDurableDeliveryCanRetrySafely();
       cancellationUsesExactGeneration();
       overlappingLaunchesStayIsolated();
+      preparedRejectionReleasesOnlyExactRequest();
+      earlyBackCancellationIsRequestOwnedUntilExactAdmission();
+      normalTeardownTerminalizesExactOwnerOnce();
+      activeTerminalReservationCanRetryAfterDurabilityFailure();
+      normalTerminalReservationCanRetryAfterDurabilityFailure();
       coldExitRequiresExactAcknowledgement();
       mainDestroyedBeforeOwnerCallbackUsesDurableFallback();
       staleAcknowledgementIsRejected();

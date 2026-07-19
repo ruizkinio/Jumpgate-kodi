@@ -18,6 +18,12 @@
 namespace KODI::JUMPGATE
 {
 
+struct JumpgatePlaybackHttpHeader final
+{
+  std::string name;
+  std::string value;
+};
+
 struct JumpgatePlaybackHttpRequest final
 {
   JumpgatePlaybackHttpRequest() = default;
@@ -30,6 +36,7 @@ struct JumpgatePlaybackHttpRequest final
   std::string url;
   std::string contentType;
   std::string authorization;
+  std::vector<JumpgatePlaybackHttpHeader> headers;
   std::string body;
   bool followRedirects{false};
 };
@@ -67,6 +74,7 @@ struct PlaybackClaimRequest
 {
   std::string bridgeOrigin;
   std::string deviceToken;
+  std::string attemptId;
   std::vector<std::string> fingerprints;
   std::string intentUrlHash;
   std::int64_t launchedAt{0};
@@ -75,7 +83,12 @@ struct PlaybackClaimRequest
 
 struct PlaybackClaim
 {
+  void ClearSensitive();
+
   std::string sessionId;
+  std::uint64_t sessionRevision{0};
+  std::string historyGrant;
+  std::string historyGrantKind;
   CVariant context;
   std::string claimedAt;
   std::string expiresAt;
@@ -97,6 +110,7 @@ enum class PlaybackClaimStatus
 struct PlaybackClaimResult
 {
   bool IsClaimed() const { return status == PlaybackClaimStatus::Claimed; }
+  void ClearSensitive();
 
   PlaybackClaimStatus status{PlaybackClaimStatus::InvalidResponse};
   int httpStatus{0};
@@ -105,9 +119,12 @@ struct PlaybackClaimResult
 
 struct PlaybackReleaseRequest
 {
+  void ClearSensitive();
+
   std::string bridgeOrigin;
   std::string deviceToken;
   std::string sessionId;
+  std::string terminalReceiptId;
 };
 
 enum class PlaybackReleaseStatus

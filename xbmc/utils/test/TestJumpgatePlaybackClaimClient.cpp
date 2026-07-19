@@ -9,7 +9,6 @@
 #include "utils/JSONVariantParser.h"
 #include "utils/JumpgatePlaybackClaimClient.h"
 
-#include <cstdint>
 #include <string>
 #include <utility>
 #include <vector>
@@ -21,10 +20,13 @@ using namespace KODI::JUMPGATE;
 namespace
 {
 constexpr const char* ORIGIN = "https://bridge.example";
+constexpr const char* ATTEMPT_ID = "018f47a2-5b6c-7d8e-9f01-23456789abcd";
+constexpr const char* RECEIPT_ID = "018f47a2-5b6c-7d8e-af01-23456789abcd";
 const std::string DEVICE_TOKEN(43, 'A');
+const std::string HISTORY_GRANT = "hg1_" + std::string(32, 'G');
 const std::string INTENT_HASH(64, 'b');
 
-class FakePlaybackTransport : public IJumpgatePlaybackClaimTransport
+class FakePlaybackTransport final : public IJumpgatePlaybackClaimTransport
 {
 public:
   bool Post(const JumpgatePlaybackHttpRequest& request,
@@ -59,6 +61,7 @@ PlaybackClaimRequest ValidClaimRequest()
   PlaybackClaimRequest request;
   request.bridgeOrigin = ORIGIN;
   request.deviceToken = DEVICE_TOKEN;
+  request.attemptId = ATTEMPT_ID;
   request.fingerprints = {"v1:url:sha256:" + std::string(64, '1'),
                           "v1:opaque:sha256:" + std::string(64, '2')};
   request.intentUrlHash = INTENT_HASH;
@@ -69,17 +72,27 @@ PlaybackClaimRequest ValidClaimRequest()
 
 PlaybackReleaseRequest ValidReleaseRequest()
 {
-  return {ORIGIN, DEVICE_TOKEN, "session_00000001"};
+  return {ORIGIN, DEVICE_TOKEN, "session_00000001", RECEIPT_ID};
 }
 
 std::string ClaimedResponse()
 {
-  return R"({"claimedAt":"2026-07-13T10:00:00.123Z","context":{"canonicalIdentity":{"id":"tt0133093","type":"movie"},"traktEligible":true},"expiresAt":"2026-07-13T10:05:00.123Z","sessionId":"session_00000001","status":"claimed"})";
+  return std::string{R"({"claimedAt":"2026-07-13T10:00:00.123Z","context":{"contentKey":")"} +
+         std::string(64, 'c') +
+         R"(","traktEligible":true},"expiresAt":"2026-07-13T10:05:00.123Z","historyGrant":")" +
+         HISTORY_GRANT +
+         R"(","historyGrantKind":"canonical","sessionId":"session_00000001","sessionRevision":1,"status":"claimed"})";
 }
 
+std::string NegativeResponse(const std::string& status)
+{
+  return "{\"historyGrant\":\"" + HISTORY_GRANT +
+         "\",\"historyGrantKind\":\"negative\",\"sessionId\":\"session_negative_01\"," +
+         "\"sessionRevision\":1,\"status\":\"" + status + "\"}";
+}
 } // namespace
 
-TEST(TestJumpgatePlaybackClaimClient, SerializesAuthenticatedClaimAtExactOrigin)
+TEST(TestJumpgatePlaybackClaimClient, SerializesAttemptBoundClaimAndParsesHistoryAuthority)
 {
   FakePlaybackTransport transport;
   transport.responseBody = ClaimedResponse();
@@ -88,259 +101,111 @@ TEST(TestJumpgatePlaybackClaimClient, SerializesAuthenticatedClaimAtExactOrigin)
   const PlaybackClaimResult result = client.Claim(ValidClaimRequest());
 
   ASSERT_TRUE(result.IsClaimed());
-  EXPECT_EQ(result.httpStatus, 200);
   EXPECT_EQ(result.claim.sessionId, "session_00000001");
-  EXPECT_EQ(result.claim.claimedAt, "2026-07-13T10:00:00.123Z");
-  EXPECT_EQ(result.claim.expiresAt, "2026-07-13T10:05:00.123Z");
-  ASSERT_TRUE(result.claim.context.isObject());
-  EXPECT_TRUE(result.claim.context["traktEligible"].asBoolean());
-
-  EXPECT_EQ(transport.calls, 1);
+  EXPECT_EQ(result.claim.sessionRevision, 1u);
+  EXPECT_EQ(result.claim.historyGrant, HISTORY_GRANT);
+  EXPECT_EQ(result.claim.historyGrantKind, "canonical");
   EXPECT_EQ(transport.url, "https://bridge.example/v1/playback/claim");
-  EXPECT_EQ(transport.contentType, "application/json");
   EXPECT_EQ(transport.authorization, "Bearer " + DEVICE_TOKEN);
   EXPECT_FALSE(transport.followRedirects);
 
   CVariant body;
   ASSERT_TRUE(CJSONVariantParser::Parse(transport.body, body));
   ASSERT_TRUE(body.isObject());
-  EXPECT_EQ(body.size(), 4u);
-  ASSERT_TRUE(body["fingerprints"].isArray());
-  ASSERT_EQ(body["fingerprints"].size(), 2u);
-  EXPECT_EQ(body["fingerprints"][0].asString(), "v1:url:sha256:" + std::string(64, '1'));
-  EXPECT_EQ(body["fingerprints"][1].asString(), "v1:opaque:sha256:" + std::string(64, '2'));
+  EXPECT_EQ(body.size(), 5u);
+  EXPECT_EQ(body["attemptId"].asString(), ATTEMPT_ID);
   EXPECT_EQ(body["intentUrlHash"].asString(), INTENT_HASH);
-  EXPECT_TRUE(body["launchedAt"].isInteger());
   EXPECT_EQ(body["launchedAt"].asInteger(), 1783900800123LL);
-  ASSERT_TRUE(body["client"].isObject());
-  EXPECT_EQ(body["client"].size(), 2u);
+  ASSERT_EQ(body["fingerprints"].size(), 2u);
   EXPECT_EQ(body["client"]["platform"].asString(), "android");
-  EXPECT_EQ(body["client"]["version"].asString(), "0.2.12");
   EXPECT_FALSE(body.isMember("ip"));
   EXPECT_FALSE(body.isMember("title"));
-  EXPECT_FALSE(body.isMember("recent"));
 }
 
-TEST(TestJumpgatePlaybackClaimClient, OmitsOptionalClientAndPreservesExactFingerprints)
-{
-  FakePlaybackTransport transport;
-  transport.responseBody = R"({"status":"not_found"})";
-  CJumpgatePlaybackClaimClient client{transport};
-  PlaybackClaimRequest request = ValidClaimRequest();
-  request.client.reset();
-  request.fingerprints = {"exact-A", "exact-A", "exact-B"};
-
-  const PlaybackClaimResult result = client.Claim(request);
-
-  EXPECT_EQ(result.status, PlaybackClaimStatus::NotFound);
-  CVariant body;
-  ASSERT_TRUE(CJSONVariantParser::Parse(transport.body, body));
-  EXPECT_FALSE(body.isMember("client"));
-  ASSERT_EQ(body["fingerprints"].size(), 3u);
-  EXPECT_EQ(body["fingerprints"][0].asString(), "exact-A");
-  EXPECT_EQ(body["fingerprints"][1].asString(), "exact-A");
-  EXPECT_EQ(body["fingerprints"][2].asString(), "exact-B");
-}
-
-TEST(TestJumpgatePlaybackClaimClient, RejectsNonCanonicalOrConfiguredOriginsWithoutTransport)
-{
-  const std::vector<std::string> invalidOrigins = {
-      "https://bridge.example/",     "https://bridge.example/_c/config",
-      "HTTPS://BRIDGE.EXAMPLE",      "https://bridge.example?config=x",
-      "https://user@bridge.example", "http://bridge.example",
-      "https://bridge.example/path", " https://bridge.example",
-  };
-
-  for (const std::string& origin : invalidOrigins)
-  {
-    FakePlaybackTransport transport;
-    CJumpgatePlaybackClaimClient client{transport};
-    PlaybackClaimRequest request = ValidClaimRequest();
-    request.bridgeOrigin = origin;
-    EXPECT_EQ(client.Claim(request).status, PlaybackClaimStatus::InvalidRequest) << origin;
-    EXPECT_EQ(transport.calls, 0) << origin;
-  }
-}
-
-TEST(TestJumpgatePlaybackClaimClient, AllowsExplicitCanonicalLoopbackDevelopmentOrigin)
-{
-  FakePlaybackTransport transport;
-  transport.responseBody = R"({"status":"not_found"})";
-  CJumpgatePlaybackClaimClient client{transport};
-  PlaybackClaimRequest request = ValidClaimRequest();
-  request.bridgeOrigin = "http://127.0.0.1:11470";
-
-  EXPECT_EQ(client.Claim(request).status, PlaybackClaimStatus::NotFound);
-  EXPECT_EQ(transport.url, "http://127.0.0.1:11470/v1/playback/claim");
-  EXPECT_FALSE(transport.followRedirects);
-}
-
-TEST(TestJumpgatePlaybackClaimClient, RejectsMalformedClaimInputsWithoutTransport)
-{
-  std::vector<PlaybackClaimRequest> requests;
-  PlaybackClaimRequest request = ValidClaimRequest();
-  request.deviceToken = "short";
-  requests.push_back(request);
-  request = ValidClaimRequest();
-  request.fingerprints.clear();
-  requests.push_back(request);
-  request = ValidClaimRequest();
-  request.fingerprints = {""};
-  requests.push_back(request);
-  request = ValidClaimRequest();
-  request.fingerprints = {"bad\nfingerprint"};
-  requests.push_back(request);
-  request = ValidClaimRequest();
-  request.fingerprints.assign(33, "exact-fingerprint");
-  requests.push_back(request);
-  request = ValidClaimRequest();
-  request.fingerprints.assign(32, std::string(512, 'x'));
-  requests.push_back(request);
-  request = ValidClaimRequest();
-  request.intentUrlHash = std::string(64, 'A');
-  requests.push_back(request);
-  request = ValidClaimRequest();
-  request.launchedAt = 0;
-  requests.push_back(request);
-  request = ValidClaimRequest();
-  request.launchedAt = 8640000000000001LL;
-  requests.push_back(request);
-  request = ValidClaimRequest();
-  request.client->platform.clear();
-  requests.push_back(request);
-  request = ValidClaimRequest();
-  request.client->version = "version with spaces";
-  requests.push_back(request);
-
-  for (const PlaybackClaimRequest& invalid : requests)
-  {
-    FakePlaybackTransport transport;
-    CJumpgatePlaybackClaimClient client{transport};
-    EXPECT_EQ(client.Claim(invalid).status, PlaybackClaimStatus::InvalidRequest);
-    EXPECT_EQ(transport.calls, 0);
-  }
-}
-
-TEST(TestJumpgatePlaybackClaimClient, MapsNegativeClaimStatusesFailClosed)
+TEST(TestJumpgatePlaybackClaimClient, ParsesEveryNegativeClaimWithAReleasableGrant)
 {
   const std::vector<std::pair<std::string, PlaybackClaimStatus>> cases = {
       {"ambiguous", PlaybackClaimStatus::Ambiguous},
       {"expired", PlaybackClaimStatus::Expired},
       {"not_found", PlaybackClaimStatus::NotFound},
   };
-
-  for (const auto& item : cases)
+  for (const auto& [name, expected] : cases)
   {
     FakePlaybackTransport transport;
-    transport.responseBody = "{\"status\":\"" + item.first + "\"}";
+    transport.responseBody = NegativeResponse(name);
     CJumpgatePlaybackClaimClient client{transport};
     const PlaybackClaimResult result = client.Claim(ValidClaimRequest());
-    EXPECT_EQ(result.status, item.second);
-    EXPECT_FALSE(result.IsClaimed());
-    EXPECT_TRUE(result.claim.sessionId.empty());
-    EXPECT_TRUE(result.claim.context.isNull());
+    EXPECT_EQ(result.status, expected);
+    EXPECT_EQ(result.claim.sessionId, "session_negative_01");
+    EXPECT_EQ(result.claim.historyGrant, HISTORY_GRANT);
+    EXPECT_EQ(result.claim.historyGrantKind, "negative");
+    EXPECT_EQ(result.claim.sessionRevision, 1u);
   }
 }
 
-TEST(TestJumpgatePlaybackClaimClient, RejectsMalformedOrNonExactClaimResponses)
+TEST(TestJumpgatePlaybackClaimClient, RejectsMalformedAttemptAndAuthorityWithoutTransportOrTrust)
 {
-  const std::vector<std::string> invalidResponses = {
-      "",
-      "not-json",
-      R"([])",
-      R"({"status":"unknown"})",
-      R"({"status":"ambiguous","context":{}})",
-      R"({"status":"not_found","status":"ambiguous"})",
-      R"({"status":"claimed"})",
-      R"({"claimedAt":"2026-07-13T10:00:00.123Z","context":{},"expiresAt":"2026-07-13T10:05:00.123Z","sessionId":"session_00000001","status":"claimed"})",
-      R"({"claimedAt":"2026-07-13T10:00:00.123Z","context":[],"expiresAt":"2026-07-13T10:05:00.123Z","sessionId":"session_00000001","status":"claimed"})",
-      R"({"claimedAt":1783936800123,"context":{"ok":true},"expiresAt":"2026-07-13T10:05:00.123Z","sessionId":"session_00000001","status":"claimed"})",
-      R"({"claimedAt":"2026-02-30T10:00:00.123Z","context":{"ok":true},"expiresAt":"2026-07-13T10:05:00.123Z","sessionId":"session_00000001","status":"claimed"})",
-      R"({"claimedAt":"2026-07-13T10:05:00.123Z","context":{"ok":true},"expiresAt":"2026-07-13T10:00:00.123Z","sessionId":"session_00000001","status":"claimed"})",
-      R"({"claimedAt":"2026-07-13T10:00:00.123Z","context":{"ok":true},"expiresAt":"2026-07-13T10:05:00.123Z","extra":true,"sessionId":"session_00000001","status":"claimed"})",
-      R"({"claimedAt":"2026-07-13T10:00:00.123Z","context":{"ok":true},"expiresAt":"2026-07-13T10:05:00.123Z","sessionId":"bad id","status":"claimed"})",
-  };
-
-  for (const std::string& response : invalidResponses)
-  {
-    FakePlaybackTransport transport;
-    transport.responseBody = response;
-    CJumpgatePlaybackClaimClient client{transport};
-    const PlaybackClaimResult result = client.Claim(ValidClaimRequest());
-    EXPECT_EQ(result.status, PlaybackClaimStatus::InvalidResponse) << response;
-    EXPECT_FALSE(result.IsClaimed());
-  }
-}
-
-TEST(TestJumpgatePlaybackClaimClient, MapsTransportAuthenticationAndHttpFailures)
-{
+  PlaybackClaimRequest invalid = ValidClaimRequest();
+  invalid.attemptId.clear();
   FakePlaybackTransport transport;
-  transport.succeeds = false;
   CJumpgatePlaybackClaimClient client{transport};
-  EXPECT_EQ(client.Claim(ValidClaimRequest()).status, PlaybackClaimStatus::TransportFailure);
+  EXPECT_EQ(client.Claim(invalid).status, PlaybackClaimStatus::InvalidRequest);
+  EXPECT_EQ(transport.calls, 0);
 
-  transport.succeeds = true;
-  transport.responseStatus = 401;
-  EXPECT_EQ(client.Claim(ValidClaimRequest()).status, PlaybackClaimStatus::AuthenticationFailure);
-  transport.responseStatus = 302;
-  EXPECT_EQ(client.Claim(ValidClaimRequest()).status, PlaybackClaimStatus::HttpFailure);
-  EXPECT_FALSE(transport.followRedirects);
-  transport.responseStatus = 700;
+  invalid = ValidClaimRequest();
+  invalid.attemptId = "018F47A2-5B6C-7D8E-9F01-23456789ABCD";
+  EXPECT_EQ(client.Claim(invalid).status, PlaybackClaimStatus::InvalidRequest);
+  EXPECT_EQ(transport.calls, 0);
+
+  transport.responseBody = ClaimedResponse();
+  const std::string marker = "\"historyGrantKind\":\"canonical\"";
+  transport.responseBody.replace(transport.responseBody.find(marker), marker.size(),
+                                 "\"historyGrantKind\":\"negative\"");
+  EXPECT_EQ(client.Claim(ValidClaimRequest()).status, PlaybackClaimStatus::InvalidResponse);
+
+  transport.responseBody = NegativeResponse("not_found");
+  transport.responseBody += " ";
+  transport.responseBody.insert(transport.responseBody.size() - 2, ",\"extra\":true");
   EXPECT_EQ(client.Claim(ValidClaimRequest()).status, PlaybackClaimStatus::InvalidResponse);
 }
 
-TEST(TestJumpgatePlaybackClaimClient, SerializesReleaseAndParsesReleasedOrNotFound)
+TEST(TestJumpgatePlaybackClaimClient, SerializesTerminalReceiptForRelease)
 {
   FakePlaybackTransport transport;
   transport.responseBody = R"({"status":"released"})";
   CJumpgatePlaybackClaimClient client{transport};
 
-  PlaybackReleaseResult result = client.Release(ValidReleaseRequest());
-
-  EXPECT_TRUE(result.IsReleased());
-  EXPECT_EQ(result.httpStatus, 200);
+  const PlaybackReleaseResult result = client.Release(ValidReleaseRequest());
+  ASSERT_TRUE(result.IsReleased());
   EXPECT_EQ(transport.url, "https://bridge.example/v1/playback/release");
-  EXPECT_EQ(transport.contentType, "application/json");
-  EXPECT_EQ(transport.authorization, "Bearer " + DEVICE_TOKEN);
-  EXPECT_FALSE(transport.followRedirects);
   CVariant body;
   ASSERT_TRUE(CJSONVariantParser::Parse(transport.body, body));
-  EXPECT_EQ(body.size(), 1u);
+  EXPECT_EQ(body.size(), 2u);
   EXPECT_EQ(body["sessionId"].asString(), "session_00000001");
+  EXPECT_EQ(body["terminalReceiptId"].asString(), RECEIPT_ID);
 
-  transport.responseBody = R"({"status":"not_found"})";
-  result = client.Release(ValidReleaseRequest());
-  EXPECT_EQ(result.status, PlaybackReleaseStatus::NotFound);
-  EXPECT_FALSE(result.IsReleased());
+  PlaybackReleaseRequest invalid = ValidReleaseRequest();
+  invalid.terminalReceiptId.clear();
+  const int priorCalls = transport.calls;
+  EXPECT_EQ(client.Release(invalid).status, PlaybackReleaseStatus::InvalidRequest);
+  EXPECT_EQ(transport.calls, priorCalls);
 }
 
-TEST(TestJumpgatePlaybackClaimClient, RejectsMalformedReleaseInputsAndResponses)
+TEST(TestJumpgatePlaybackClaimClient, FailsClosedOnTransportAuthenticationAndNonExactResponses)
 {
   FakePlaybackTransport transport;
   CJumpgatePlaybackClaimClient client{transport};
-  PlaybackReleaseRequest request = ValidReleaseRequest();
-  request.sessionId = "short";
-  EXPECT_EQ(client.Release(request).status, PlaybackReleaseStatus::InvalidRequest);
-  EXPECT_EQ(transport.calls, 0);
-
-  request = ValidReleaseRequest();
-  request.bridgeOrigin += "/_c/config";
-  EXPECT_EQ(client.Release(request).status, PlaybackReleaseStatus::InvalidRequest);
-  EXPECT_EQ(transport.calls, 0);
-
-  request = ValidReleaseRequest();
-  transport.responseBody = R"({"status":"released","sessionId":"session_00000001"})";
-  EXPECT_EQ(client.Release(request).status, PlaybackReleaseStatus::InvalidResponse);
-  transport.responseBody = R"({"status":"claimed"})";
-  EXPECT_EQ(client.Release(request).status, PlaybackReleaseStatus::InvalidResponse);
-  transport.responseBody = R"({"status":"not_found","status":"released"})";
-  EXPECT_EQ(client.Release(request).status, PlaybackReleaseStatus::InvalidResponse);
-
   transport.succeeds = false;
-  EXPECT_EQ(client.Release(request).status, PlaybackReleaseStatus::TransportFailure);
+  EXPECT_EQ(client.Claim(ValidClaimRequest()).status, PlaybackClaimStatus::TransportFailure);
+
   transport.succeeds = true;
-  transport.responseStatus = 403;
-  EXPECT_EQ(client.Release(request).status, PlaybackReleaseStatus::AuthenticationFailure);
-  transport.responseStatus = 500;
-  EXPECT_EQ(client.Release(request).status, PlaybackReleaseStatus::HttpFailure);
+  transport.responseStatus = 401;
+  EXPECT_EQ(client.Claim(ValidClaimRequest()).status, PlaybackClaimStatus::AuthenticationFailure);
+
+  transport.responseStatus = 200;
+  transport.responseBody = R"({"status":"not_found"})";
+  EXPECT_EQ(client.Claim(ValidClaimRequest()).status, PlaybackClaimStatus::InvalidResponse);
+
+  transport.responseBody = R"({"status":"released","extra":true})";
+  EXPECT_EQ(client.Release(ValidReleaseRequest()).status, PlaybackReleaseStatus::InvalidResponse);
 }

@@ -10,24 +10,151 @@
 
 #include "CompileInfo.h"
 
+#include <mutex>
+
+#include <android/native_activity.h>
 #include <androidjni/Activity.h>
 #include <androidjni/Intent.h>
 #include <androidjni/jutils-details.hpp>
 
 using namespace jni;
 
-CJNIMainActivity* CJNIMainActivity::m_appInstance(NULL);
+namespace
+{
+using BackDispatcher = KODI::JUMPGATE::CJumpgateBackDispatcher;
+using LifecycleToken = BackDispatcher::LifecycleToken;
+using AppTargetRegistry = KODI::JUMPGATE::CJumpgateLifecycleTargetRegistry<CJNIMainActivity>;
+
+AppTargetRegistry& GetAppTargetRegistry()
+{
+  // JNI callbacks can outlive an Activity destructor. Exact publication tokens
+  // keep a stale destructor from clearing or reacquiring its replacement.
+  static auto* registry = new AppTargetRegistry;
+  return *registry;
+}
+
+class CBackActivityBinding
+{
+public:
+  LifecycleToken OnCreated(JNIEnv* env, jobject context, bool initialExternalMode)
+  {
+    if (context == nullptr)
+      return BackDispatcher::INVALID_LIFECYCLE_TOKEN;
+
+    jweak activity = env->NewWeakGlobalRef(context);
+    if (activity == nullptr)
+      return BackDispatcher::INVALID_LIFECYCLE_TOKEN;
+
+    const LifecycleToken token =
+        CJNIMainActivity::GetJumpgateBackDispatcher().OnLifecycleStarted(initialExternalMode);
+    jweak previousActivity{nullptr};
+    {
+      std::unique_lock lock(m_mutex);
+      previousActivity = m_activity;
+      m_activity = activity;
+      m_token = token;
+    }
+
+    if (previousActivity != nullptr)
+      env->DeleteWeakGlobalRef(previousActivity);
+    return token;
+  }
+
+  bool IsCurrent(JNIEnv* env, jobject context, LifecycleToken token)
+  {
+    if (context == nullptr || token == BackDispatcher::INVALID_LIFECYCLE_TOKEN)
+      return false;
+
+    std::unique_lock lock(m_mutex);
+    return token == m_token && m_activity != nullptr &&
+           env->IsSameObject(context, m_activity) == JNI_TRUE;
+  }
+
+  void OnDestroyed(JNIEnv* env, jobject context, LifecycleToken token)
+  {
+    jweak activity{nullptr};
+    {
+      std::unique_lock lock(m_mutex);
+      if (token == BackDispatcher::INVALID_LIFECYCLE_TOKEN || token != m_token ||
+          m_activity == nullptr || env->IsSameObject(context, m_activity) != JNI_TRUE)
+      {
+        return;
+      }
+
+      activity = m_activity;
+      m_activity = nullptr;
+      m_token = BackDispatcher::INVALID_LIFECYCLE_TOKEN;
+    }
+
+    CJNIMainActivity::GetJumpgateBackDispatcher().OnLifecycleDestroyed(token);
+    env->DeleteWeakGlobalRef(activity);
+  }
+
+private:
+  std::mutex m_mutex;
+  jweak m_activity{nullptr};
+  LifecycleToken m_token{BackDispatcher::INVALID_LIFECYCLE_TOKEN};
+};
+
+CBackActivityBinding& GetBackActivityBinding()
+{
+  static auto* binding = new CBackActivityBinding;
+  return *binding;
+}
+
+LifecycleToken ToLifecycleToken(jlong lifecycleToken)
+{
+  return static_cast<LifecycleToken>(lifecycleToken);
+}
+} // namespace
+
+KODI::JUMPGATE::CJumpgateBackDispatcher& CJNIMainActivity::GetJumpgateBackDispatcher()
+{
+  // The broker spans Activity recreation and must remain valid through JNI/static teardown.
+  static auto* dispatcher = new KODI::JUMPGATE::CJumpgateBackDispatcher;
+  return *dispatcher;
+}
+
+CJNIMainActivity::AppInstancePublicationToken CJNIMainActivity::PublishAppInstance(
+    BackLifecycleToken lifecycleToken, std::shared_ptr<CJNIMainActivity> appInstance)
+{
+  return GetAppTargetRegistry().Publish(lifecycleToken, std::move(appInstance));
+}
+
+CJNIMainActivity::AppInstanceOperation CJNIMainActivity::AcquireAppInstance(
+    BackLifecycleToken lifecycleToken)
+{
+  auto lifecycleOperation =
+      GetJumpgateBackDispatcher().TryAcquireLifecycleOperation(lifecycleToken);
+  if (!lifecycleOperation)
+    return {};
+
+  // Do not nest the dispatcher and registry mutexes. The lifecycle lease keeps
+  // a replacement pending while the acquired shared target executes.
+  auto appInstance = GetAppTargetRegistry().Acquire(lifecycleToken);
+  if (!appInstance)
+    return {};
+  return AppInstanceOperation{std::move(lifecycleOperation), std::move(appInstance)};
+}
+
+bool CJNIMainActivity::RetireAppInstance(BackLifecycleToken lifecycleToken,
+                                         AppInstancePublicationToken publicationToken,
+                                         const CJNIMainActivity* expectedInstance)
+{
+  return GetAppTargetRegistry().Retire(lifecycleToken, publicationToken, expectedInstance);
+}
+
+bool CJNIMainActivity::RetireAppLifecycle(BackLifecycleToken lifecycleToken)
+{
+  return GetAppTargetRegistry().RetireLifecycle(lifecycleToken);
+}
 
 CJNIMainActivity::CJNIMainActivity(const ANativeActivity *nativeActivity)
   : CJNIActivity(nativeActivity)
 {
-  m_appInstance = this;
 }
 
-CJNIMainActivity::~CJNIMainActivity()
-{
-  m_appInstance = NULL;
-}
+CJNIMainActivity::~CJNIMainActivity() = default;
 
 void CJNIMainActivity::RegisterNatives(JNIEnv* env)
 {
@@ -41,16 +168,20 @@ void CJNIMainActivity::RegisterNatives(JNIEnv* env)
   if (cMain)
   {
     JNINativeMethod methods[] = {
-        {"_onNewIntent", "(Landroid/content/Intent;)V",
+        {"_onNewIntent", "(JLandroid/content/Intent;Ljava/lang/String;)V",
          reinterpret_cast<void*>(&CJNIMainActivity::_onNewIntent)},
-        {"_onActivityResult", "(IILandroid/content/Intent;)V",
+        {"_onActivityResult", "(JIILandroid/content/Intent;)V",
          reinterpret_cast<void*>(&CJNIMainActivity::_onActivityResult)},
-        {"_doFrame", "(J)V", reinterpret_cast<void*>(&CJNIMainActivity::_doFrame)},
+        {"_onBackCreated", "(Z)J", reinterpret_cast<void*>(&CJNIMainActivity::_onBackCreated)},
+        {"_onBackStarted", "(JI)V", reinterpret_cast<void*>(&CJNIMainActivity::_onBackStarted)},
+        {"_onBackLongPress", "(J)V", reinterpret_cast<void*>(&CJNIMainActivity::_onBackLongPress)},
+        {"_onBackCancelled", "(J)V", reinterpret_cast<void*>(&CJNIMainActivity::_onBackCancelled)},
+        {"_onBackInvoked", "(J)V", reinterpret_cast<void*>(&CJNIMainActivity::_onBackInvoked)},
+        {"_onBackDestroyed", "(J)V", reinterpret_cast<void*>(&CJNIMainActivity::_onBackDestroyed)},
+        {"_doFrame", "(JJ)V", reinterpret_cast<void*>(&CJNIMainActivity::_doFrame)},
         {"_callNative", "(JJ)V", reinterpret_cast<void*>(&CJNIMainActivity::_callNative)},
-        {"_onVisibleBehindCanceled", "()V",
+        {"_onVisibleBehindCanceled", "(J)V",
          reinterpret_cast<void*>(&CJNIMainActivity::_onVisibleBehindCanceled)},
-        {"_requestOpenSettings", "()V",
-         reinterpret_cast<void*>(&CJNIMainActivity::_requestOpenSettings)},
     };
     env->RegisterNatives(cMain, methods, sizeof(methods) / sizeof(methods[0]));
   }
@@ -59,7 +190,8 @@ void CJNIMainActivity::RegisterNatives(JNIEnv* env)
   if (cSettingsObserver)
   {
     JNINativeMethod methods[] = {
-        {"_onVolumeChanged", "(I)V", reinterpret_cast<void*>(&CJNIMainActivity::_onVolumeChanged)},
+        {"_onVolumeChanged", "(JI)V",
+         reinterpret_cast<void*>(&CJNIMainActivity::_onVolumeChanged)},
     };
     env->RegisterNatives(cSettingsObserver, methods, sizeof(methods) / sizeof(methods[0]));
   }
@@ -68,30 +200,105 @@ void CJNIMainActivity::RegisterNatives(JNIEnv* env)
   if (cInputDeviceListener)
   {
     JNINativeMethod methods[] = {
-        {"_onInputDeviceAdded", "(I)V",
+        {"_onInputDeviceAdded", "(JI)V",
          reinterpret_cast<void*>(&CJNIMainActivity::_onInputDeviceAdded)},
-        {"_onInputDeviceChanged", "(I)V",
+        {"_onInputDeviceChanged", "(JI)V",
          reinterpret_cast<void*>(&CJNIMainActivity::_onInputDeviceChanged)},
-        {"_onInputDeviceRemoved", "(I)V",
+        {"_onInputDeviceRemoved", "(JI)V",
          reinterpret_cast<void*>(&CJNIMainActivity::_onInputDeviceRemoved)}};
     env->RegisterNatives(cInputDeviceListener, methods, sizeof(methods) / sizeof(methods[0]));
   }
 }
 
-void CJNIMainActivity::_onNewIntent(JNIEnv *env, jobject context, jobject intent)
+void CJNIMainActivity::_onNewIntent(JNIEnv* env,
+                                    jobject context,
+                                    jlong lifecycleToken,
+                                    jobject intent,
+                                    jstring preparedRequestId)
 {
-  (void)env;
-  (void)context;
-  if (m_appInstance)
-    m_appInstance->onNewIntent(CJNIIntent(jhobject::fromJNI(intent)));
+  const LifecycleToken token = ToLifecycleToken(lifecycleToken);
+  if (!GetBackActivityBinding().IsCurrent(env, context, token))
+    return;
+  if (const auto appInstance = AcquireAppInstance(token))
+  {
+    std::string requestId;
+    if (preparedRequestId != nullptr)
+    {
+      const char* requestChars = env->GetStringUTFChars(preparedRequestId, nullptr);
+      if (requestChars != nullptr)
+      {
+        requestId.assign(requestChars);
+        env->ReleaseStringUTFChars(preparedRequestId, requestChars);
+      }
+    }
+    appInstance->onNewIntent(CJNIIntent(jhobject::fromJNI(intent)), std::move(requestId));
+  }
 }
 
-void CJNIMainActivity::_onActivityResult(JNIEnv *env, jobject context, jint requestCode, jint resultCode, jobject resultData)
+void CJNIMainActivity::_onActivityResult(JNIEnv* env,
+                                         jobject context,
+                                         jlong lifecycleToken,
+                                         jint requestCode,
+                                         jint resultCode,
+                                         jobject resultData)
 {
-  (void)env;
-  (void)context;
-  if (m_appInstance)
-    m_appInstance->onActivityResult(requestCode, resultCode, CJNIIntent(jhobject::fromJNI(resultData)));
+  const LifecycleToken token = ToLifecycleToken(lifecycleToken);
+  if (!GetBackActivityBinding().IsCurrent(env, context, token))
+    return;
+  if (const auto appInstance = AcquireAppInstance(token))
+    appInstance->onActivityResult(requestCode, resultCode,
+                                  CJNIIntent(jhobject::fromJNI(resultData)));
+}
+
+jlong CJNIMainActivity::_onBackCreated(JNIEnv* env,
+                                       jobject context,
+                                       jboolean initialExternalMode)
+{
+  return static_cast<jlong>(
+      GetBackActivityBinding().OnCreated(env, context, initialExternalMode == JNI_TRUE));
+}
+
+void CJNIMainActivity::_onBackStarted(JNIEnv* env,
+                                      jobject context,
+                                      jlong lifecycleToken,
+                                      jint source)
+{
+  const LifecycleToken token = ToLifecycleToken(lifecycleToken);
+  if (GetBackActivityBinding().IsCurrent(env, context, token))
+    GetJumpgateBackDispatcher().OnApi36BackStarted(token, source);
+}
+
+void CJNIMainActivity::_onBackLongPress(JNIEnv* env, jobject context, jlong lifecycleToken)
+{
+  const LifecycleToken token = ToLifecycleToken(lifecycleToken);
+  if (GetBackActivityBinding().IsCurrent(env, context, token))
+    GetJumpgateBackDispatcher().OnApi36BackLongPress(token);
+}
+
+void CJNIMainActivity::_onBackCancelled(JNIEnv* env, jobject context, jlong lifecycleToken)
+{
+  const LifecycleToken token = ToLifecycleToken(lifecycleToken);
+  if (GetBackActivityBinding().IsCurrent(env, context, token))
+    GetJumpgateBackDispatcher().OnApi36BackCancelled(token);
+}
+
+void CJNIMainActivity::_onBackInvoked(JNIEnv* env, jobject context, jlong lifecycleToken)
+{
+  const LifecycleToken token = ToLifecycleToken(lifecycleToken);
+  if (GetBackActivityBinding().IsCurrent(env, context, token))
+    GetJumpgateBackDispatcher().OnApi36BackInvoked(token);
+}
+
+void CJNIMainActivity::_onBackDestroyed(JNIEnv* env, jobject context, jlong lifecycleToken)
+{
+  const LifecycleToken token = ToLifecycleToken(lifecycleToken);
+  if (GetBackActivityBinding().IsCurrent(env, context, token))
+  {
+    if (const auto appInstance = AcquireAppInstance(token))
+      appInstance->onBackLifecycleRetiring(token);
+    RetireAppLifecycle(token);
+  }
+  GetBackActivityBinding().OnDestroyed(env, context, token);
 }
 
 void CJNIMainActivity::_callNative(JNIEnv *env, jobject context, jlong funcAddr, jlong variantAddr)
@@ -101,20 +308,15 @@ void CJNIMainActivity::_callNative(JNIEnv *env, jobject context, jlong funcAddr,
   ((void (*)(CVariant *))funcAddr)((CVariant *)variantAddr);
 }
 
-void CJNIMainActivity::_onVisibleBehindCanceled(JNIEnv* env, jobject context)
+void CJNIMainActivity::_onVisibleBehindCanceled(JNIEnv* env,
+                                                jobject context,
+                                                jlong lifecycleToken)
 {
-  (void)env;
-  (void)context;
-  if (m_appInstance)
-    m_appInstance->onVisibleBehindCanceled();
-}
-
-void CJNIMainActivity::_requestOpenSettings(JNIEnv* env, jobject context)
-{
-  (void)env;
-  (void)context;
-  if (m_appInstance)
-    m_appInstance->onOpenSettingsRequested();
+  const LifecycleToken token = ToLifecycleToken(lifecycleToken);
+  if (!GetBackActivityBinding().IsCurrent(env, context, token))
+    return;
+  if (const auto appInstance = AcquireAppInstance(token))
+    appInstance->onVisibleBehindCanceled();
 }
 
 void CJNIMainActivity::runNativeOnUiThread(void (*callback)(void*), void* variant)
@@ -123,51 +325,81 @@ void CJNIMainActivity::runNativeOnUiThread(void (*callback)(void*), void* varian
                     "runNativeOnUiThread", "(JJ)V", (jlong)callback, (jlong)variant);
 }
 
-void CJNIMainActivity::_onVolumeChanged(JNIEnv *env, jobject context, jint volume)
+void CJNIMainActivity::_onVolumeChanged(JNIEnv* env,
+                                        jobject context,
+                                        jlong lifecycleToken,
+                                        jint volume)
 {
   (void)env;
   (void)context;
-  if(m_appInstance)
-    m_appInstance->onVolumeChanged(volume);
+  const LifecycleToken token = ToLifecycleToken(lifecycleToken);
+  if (const auto appInstance = AcquireAppInstance(token))
+    appInstance->onVolumeChanged(volume);
 }
 
-void CJNIMainActivity::_onInputDeviceAdded(JNIEnv *env, jobject context, jint deviceId)
+void CJNIMainActivity::_onInputDeviceAdded(JNIEnv* env,
+                                           jobject context,
+                                           jlong lifecycleToken,
+                                           jint deviceId)
 {
   static_cast<void>(env);
   static_cast<void>(context);
 
-  if (m_appInstance != nullptr)
-    m_appInstance->onInputDeviceAdded(deviceId);
+  const LifecycleToken token = ToLifecycleToken(lifecycleToken);
+  if (const auto appInstance = AcquireAppInstance(token))
+    appInstance->onInputDeviceAdded(deviceId);
 }
 
-void CJNIMainActivity::_onInputDeviceChanged(JNIEnv *env, jobject context, jint deviceId)
+void CJNIMainActivity::_onInputDeviceChanged(JNIEnv* env,
+                                             jobject context,
+                                             jlong lifecycleToken,
+                                             jint deviceId)
 {
   static_cast<void>(env);
   static_cast<void>(context);
 
-  if (m_appInstance != nullptr)
-    m_appInstance->onInputDeviceChanged(deviceId);
+  const LifecycleToken token = ToLifecycleToken(lifecycleToken);
+  if (const auto appInstance = AcquireAppInstance(token))
+    appInstance->onInputDeviceChanged(deviceId);
 }
 
-void CJNIMainActivity::_onInputDeviceRemoved(JNIEnv *env, jobject context, jint deviceId)
+void CJNIMainActivity::_onInputDeviceRemoved(JNIEnv* env,
+                                             jobject context,
+                                             jlong lifecycleToken,
+                                             jint deviceId)
 {
   static_cast<void>(env);
   static_cast<void>(context);
 
-  if (m_appInstance != nullptr)
-    m_appInstance->onInputDeviceRemoved(deviceId);
+  const LifecycleToken token = ToLifecycleToken(lifecycleToken);
+  if (const auto appInstance = AcquireAppInstance(token))
+    appInstance->onInputDeviceRemoved(deviceId);
 }
 
-void CJNIMainActivity::_doFrame(JNIEnv *env, jobject context, jlong frameTimeNanos)
+void CJNIMainActivity::_doFrame(JNIEnv* env,
+                                jobject context,
+                                jlong lifecycleToken,
+                                jlong frameTimeNanos)
 {
-  (void)env;
-  (void)context;
-  if(m_appInstance)
-    m_appInstance->doFrame(frameTimeNanos);
+  const LifecycleToken token = ToLifecycleToken(lifecycleToken);
+  if (!GetBackActivityBinding().IsCurrent(env, context, token))
+    return;
+  if (const auto appInstance = AcquireAppInstance(token))
+    appInstance->doFrame(frameTimeNanos);
 }
 
 CJNIRect CJNIMainActivity::getDisplayRect()
 {
   return call_method<jhobject>(m_context,
                                "getDisplayRect", "()Landroid/graphics/Rect;");
+}
+
+KODI::JUMPGATE::CJumpgateBackDispatcher::LifecycleToken CJNIMainActivity::
+    GetJumpgateBackLifecycleToken(const ANativeActivity* nativeActivity)
+{
+  if (nativeActivity == nullptr || nativeActivity->clazz == nullptr)
+    return KODI::JUMPGATE::CJumpgateBackDispatcher::INVALID_LIFECYCLE_TOKEN;
+
+  return static_cast<KODI::JUMPGATE::CJumpgateBackDispatcher::LifecycleToken>(
+      call_method<jlong>(jhobject::fromJNI(nativeActivity->clazz), "getBackLifecycleToken", "()J"));
 }

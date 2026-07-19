@@ -8,8 +8,10 @@
 
 #pragma once
 
+#include <functional>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -22,6 +24,69 @@ namespace MESSAGING
 {
 
 class CApplicationMessenger;
+class COwnedApplicationCallback;
+
+class COwnedThreadMessagePayload final
+{
+public:
+  using Deleter = void (*)(void*);
+
+  COwnedThreadMessagePayload(void* payload,
+                             Deleter deleter,
+                             std::function<void()> cancellation)
+    : m_payload(payload),
+      m_deleter(deleter),
+      m_cancellation(std::move(cancellation))
+  {
+  }
+
+  ~COwnedThreadMessagePayload() { Cancel(); }
+
+  COwnedThreadMessagePayload(const COwnedThreadMessagePayload&) = delete;
+  COwnedThreadMessagePayload& operator=(const COwnedThreadMessagePayload&) = delete;
+
+  void* Take() noexcept
+  {
+    std::lock_guard lock(m_mutex);
+    void* payload = m_payload;
+    m_payload = nullptr;
+    m_cancellation = {};
+    return payload;
+  }
+
+  bool Cancel() noexcept
+  {
+    void* payload{nullptr};
+    std::function<void()> cancellation;
+    {
+      std::lock_guard lock(m_mutex);
+      if (m_payload == nullptr)
+        return false;
+      payload = m_payload;
+      m_payload = nullptr;
+      cancellation = std::move(m_cancellation);
+    }
+
+    m_deleter(payload);
+    if (cancellation)
+    {
+      try
+      {
+        cancellation();
+      }
+      catch (...)
+      {
+      }
+    }
+    return true;
+  }
+
+private:
+  std::mutex m_mutex;
+  void* m_payload{nullptr};
+  Deleter m_deleter{nullptr};
+  std::function<void()> m_cancellation;
+};
 
 class ThreadMessage
 {
@@ -78,7 +143,10 @@ public:
       strParam(std::move(other.strParam)),
       params(std::move(other.params)),
       waitEvent(std::move(other.waitEvent)),
-      result(std::move(other.result))
+      result(std::move(other.result)),
+      ownedCallback(std::move(other.ownedCallback)),
+      ownedPayload(std::move(other.ownedPayload)),
+      queueReservation(std::move(other.queueReservation))
   {
   }
 
@@ -95,6 +163,9 @@ public:
     params = other.params;
     waitEvent = other.waitEvent;
     result = other.result;
+    ownedCallback = other.ownedCallback;
+    ownedPayload = other.ownedPayload;
+    queueReservation = other.queueReservation;
     return *this;
   }
 
@@ -111,7 +182,39 @@ public:
     params = std::move(other.params);
     waitEvent = std::move(other.waitEvent);
     result = std::move(other.result);
+    ownedCallback = std::move(other.ownedCallback);
+    ownedPayload = std::move(other.ownedPayload);
+    queueReservation = std::move(other.queueReservation);
     return *this;
+  }
+
+  template<typename Payload>
+  std::shared_ptr<COwnedThreadMessagePayload> SetOwnedPayload(
+      std::unique_ptr<Payload> payload, std::function<void()> cancellation = {})
+  {
+    if (!payload)
+      return {};
+
+    auto owned = std::make_shared<COwnedThreadMessagePayload>(
+        payload.get(), [](void* value) { delete static_cast<Payload*>(value); },
+        std::move(cancellation));
+    lpVoid = payload.release();
+    ownedPayload = owned;
+    return owned;
+  }
+
+  template<typename Payload>
+  std::unique_ptr<Payload> TakeOwnedPayload() noexcept
+  {
+    if (ownedPayload)
+    {
+      lpVoid = nullptr;
+      return std::unique_ptr<Payload>(static_cast<Payload*>(ownedPayload->Take()));
+    }
+
+    Payload* payload = static_cast<Payload*>(lpVoid);
+    lpVoid = nullptr;
+    return std::unique_ptr<Payload>(payload);
   }
 
   uint32_t dwMessage;
@@ -138,6 +241,9 @@ public:
 protected:
   std::shared_ptr<CEvent> waitEvent;
   std::shared_ptr<int> result;
+  std::shared_ptr<COwnedApplicationCallback> ownedCallback;
+  std::shared_ptr<COwnedThreadMessagePayload> ownedPayload;
+  std::shared_ptr<void> queueReservation;
 };
 }
 }

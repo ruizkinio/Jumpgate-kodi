@@ -4,6 +4,7 @@ import @APP_PACKAGE@.channels.util.TvUtil;
 
 import static android.content.pm.PackageManager.FEATURE_LEANBACK;
 
+import android.annotation.TargetApi;
 import android.animation.ObjectAnimator;
 import android.animation.ValueAnimator;
 import android.app.NativeActivity;
@@ -29,11 +30,13 @@ import android.graphics.Color;
 import android.graphics.PixelFormat;
 import android.view.Choreographer;
 import android.view.Gravity;
-import android.view.KeyEvent;
 import android.view.View;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
 import android.view.WindowManager;
+import android.window.BackEvent;
+import android.window.OnBackAnimationCallback;
+import android.window.OnBackInvokedDispatcher;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
@@ -86,13 +89,28 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
 
   // External player mode: when launched via ACTION_VIEW from another app
   private boolean mExternalPlayerMode = false;
-  private long mExternalPlaybackGeneration = 0;
-  private final ExternalPlayerResultCoordinator.Producer mExternalResultProducer =
-      new ExternalPlayerResultCoordinator.Producer();
+  private final ExternalPlayerResultCoordinator.MainState mExternalResultProducer =
+      new ExternalPlayerResultCoordinator.MainState();
   private long mLastPlaybackPosition = 0;  // ms
   private long mLastPlaybackDuration = 0;  // ms
-  private static final long EXTERNAL_BACK_LONG_PRESS_MS = 700L;
-  private boolean mExternalBackLongPressHandled = false;
+  private static final long BACK_LONG_PRESS_THRESHOLD_MS = 700L;
+  private static final int BACK_SOURCE_GESTURE_LEFT = 0;
+  private static final int BACK_SOURCE_GESTURE_RIGHT = 1;
+  private static final int BACK_SOURCE_BUTTON = 2;
+  private static final String NATIVE_INTENT_RETRY = "jumpgate_native_intent_retry";
+  private static final int MAX_NATIVE_INTENT_RETRIES = 1;
+  private long mBackLifecycleToken = 0;
+  private Object mOnBackAnimationCallback = null;
+  private final Runnable mBackLongPressRunnable = new Runnable()
+  {
+    @Override
+    public void run()
+    {
+      final long lifecycleToken = mBackLifecycleToken;
+      if (lifecycleToken != 0)
+        _onBackLongPress(lifecycleToken);
+    }
+  };
 
   // Tracks whether we entered external player mode from an already-running standalone Kodi.
   // When true, exitExternalPlayerMode returns to standalone instead of killing the process.
@@ -118,15 +136,21 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
   private ValueAnimator mOverlayPulseAnimator = null;
   private long mOverlayShownAtMs = 0L;
   private int mOverlayProgress = 0;
+  private long mDeferredRejectionGeneration = 1L << 62;
 
   private class DelayedIntent
   {
-    public Intent mIntent;
-    public int mDelay;
+    public final Intent mIntent;
+    public final int mDelay;
+    public final long mLifecycleToken;
+    public final String mPreparedRequestId;
 
-    public DelayedIntent(Intent intent, int delay) {
+    public DelayedIntent(
+        Intent intent, int delay, long lifecycleToken, String preparedRequestId) {
       mIntent = intent;
       mDelay = delay;
+      mLifecycleToken = lifecycleToken;
+      mPreparedRequestId = preparedRequestId == null ? "" : preparedRequestId;
     }
   }
   private ArrayList<DelayedIntent> mDelayedIntents = new ArrayList<>();
@@ -139,15 +163,23 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
     add("com.spocky.projengmenu"); // Projectivy Launcher
   }};
 
-  native void _onNewIntent(Intent intent);
+  native void _onNewIntent(long lifecycleToken, Intent intent, String preparedRequestId);
 
-  native void _onActivityResult(int requestCode, int resultCode, Intent resultData);
+  native void _onActivityResult(
+      long lifecycleToken, int requestCode, int resultCode, Intent resultData);
 
-  native void _doFrame(long frameTimeNanos);
+  native long _onBackCreated(boolean externalPlayerMode);
+  native void _onBackStarted(long lifecycleToken, int swipeEdge);
+  native void _onBackLongPress(long lifecycleToken);
+  native void _onBackCancelled(long lifecycleToken);
+  native void _onBackInvoked(long lifecycleToken);
+  native void _onBackDestroyed(long lifecycleToken);
 
-  native void _onVisibleBehindCanceled();
-  native void _requestOpenSettings();
+  native void _doFrame(long lifecycleToken, long frameTimeNanos);
 
+  native void _onVisibleBehindCanceled(long lifecycleToken);
+
+  @SuppressWarnings("deprecation")
   private static void normalizeLongExtraAsString(Intent intent, String name) {
     if (intent == null || !intent.hasExtra(name) || intent.getExtras() == null) return;
     Object value = intent.getExtras().get(name);
@@ -212,9 +244,22 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
       Log.d(TAG, "Main: External player mode activated");
     }
 
+    String initialRequestId =
+        getIntent().getStringExtra(ExternalPlayerResultCoordinator.EXTRA_REQUEST_ID);
+    if (mExternalPlayerMode && !ExternalPlayerResultCoordinator.isValidRequestId(initialRequestId))
+      throw new IllegalStateException("External player launch has no valid result owner");
+    if (mExternalPlayerMode) {
+      if (!mExternalResultProducer.prepare(initialRequestId))
+        throw new IllegalStateException("External result request ownership preparation failed");
+    }
+
     System.loadLibrary("@APP_NAME_LC@");
 
+    mBackLifecycleToken = _onBackCreated(mExternalPlayerMode);
+    if (mBackLifecycleToken == 0)
+      throw new IllegalStateException("Native Back lifecycle creation failed");
     super.onCreate(savedInstanceState);
+    registerApi36BackCallback();
 
     // Show loading overlay immediately — before any views or native rendering.
     // Must be after super.onCreate() (window token needed) but before SurfaceView setup.
@@ -225,7 +270,8 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
     setContentView(R.layout.activity_main);
     setVolumeControlStream(AudioManager.STREAM_MUSIC);
 
-    mSettingsContentObserver = new XBMCSettingsContentObserver(this, handler);
+    mSettingsContentObserver =
+        new XBMCSettingsContentObserver(this, handler, mBackLifecycleToken);
     getApplicationContext().getContentResolver().registerContentObserver(android.provider.Settings.System.CONTENT_URI, true, mSettingsContentObserver);
 
     // Delayed Intent — wait for native engine to initialize before dispatching media URL
@@ -233,7 +279,9 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
     if (getIntent().getData() != null)
     {
       int delay = mExternalPlayerMode ? 2000 : 5000;
-      mDelayedIntents.add(new DelayedIntent(new Intent(getIntent()), delay));
+      mDelayedIntents.add(
+          new DelayedIntent(
+              new Intent(getIntent()), delay, mBackLifecycleToken, initialRequestId));
       getIntent().setData(null);
     }
 
@@ -255,7 +303,7 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
     }
 
     // register the InputDeviceListener implementation
-    mInputDeviceListener = new XBMCInputDeviceListener();
+    mInputDeviceListener = new XBMCInputDeviceListener(mBackLifecycleToken);
     InputManager manager = (InputManager) getSystemService(INPUT_SERVICE);
     manager.registerInputDeviceListener(mInputDeviceListener, handler);
 
@@ -274,33 +322,38 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
     mMainView.setElevation(1);  // Always on Top
     videoLayout.addView(mMainView, layoutParams);
 
-    if (Build.VERSION.SDK_INT < 30)
+    registerLegacySystemUiVisibilityListener();
+  }
+
+  @SuppressWarnings("deprecation")
+  private void registerLegacySystemUiVisibilityListener()
+  {
+    if (Build.VERSION.SDK_INT >= 30)
+      return;
+
+    mDecorView.setOnSystemUiVisibilityChangeListener(new View.OnSystemUiVisibilityChangeListener()
     {
-      mDecorView.setOnSystemUiVisibilityChangeListener(new View.OnSystemUiVisibilityChangeListener()
+      @Override
+      public void onSystemUiVisibilityChange(int visibility)
       {
-        @Override
-        public void onSystemUiVisibilityChange(int visibility)
+        if ((visibility & View.SYSTEM_UI_FLAG_HIDE_NAVIGATION) == 0)
         {
-          if ((visibility & View.SYSTEM_UI_FLAG_HIDE_NAVIGATION) == 0)
+          handler.post(new Runnable()
           {
-            handler.post(new Runnable()
+            public void run()
             {
-              public void run()
-              {
-                // Immersive mode
-                mDecorView.setSystemUiVisibility(
-                        View.SYSTEM_UI_FLAG_LAYOUT_STABLE
-                                | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
-                                | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
-                                | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
-                                | View.SYSTEM_UI_FLAG_FULLSCREEN
-                                | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY);
-              }
-            });
-          }
+              mDecorView.setSystemUiVisibility(
+                  View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                      | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                      | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                      | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                      | View.SYSTEM_UI_FLAG_FULLSCREEN
+                      | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY);
+            }
+          });
         }
-      });
-    }
+      }
+    });
   }
 
   @Override
@@ -325,6 +378,12 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
       Log.w(TAG, "Main: Ignoring duplicate external playback request " + externalRequestId);
       return;
     }
+    if (isActionView) {
+      if (!mExternalResultProducer.prepare(externalRequestId)) {
+        Log.e(TAG, "Main: Rejecting unowned external playback request " + externalRequestId);
+        return;
+      }
+    }
     boolean wasAlreadyExternal = mExternalPlayerMode;
 
     // Show loading overlay for external player transitions
@@ -342,7 +401,12 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
       {
         mPendingWasStandalone = true;
       }
-      mDelayedIntents.add(new DelayedIntent(new Intent(intent), 500));
+      mDelayedIntents.add(
+          new DelayedIntent(
+              new Intent(intent),
+              500,
+              mBackLifecycleToken,
+              isActionView ? externalRequestId : ""));
     }
     else
     {
@@ -356,7 +420,8 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
         }
         mExternalPlayerMode = true;
       }
-      _onNewIntent(intent);
+      _onNewIntent(
+          mBackLifecycleToken, intent, isActionView ? externalRequestId : "");
     }
   }
 
@@ -371,6 +436,7 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
   }
 
   @Override
+  @SuppressWarnings("deprecation")
   public void onResume()
   {
     super.onResume();
@@ -415,7 +481,10 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
         {
           try
           {
-            _onNewIntent(delayedIntent.mIntent);
+            _onNewIntent(
+                delayedIntent.mLifecycleToken,
+                delayedIntent.mIntent,
+                delayedIntent.mPreparedRequestId);
           }
           catch (UnsatisfiedLinkError e)
           {
@@ -447,63 +516,92 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
                                Intent resultData)
   {
     super.onActivityResult(requestCode, resultCode, resultData);
-    _onActivityResult(requestCode, resultCode, resultData);
+    _onActivityResult(mBackLifecycleToken, requestCode, resultCode, resultData);
   }
 
-  @Override
-  public boolean onKeyUp(int keyCode, KeyEvent event)
+  private void registerApi36BackCallback()
   {
-    if (mExternalPlayerMode && keyCode == KeyEvent.KEYCODE_BACK)
-    {
-      long heldMs = event.getEventTime() - event.getDownTime();
-      if (mExternalBackLongPressHandled || heldMs >= EXTERNAL_BACK_LONG_PRESS_MS)
-      {
-        if (!mExternalBackLongPressHandled)
-          requestExternalSettingsFromBackLongPress("keyup " + heldMs + "ms");
-        mExternalBackLongPressHandled = false;
-        return true;
-      }
-      mExternalBackLongPressHandled = false;
-    }
+    if (Build.VERSION.SDK_INT < 36 || mOnBackAnimationCallback != null)
+      return;
 
-    return super.onKeyUp(keyCode, event);
+    mOnBackAnimationCallback = PredictiveBackApi36.register(this, mBackLifecycleToken);
   }
 
-  @Override
-  public boolean onKeyDown(int keyCode, KeyEvent event)
+  private void unregisterApi36BackCallback()
   {
-    if (mExternalPlayerMode && keyCode == KeyEvent.KEYCODE_BACK)
+    Object callback = mOnBackAnimationCallback;
+    mOnBackAnimationCallback = null;
+    if (Build.VERSION.SDK_INT < 36 || callback == null)
+      return;
+
+    PredictiveBackApi36.unregister(this, callback);
+  }
+
+  @TargetApi(36)
+  private static final class PredictiveBackApi36
+  {
+    static Object register(final Main activity, final long lifecycleToken)
     {
-      if (event.getRepeatCount() > 0)
+      OnBackAnimationCallback callback = new OnBackAnimationCallback()
       {
-        if (!mExternalBackLongPressHandled)
+        @Override
+        public void onBackStarted(BackEvent backEvent)
         {
-          requestExternalSettingsFromBackLongPress("keydown repeat=" + event.getRepeatCount());
-          mExternalBackLongPressHandled = true;
+          int swipeEdge = backEvent.getSwipeEdge();
+          int source = BACK_SOURCE_GESTURE_LEFT;
+          if (swipeEdge == BackEvent.EDGE_RIGHT)
+            source = BACK_SOURCE_GESTURE_RIGHT;
+          else if (swipeEdge == BackEvent.EDGE_NONE)
+            source = BACK_SOURCE_BUTTON;
+          activity.handler.removeCallbacks(activity.mBackLongPressRunnable);
+          activity._onBackStarted(lifecycleToken, source);
+          if (swipeEdge == BackEvent.EDGE_NONE)
+            activity.handler.postDelayed(
+                activity.mBackLongPressRunnable, BACK_LONG_PRESS_THRESHOLD_MS);
         }
-        return true;
-      }
+
+        @Override
+        public void onBackCancelled()
+        {
+          activity.handler.removeCallbacks(activity.mBackLongPressRunnable);
+          activity._onBackCancelled(lifecycleToken);
+        }
+
+        @Override
+        public void onBackInvoked()
+        {
+          activity.handler.removeCallbacks(activity.mBackLongPressRunnable);
+          activity._onBackInvoked(lifecycleToken);
+        }
+      };
+      activity.getOnBackInvokedDispatcher().registerOnBackInvokedCallback(
+          OnBackInvokedDispatcher.PRIORITY_DEFAULT, callback);
+      return callback;
     }
 
-    return super.onKeyDown(keyCode, event);
+    static void unregister(Main activity, Object callback)
+    {
+      activity.getOnBackInvokedDispatcher().unregisterOnBackInvokedCallback(
+          (OnBackAnimationCallback) callback);
+    }
   }
 
-  private void requestExternalSettingsFromBackLongPress(String source)
+  public long getBackLifecycleToken()
   {
-    Log.d(TAG, "Main: Back long-press detected (" + source + "), opening settings");
-    try
-    {
-      _requestOpenSettings();
-    }
-    catch (UnsatisfiedLinkError e)
-    {
-      Log.e(TAG, "Main: Native settings request not registered", e);
-    }
+    return mBackLifecycleToken;
   }
 
   @Override
   public void onDestroy()
   {
+    handler.removeCallbacks(mBackLongPressRunnable);
+    unregisterApi36BackCallback();
+    terminalizeExternalPlayerResultForTeardown();
+    final long lifecycleToken = mBackLifecycleToken;
+    mBackLifecycleToken = 0;
+    if (lifecycleToken != 0)
+      _onBackDestroyed(lifecycleToken);
+
     TvUtil.cancelAllScheduledJobs(this);
 
     // unregister the InputDeviceListener implementation
@@ -530,7 +628,7 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
   @SuppressWarnings("deprecation")
   public void onVisibleBehindCanceled()
   {
-    _onVisibleBehindCanceled();
+    _onVisibleBehindCanceled(mBackLifecycleToken);
     super.onVisibleBehindCanceled();
   }
 
@@ -538,7 +636,7 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
   public void doFrame(long frameTimeNanos)
   {
     Choreographer.getInstance().postFrameCallback(this);
-    _doFrame(frameTimeNanos);
+    _doFrame(mBackLifecycleToken, frameTimeNanos);
   }
 
   private native void _callNative(long funcAddr, long variantAddr);
@@ -571,12 +669,62 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
 
   // --- External Player Mode ---
 
-  public synchronized void beginExternalPlayerMode(
-      long generation, String requestId, boolean wasStandalone) {
-    if (!mExternalResultProducer.begin(generation, requestId)) {
+  private void postNativeExternalIntentRetry(
+      long lifecycleToken, Intent intent, String preparedRequestId) {
+    if (intent == null
+        || lifecycleToken == 0
+        || lifecycleToken != mBackLifecycleToken
+        || intent.getIntExtra(NATIVE_INTENT_RETRY, 0) >= MAX_NATIVE_INTENT_RETRIES) {
+      postDeferredExternalPlayerRejection(lifecycleToken, preparedRequestId);
       return;
     }
 
+    final Intent retryIntent = new Intent(intent);
+    retryIntent.putExtra(
+        NATIVE_INTENT_RETRY, intent.getIntExtra(NATIVE_INTENT_RETRY, 0) + 1);
+    final String exactRequestId = preparedRequestId == null ? "" : preparedRequestId;
+    if (!handler.postDelayed(
+        () -> {
+          if (lifecycleToken != mBackLifecycleToken) {
+            postDeferredExternalPlayerRejection(lifecycleToken, exactRequestId);
+            return;
+          }
+          _onNewIntent(lifecycleToken, retryIntent, exactRequestId);
+        },
+        16L)) {
+      postDeferredExternalPlayerRejection(lifecycleToken, exactRequestId);
+    }
+  }
+
+  private void postDeferredExternalPlayerRejection(
+      long lifecycleToken, String preparedRequestId) {
+    if (!ExternalPlayerResultCoordinator.isValidRequestId(preparedRequestId)) return;
+
+    final long generation;
+    synchronized (this) {
+      if (lifecycleToken != mBackLifecycleToken
+          || !mExternalResultProducer.isPrepared(preparedRequestId)) return;
+      generation = mDeferredRejectionGeneration++;
+    }
+
+    Runnable rejection = () -> rejectExternalPlayerResult(generation, preparedRequestId);
+    if (!handler.post(rejection)) {
+      // At most one exact prepared request can own this Main instance, so this
+      // fallback is bounded even while its Looper is shutting down.
+      new Thread(rejection, "jumpgate-result-rejection").start();
+    }
+  }
+
+  public synchronized boolean beginExternalPlayerMode(
+      long generation, String requestId, boolean wasStandalone) {
+    ExternalPlayerResultCoordinator.Admission admission =
+        mExternalResultProducer.admitPrepared(generation, requestId);
+    if (admission == null) {
+      Log.e(TAG, "Main: External playback lacked exact prepared request ownership");
+      return true;
+    }
+
+    boolean cancellationRequested = admission.wasCancellationRequested();
     ExternalPlayerResultCoordinator.Owner owner =
         ExternalPlayerResultStore.bindActive(this, requestId, generation);
     if (owner == null) {
@@ -584,54 +732,118 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
           TAG,
           "Main: External playback has no forwarded result owner for generation " + generation);
       mExternalResultProducer.cancelOwner(generation, requestId);
+      cancellationRequested = true;
     } else if (owner.wasCanceled()) {
       mExternalResultProducer.cancelOwner(generation, requestId);
+      cancellationRequested = true;
     }
 
-    mExternalPlaybackGeneration = generation;
     mExternalPlayerMode = true;
     mWasStandalone = wasStandalone;
+    return cancellationRequested;
+  }
+
+  public synchronized boolean isExternalPlayerResultCanceled(long generation, String requestId) {
+    return mExternalResultProducer.isOwnerCanceled(generation, requestId);
+  }
+
+  public synchronized boolean recordEarlyExternalPlayerBack() {
+    return mExternalResultProducer.cancelEarlyBack();
+  }
+
+  public void postExternalPlayerCancellationResult(
+      long generation, String requestId, boolean wasStandalone) {
+    handler.post(
+        () -> exitExternalPlayerMode(generation, requestId, 0, 0, false, wasStandalone));
+  }
+
+  private boolean publishExternalPlayerTerminalOrClearCanceledOwner(
+      ExternalPlayerResultCoordinator.Terminal terminal) {
+    ExternalPlayerResultCoordinator.Owner owner =
+        ExternalPlayerResultStore.readOwner(this, terminal.requestId);
+    if (owner != null
+        && owner.expectedGeneration() == terminal.generation
+        && owner.wasCanceled()) {
+      return ExternalPlayerResultStore.clear(this, terminal.requestId, terminal.generation);
+    }
+    return ExternalPlayerResultStore.publish(this, terminal);
+  }
+
+  private synchronized void terminalizeExternalPlayerResultForTeardown() {
+    String preparedRequestId = mExternalResultProducer.preparedRequestId();
+    if (ExternalPlayerResultCoordinator.isValidRequestId(preparedRequestId))
+      rejectExternalPlayerResult(mDeferredRejectionGeneration++, preparedRequestId);
+
+    long activeGeneration = mExternalResultProducer.activeGeneration();
+    String activeRequestId = mExternalResultProducer.activeRequestId();
+    if (activeGeneration <= 0
+        || !ExternalPlayerResultCoordinator.isValidRequestId(activeRequestId)) return;
+
+    ExternalPlayerResultCoordinator.TerminalReservation reservation =
+        mExternalResultProducer.reserveFinish(
+            activeGeneration,
+            activeRequestId,
+            mLastPlaybackPosition,
+            mLastPlaybackDuration,
+            false,
+            false);
+    if (reservation == null) return;
+
+    ExternalPlayerResultCoordinator.Terminal terminal = reservation.terminal();
+    if (!publishExternalPlayerTerminalOrClearCanceledOwner(terminal)) {
+      reservation.rollback();
+      Log.e(TAG, "Main: Could not persist exact teardown terminal");
+      return;
+    }
+    if (!reservation.commit())
+      throw new IllegalStateException("Exact teardown terminal reservation changed");
   }
 
   public synchronized void supersedeExternalPlayerResult(long generation, String requestId) {
-    ExternalPlayerResultCoordinator.Terminal terminal =
-        mExternalResultProducer.supersede(generation, requestId);
-    if (terminal == null) {
+    ExternalPlayerResultCoordinator.TerminalReservation reservation =
+        mExternalResultProducer.reserveSupersede(generation, requestId);
+    if (reservation == null) {
       Log.d(TAG, "Main: Ignoring stale external player supersession " + generation);
       return;
     }
 
-    if (mExternalResultProducer.isOwnerCanceled(generation, requestId)) {
-      ExternalPlayerResultStore.clear(this, requestId, generation);
-    } else if (!ExternalPlayerResultStore.publish(this, terminal)) {
+    if (!publishExternalPlayerTerminalOrClearCanceledOwner(reservation.terminal())) {
+      reservation.rollback();
       Log.e(TAG, "Main: Could not persist superseded external player result");
+      return;
     }
+    if (!reservation.commit())
+      throw new IllegalStateException("Exact supersession reservation changed");
   }
 
   public synchronized void rejectExternalPlayerResult(long generation, String requestId) {
+    ExternalPlayerResultCoordinator.TerminalReservation reservation =
+        mExternalResultProducer.reservePreparedRejection(generation, requestId);
+    if (reservation == null) {
+      Log.d(TAG, "Main: Ignoring stale prepared rejection " + generation);
+      return;
+    }
+
     ExternalPlayerResultCoordinator.Owner owner =
         ExternalPlayerResultStore.bind(this, requestId, generation);
     if (owner == null) {
+      reservation.rollback();
       Log.e(TAG, "Main: Rejected playback has no exact result owner " + generation);
       return;
     }
     if (owner.wasCanceled()) {
-      ExternalPlayerResultStore.clear(this, requestId, generation);
-      return;
-    }
-
-    ExternalPlayerResultCoordinator.Terminal terminal;
-    try {
-      terminal =
-          new ExternalPlayerResultCoordinator.Terminal(requestId, generation, 0, 0, false, false);
-    } catch (IllegalArgumentException e) {
-      Log.e(TAG, "Main: Ignoring invalid rejected external player result", e);
-      return;
-    }
-
-    if (!ExternalPlayerResultStore.publish(this, terminal)) {
+      if (!ExternalPlayerResultStore.clear(this, requestId, generation)) {
+        reservation.rollback();
+        Log.e(TAG, "Main: Could not clear exact canceled rejected owner " + generation);
+        return;
+      }
+    } else if (!ExternalPlayerResultStore.publish(this, reservation.terminal())) {
+      reservation.rollback();
       Log.e(TAG, "Main: Could not persist rejected external player result");
+      return;
     }
+    if (!reservation.commit())
+      throw new IllegalStateException("Exact prepared rejection reservation changed");
   }
 
   /**
@@ -680,18 +892,48 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
       long durationMs,
       boolean completed,
       boolean wasStandalone) {
-    if (generation != mExternalPlaybackGeneration) {
+    if (generation != mExternalResultProducer.activeGeneration()
+        || !mExternalResultProducer.activeRequestId().equals(requestId)) {
       Log.d(TAG, "Main: Ignoring stale external player result generation " + generation);
       return;
     }
 
-    ExternalPlayerResultCoordinator.Terminal terminal =
-        mExternalResultProducer.finish(
+    ExternalPlayerResultCoordinator.TerminalReservation reservation =
+        mExternalResultProducer.reserveFinish(
             generation, requestId, positionMs, durationMs, completed, !wasStandalone);
-    if (terminal == null) {
+    if (reservation == null) {
       Log.d(TAG, "Main: Ignoring stale external player result generation " + generation);
       return;
     }
+
+    ExternalPlayerResultCoordinator.Owner durableOwner =
+        ExternalPlayerResultStore.readOwner(this, requestId);
+    boolean ownerCanceled = mExternalResultProducer.isOwnerCanceled(generation, requestId);
+    boolean callerAlreadyCanceled =
+        ownerCanceled
+            && durableOwner != null
+            && durableOwner.expectedGeneration() == generation
+            && durableOwner.wasCanceled();
+    boolean canceledExitAcknowledged = false;
+    boolean durable;
+    if (callerAlreadyCanceled) {
+      if (wasStandalone) {
+        durable = ExternalPlayerResultStore.clear(this, requestId, generation);
+      } else {
+        canceledExitAcknowledged =
+            ExternalPlayerResultStore.acknowledgeCanceledExit(this, requestId, generation);
+        durable = canceledExitAcknowledged;
+      }
+    } else {
+      durable = ExternalPlayerResultStore.publish(this, reservation.terminal());
+    }
+    if (!durable) {
+      reservation.rollback();
+      Log.e(TAG, "Main: Could not persist external player result " + generation);
+      return;
+    }
+    if (!reservation.commit())
+      throw new IllegalStateException("Exact external player terminal reservation changed");
 
     Log.d(
         TAG,
@@ -704,27 +946,11 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
             + " wasStandalone="
             + wasStandalone);
 
-    boolean ownerCanceled = mExternalResultProducer.isOwnerCanceled(generation, requestId);
-    boolean canceledExitAcknowledged = false;
-    if (ownerCanceled) {
-      if (wasStandalone) {
-        ExternalPlayerResultStore.clear(this, requestId, generation);
-      } else {
-        canceledExitAcknowledged =
-            ExternalPlayerResultStore.acknowledgeCanceledExit(this, requestId, generation);
-        if (!canceledExitAcknowledged)
-          Log.e(TAG, "Main: Could not persist canceled external-player process exit");
-      }
-    } else if (!ExternalPlayerResultStore.publish(this, terminal)) {
-      Log.e(TAG, "Main: Could not persist external player result " + generation);
-    }
-
     if (wasStandalone) {
       // Warm-transition: return to standalone Kodi.
       // Do NOT finish Main (it stays alive as standalone Kodi).
       // Do NOT kill the process (native engine keeps running).
       mExternalPlayerMode = false;
-      mExternalPlaybackGeneration = 0;
       mExternalResultProducer.clear(generation, requestId);
       mWasStandalone = false;
       // Hide loading overlay so Kodi home screen is visible again
@@ -736,7 +962,7 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
       // can consume the durable terminal.
       mExternalPlayerMode = false;
       finish();
-      if (ownerCanceled && canceledExitAcknowledged)
+      if (callerAlreadyCanceled && canceledExitAcknowledged)
         scheduleExternalPlayerProcessExit(generation, requestId);
     }
   }
@@ -1301,7 +1527,6 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
       in = new FileInputStream(cacheFile);
       BitmapFactory.Options opts = new BitmapFactory.Options();
       opts.inPreferredConfig = Bitmap.Config.RGB_565;
-      opts.inDither = true;
       Bitmap bmp = BitmapFactory.decodeStream(in, null, opts);
       if (bmp != null) {
         cacheFile.setLastModified(now);
@@ -1473,7 +1698,6 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
         in = conn.getInputStream();
         BitmapFactory.Options opts = new BitmapFactory.Options();
         opts.inPreferredConfig = Bitmap.Config.RGB_565;
-        opts.inDither = true;
         bmp = BitmapFactory.decodeStream(in, null, opts);
       } catch (Exception _e) {
         bmp = null;
@@ -1566,7 +1790,7 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
       // Opaque URIs don't support query parameters. Fall through to path parsing.
     } catch (Exception e) {
       // Defensive: title extraction must never crash the player.
-      Log.w(TAG, "Main: Failed to extract title from URI query params: " + uri, e);
+      Log.w(TAG, "Main: Failed to extract title from URI query params", e);
     }
 
     // debridmediamanager.com URLs are frequently opaque token paths; avoid displaying those.
