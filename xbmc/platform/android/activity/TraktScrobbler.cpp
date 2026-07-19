@@ -725,7 +725,7 @@ KODI::JUMPGATE::JumpgateHistorySnapshot TraktScrobbler::GetPlaybackSnapshot(std:
   const auto appPlayer = CServiceBroker::GetAppComponents().GetComponent<CApplicationPlayer>();
   const std::int64_t durationMs = std::max<std::int64_t>(0, appPlayer->GetTotalTime());
   const std::int64_t positionMs = std::max<std::int64_t>(0, appPlayer->GetTime());
-  const double playbackSpeed = appPlayer->GetPlaySpeed();
+  const double playbackSpeed = static_cast<double>(appPlayer->GetPlaySpeed());
   if (nowMs <= 0)
     nowMs = GetMonotonicTimeMs();
   std::int64_t watchedMs = 0;
