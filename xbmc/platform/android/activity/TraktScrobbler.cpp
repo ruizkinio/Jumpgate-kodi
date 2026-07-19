@@ -458,9 +458,10 @@ bool TraktScrobbler::SetClaimedContentInfo(std::uint64_t generation,
   m_contentIdentified = true;
   m_playbackStartTimeMs = 0;
   m_identifyFailed = false;
-  CLog::Log(LOGINFO, informationalTraktAuthority
-                         ? "TraktScrobbler: Canonical Bridge history claim bound"
-                         : "TraktScrobbler: Authenticated claim bound for local-only history");
+  if (informationalTraktAuthority)
+    CLog::Log(LOGINFO, "TraktScrobbler: Canonical Bridge history claim bound");
+  else
+    CLog::Log(LOGINFO, "TraktScrobbler: Authenticated claim bound for local-only history");
   return true;
 }
 
