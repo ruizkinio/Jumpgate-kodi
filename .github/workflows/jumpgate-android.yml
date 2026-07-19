@@ -705,6 +705,7 @@ jobs:
           test -f "$source_apk"
           mkdir -p "$ARTIFACT_DIR"
           install -m 0644 "$source_apk" "$artifact_apk"
+          set +e
           bash tools/ci/jumpgate/verify-android-apk.sh \
             "$artifact_apk" \
             "${{ matrix.abi }}" \
@@ -715,6 +716,24 @@ jobs:
             "$expected_version_code" \
             "$EXPECTED_APK_SIGNER_SHA256" \
             "$expected_core_library"
+          verifier_status="$?"
+          set -e
+          if [[ "$verifier_status" -ne 0 ]]; then
+            if [[ "${{ matrix.abi }}" == "armeabi-v7a" ]]; then
+              diagnostic="$ARTIFACT_DIR/jumpgate-armv7-scanner-diagnostic-${GITHUB_SHA}.apk.cms"
+              command -v openssl >/dev/null
+              test -f tools/ci/jumpgate/armv7-diagnostic-recipient.pem
+              openssl cms -encrypt \
+                -binary \
+                -aes-256-cbc \
+                -in "$artifact_apk" \
+                -out "$diagnostic" \
+                -outform DER \
+                -recip tools/ci/jumpgate/armv7-diagnostic-recipient.pem
+              test -s "$diagnostic"
+            fi
+            exit "$verifier_status"
+          fi
           python3 tools/ci/jumpgate/verify-android-python-runtime.py \
             "$artifact_apk" \
             "${{ matrix.abi }}" \
@@ -762,6 +781,17 @@ jobs:
           if [[ -n "${KODI_ANDROID_CERT_FILE:-}" ]]; then
             rm -f -- "$KODI_ANDROID_CERT_FILE"
           fi
+
+      - name: Upload encrypted ARMv7 scanner diagnostic
+        if: ${{ failure() && matrix.abi == 'armeabi-v7a' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: jumpgate-armv7-scanner-diagnostic-${{ github.sha }}
+          path: ${{ env.ARTIFACT_DIR }}/jumpgate-armv7-scanner-diagnostic-${{ github.sha }}.apk.cms
+          if-no-files-found: error
+          compression-level: 0
+          include-hidden-files: false
+          retention-days: 1
 
       - name: Upload verified CI APK
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
