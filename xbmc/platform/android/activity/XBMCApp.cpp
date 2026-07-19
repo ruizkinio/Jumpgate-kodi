@@ -2600,7 +2600,10 @@ bool CXBMCApp::InitializeJumpgateProfileRuntime()
             *m_jumpgatePlaybackHistoryStorage);
   }
   if (!m_jumpgateCredentialStore)
-    m_jumpgateCredentialStore = std::make_unique<KODI::JUMPGATE::CAndroidJumpgateCredentialStore>();
+  {
+    m_jumpgateCredentialStore =
+        std::make_unique<KODI::JUMPGATE::CAndroidJumpgateCredentialStore>(*this);
+  }
   if (!m_jumpgateProfileRuntime)
   {
     m_jumpgateProfileRuntime = std::make_unique<KODI::JUMPGATE::CJumpgateProfileRuntime>(

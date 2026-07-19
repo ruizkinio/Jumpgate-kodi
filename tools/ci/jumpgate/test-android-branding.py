@@ -40,6 +40,22 @@ JNI_MAIN_HEADER = (
 JNI_MAIN_SOURCE = (
     ROOT / "xbmc" / "platform" / "android" / "activity" / "JNIMainActivity.cpp"
 )
+CREDENTIAL_STORE_HEADER = (
+    ROOT
+    / "xbmc"
+    / "platform"
+    / "android"
+    / "activity"
+    / "AndroidJumpgateCredentialStore.h"
+)
+CREDENTIAL_STORE_SOURCE = (
+    ROOT
+    / "xbmc"
+    / "platform"
+    / "android"
+    / "activity"
+    / "AndroidJumpgateCredentialStore.cpp"
+)
 WIN_SYSTEM = ROOT / "xbmc" / "windowing" / "android" / "WinSystemAndroid.cpp"
 BACK_COORDINATOR_HEADER = ROOT / "xbmc" / "utils" / "JumpgateBackCoordinator.h"
 BACK_COORDINATOR_SOURCE = ROOT / "xbmc" / "utils" / "JumpgateBackCoordinator.cpp"
@@ -1241,6 +1257,46 @@ def verify_uri_logging_privacy():
         raise AssertionError("title extraction logs the complete private media URI")
 
 
+def verify_credential_context_wiring():
+    header = CREDENTIAL_STORE_HEADER.read_text(encoding="utf-8")
+    source = CREDENTIAL_STORE_SOURCE.read_text(encoding="utf-8")
+    app_source = APP_SOURCE.read_text(encoding="utf-8")
+
+    for contract in (
+        "explicit CAndroidJumpgateCredentialStore(const CJNIContext& context);",
+        "jni::jhobject m_context;",
+    ):
+        if contract not in header:
+            raise AssertionError(f"Android credential store is missing {contract!r}")
+    for contract in (
+        "CAndroidJumpgateCredentialStore::CAndroidJumpgateCredentialStore(",
+        ": m_context(context.get_raw())",
+        "m_context.setGlobal();",
+    ):
+        if contract not in source:
+            raise AssertionError(
+                f"Android credential context binding is missing {contract!r}"
+            )
+    if source.count("const jhobject& context = m_context;") != 3:
+        raise AssertionError(
+            "Android credential operations are not bound to the injected context"
+        )
+    if "GetAppInstance" in source:
+        raise AssertionError(
+            "Android credential store uses the retired global app accessor"
+        )
+    initialization = extract_braced_block(
+        app_source, "bool CXBMCApp::InitializeJumpgateProfileRuntime()"
+    )
+    if (
+        "std::make_unique<KODI::JUMPGATE::CAndroidJumpgateCredentialStore>(*this)"
+        not in initialization
+    ):
+        raise AssertionError(
+            "CXBMCApp does not inject its exact JNI context into the credential store"
+        )
+
+
 def extract_braced_block(source, anchor):
     start = source.find(anchor)
     if start < 0:
@@ -2207,6 +2263,7 @@ def main(arguments):
     verify_host_policy_regressions()
     host_test_count = verify_jumpgate_host_test_policy()
     verify_uri_logging_privacy()
+    verify_credential_context_wiring()
     verify_back_lifecycle_rejection_contract()
     verify_native_back_wiring()
     print(

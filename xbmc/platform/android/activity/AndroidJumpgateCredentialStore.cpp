@@ -9,7 +9,6 @@
 #include "AndroidJumpgateCredentialStore.h"
 
 #include "CompileInfo.h"
-#include "JNIMainActivity.h"
 
 #include <androidjni/Context.h>
 #include <androidjni/jutils-details.hpp>
@@ -29,13 +28,13 @@ jhclass CredentialStoreClass()
   return CJNIContext::getClassLoader().loadClass(className);
 }
 
-jhobject ActivityContext()
-{
-  CJNIMainActivity* activity = CJNIMainActivity::GetAppInstance();
-  return activity ? activity->CJNIContext::get_raw() : jhobject{};
-}
-
 } // namespace
+
+CAndroidJumpgateCredentialStore::CAndroidJumpgateCredentialStore(const CJNIContext& context)
+  : m_context(context.get_raw())
+{
+  m_context.setGlobal();
+}
 
 bool CAndroidJumpgateCredentialStore::Store(const std::string& profileId,
                                             const std::string& deviceId,
@@ -45,7 +44,7 @@ bool CAndroidJumpgateCredentialStore::Store(const std::string& profileId,
 {
   credentialRef.clear();
   error.clear();
-  const jhobject context = ActivityContext();
+  const jhobject& context = m_context;
   if (!context)
   {
     error = "Android credential context is unavailable";
@@ -83,7 +82,7 @@ bool CAndroidJumpgateCredentialStore::Load(const std::string& profileId,
 {
   secretJson.clear();
   error.clear();
-  const jhobject context = ActivityContext();
+  const jhobject& context = m_context;
   if (!context)
   {
     error = "Android credential context is unavailable";
@@ -116,7 +115,7 @@ bool CAndroidJumpgateCredentialStore::Load(const std::string& profileId,
 bool CAndroidJumpgateCredentialStore::Remove(const std::string& credentialRef, std::string& error)
 {
   error.clear();
-  const jhobject context = ActivityContext();
+  const jhobject& context = m_context;
   if (!context)
   {
     error = "Android credential context is unavailable";

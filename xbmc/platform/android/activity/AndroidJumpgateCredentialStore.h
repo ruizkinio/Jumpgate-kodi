@@ -10,12 +10,18 @@
 
 #include "utils/JumpgateProfileStore.h"
 
+#include <androidjni/jutils-details.hpp>
+
+class CJNIContext;
+
 namespace KODI::JUMPGATE
 {
 
 class CAndroidJumpgateCredentialStore final : public IJumpgateCredentialStore
 {
 public:
+  explicit CAndroidJumpgateCredentialStore(const CJNIContext& context);
+
   bool Store(const std::string& profileId,
              const std::string& deviceId,
              const std::string& secretJson,
@@ -27,6 +33,9 @@ public:
             std::string& secretJson,
             std::string& error) override;
   bool Remove(const std::string& credentialRef, std::string& error) override;
+
+private:
+  jni::jhobject m_context;
 };
 
 } // namespace KODI::JUMPGATE
