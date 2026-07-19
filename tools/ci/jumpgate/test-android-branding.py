@@ -1488,7 +1488,7 @@ def verify_native_back_wiring():
     for contract in (
         "SetExternalMode(m_jumpgateBackLifecycleToken, mode)",
         "SetWindowReady(m_jumpgateBackLifecycleToken, ready)",
-        "GetJumpgateBackLifecycleToken(nativeActivity)",
+        "jni::CJNIMainActivity::GetJumpgateBackLifecycleToken(nativeActivity)",
     ):
         if contract not in app_source:
             raise AssertionError(

@@ -471,7 +471,8 @@ CXBMCApp::CXBMCApp(ANativeActivity* nativeActivity, IInputHandler& inputHandler)
     return;
   }
 
-  m_jumpgateBackLifecycleToken = GetJumpgateBackLifecycleToken(nativeActivity);
+  m_jumpgateBackLifecycleToken =
+      jni::CJNIMainActivity::GetJumpgateBackLifecycleToken(nativeActivity);
   if (m_jumpgateBackLifecycleToken ==
       KODI::JUMPGATE::CJumpgateBackDispatcher::INVALID_LIFECYCLE_TOKEN)
   {
