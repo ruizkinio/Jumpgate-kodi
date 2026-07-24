@@ -601,6 +601,32 @@ expect_failure_diagnostic_without_value() {
   fi
 }
 
+expect_failure_phase_diagnostic() {
+  local label="$1"
+  local apk="$2"
+  local abi="$3"
+  local expected_phase="$4"
+  local output status diagnostic
+  shift 4
+  set +e
+  output="$(verify_apk "$apk" "$abi" "$@" 2>&1)"
+  status="$?"
+  set -e
+  if [[ "$status" -eq 0 ]]; then
+    echo "Expected verifier failure: $label" >&2
+    exit 1
+  fi
+  diagnostic="JUMPGATE_APK_SCAN_REJECT {\"phase\":\"$expected_phase\"}"
+  if ! grep -Fqx -- "$diagnostic" <<< "$output"; then
+    echo "Verifier omitted the sanitized phase diagnostic: $label" >&2
+    exit 1
+  fi
+  if [[ "$output" == *'Traceback (most recent call last)'* ]]; then
+    echo "Verifier disclosed a scanner traceback: $label" >&2
+    exit 1
+  fi
+}
+
 expect_failure_without_diagnostic() {
   local label="$1"
   local apk="$2"
@@ -829,6 +855,112 @@ verify_apk "$armv7_apk" armeabi-v7a >/dev/null
 grep -Fxq 'libhelper.so' "$readelf_log"
 grep -Fxq "$expected_core_library" "$readelf_log"
 test -s "$armv7_apk.sha256"
+
+verify_apk "$arm64_apk" arm64-v8a \
+  JUMPGATE_TEST_OPENPGP_WORK=500000 >/dev/null
+expect_failure_phase_diagnostic \
+  openpgp-work-budget-500001 \
+  "$arm64_apk" \
+  arm64-v8a \
+  'openpgp-work-budget-probe' \
+  JUMPGATE_TEST_OPENPGP_WORK=500001
+verify_apk "$arm64_apk" arm64-v8a \
+  JUMPGATE_TEST_OPENPGP_COPY_WORK=exact >/dev/null
+expect_failure_phase_diagnostic \
+  openpgp-copy-budget \
+  "$arm64_apk" \
+  arm64-v8a \
+  'openpgp-copy-budget-probe' \
+  JUMPGATE_TEST_OPENPGP_COPY_WORK=overflow
+
+openpgp_cross_packet_work="$work_dir/openpgp-cross-packet-work"
+copy_fixture "$base_arm64" "$openpgp_cross_packet_work"
+python3 - \
+  "$openpgp_cross_packet_work/assets/fixed-candidates-a.pgp" \
+  "$openpgp_cross_packet_work/assets/fixed-candidates-b.pgp" <<'PY'
+import pathlib
+import sys
+
+candidate = bytes((0xC5, 6, 4, 0, 0, 0, 0, 0))
+pathlib.Path(sys.argv[1]).write_bytes(candidate * 250_000)
+pathlib.Path(sys.argv[2]).write_bytes(candidate * 250_001)
+PY
+openpgp_cross_packet_work_apk="$work_dir/openpgp-cross-packet-work.apk"
+make_apk "$openpgp_cross_packet_work" "$openpgp_cross_packet_work_apk"
+expect_failure_reason \
+  openpgp-cross-packet-work \
+  "$openpgp_cross_packet_work_apk" \
+  arm64-v8a \
+  'private signing, deployment, or runtime secret material'
+
+openpgp_prefilter_spam="$work_dir/openpgp-prefilter-spam"
+copy_fixture "$base_arm64" "$openpgp_prefilter_spam"
+python3 - "$openpgp_prefilter_spam/assets/nonsemantic-candidates.pgp" <<'PY'
+import pathlib
+import sys
+
+candidate = bytes((0xC5, 1, 2))
+pathlib.Path(sys.argv[1]).write_bytes(candidate * 500_001)
+PY
+openpgp_prefilter_spam_apk="$work_dir/openpgp-prefilter-spam.apk"
+make_apk "$openpgp_prefilter_spam" "$openpgp_prefilter_spam_apk"
+verify_apk "$openpgp_prefilter_spam_apk" arm64-v8a \
+  JUMPGATE_TEST_OPENPGP_EXPECT_OPERATIONS=0 \
+  JUMPGATE_TEST_OPENPGP_EXPECT_COPIED_BYTES=0 >/dev/null
+
+openpgp_fixed_overlap="$work_dir/openpgp-fixed-overlap"
+copy_fixture "$base_arm64" "$openpgp_fixed_overlap"
+python3 - "$openpgp_fixed_overlap/assets/fixed-overlap-candidates.pgp" <<'PY'
+import pathlib
+import sys
+
+def mpi(bits: int, value: bytes) -> bytes:
+    return bits.to_bytes(2, 'big') + value
+
+
+public = (
+    b'\x04' + b'\x00' * 4 + b'\x01' +
+    mpi(512, b'\x80' + b'\x01' * 63) +
+    mpi(17, b'\x01\x00\x01')
+)
+# Every candidate reaches a valid RSA public layout. The invalid protection
+# octet keeps it non-secret, while the fixed body extends over later frames.
+candidate = b'\xC5\xFF' + (128 * 1024).to_bytes(4, 'big') + public + b'\x0E'
+pathlib.Path(sys.argv[1]).write_bytes(
+    candidate * 10_000 + b'\x00' * (128 * 1024)
+)
+PY
+openpgp_fixed_overlap_apk="$work_dir/openpgp-fixed-overlap.apk"
+make_apk "$openpgp_fixed_overlap" "$openpgp_fixed_overlap_apk"
+verify_apk "$openpgp_fixed_overlap_apk" arm64-v8a \
+  JUMPGATE_TEST_OPENPGP_EXPECT_OPERATIONS=10000 \
+  JUMPGATE_TEST_OPENPGP_EXPECT_COPIED_BYTES=0 >/dev/null
+
+openpgp_partial_overlap="$work_dir/openpgp-partial-overlap"
+copy_fixture "$base_arm64" "$openpgp_partial_overlap"
+python3 - "$openpgp_partial_overlap/assets/partial-overlap-candidates.pgp" <<'PY'
+import pathlib
+import sys
+
+def mpi(bits: int, value: bytes) -> bytes:
+    return bits.to_bytes(2, 'big') + value
+
+
+public = (
+    b'\x04' + b'\x00' * 4 + b'\x01' +
+    mpi(512, b'\x80' + b'\x01' * 63) +
+    mpi(17, b'\x01\x00\x01')
+)
+# Every semantic candidate spans the remaining bounded source window and
+# reaches the segmented slice path twice in the recoverable-field layout check.
+candidate = b'\xC5\xFE' + public + b'\x0E'
+pathlib.Path(sys.argv[1]).write_bytes(candidate * 10_000)
+PY
+openpgp_partial_overlap_apk="$work_dir/openpgp-partial-overlap.apk"
+make_apk "$openpgp_partial_overlap" "$openpgp_partial_overlap_apk"
+verify_apk "$openpgp_partial_overlap_apk" arm64-v8a \
+  JUMPGATE_TEST_OPENPGP_EXPECT_OPERATIONS=20000 \
+  JUMPGATE_TEST_OPENPGP_EXPECT_COPIED_BYTES=40000 >/dev/null
 
 set +e
 invalid_core_output="$(
@@ -1307,6 +1439,13 @@ openpgp_packet="$work_dir/openpgp-secret-key.pgp"
 openpgp_old_packet="$work_dir/openpgp-old-indeterminate.pgp"
 openpgp_partial_packet="$work_dir/openpgp-partial.pgp"
 openpgp_malformed_partial="$work_dir/openpgp-malformed-partial.pgp"
+openpgp_partial_subkey_collision="$work_dir/openpgp-partial-subkey-collision.pgp"
+openpgp_partial_subkey_complete="$work_dir/openpgp-partial-subkey-complete.pgp"
+openpgp_partial_subkey_recoverable="$work_dir/openpgp-partial-subkey-recoverable.pgp"
+openpgp_partial_subkey_no_checksum="$work_dir/openpgp-partial-subkey-no-checksum.pgp"
+openpgp_partial_subkey_one_checksum="$work_dir/openpgp-partial-subkey-one-checksum.pgp"
+openpgp_partial_subkey_complete_variants="$work_dir/openpgp-partial-subkey-complete-variants"
+openpgp_fixed_subkey_control="$work_dir/openpgp-fixed-subkey-control.pgp"
 openpgp_nonsecret_partial="$work_dir/openpgp-nonsecret-partial.pgp"
 openpgp_dex_collision="$work_dir/openpgp-dex-collision.bin"
 openpgp_ec_malformed="$work_dir/openpgp-ec-malformed.pgp"
@@ -1318,7 +1457,17 @@ openpgp_ec_sha224="$work_dir/openpgp-ec-sha224.pgp"
 openpgp_ec_malformed_kdf="$work_dir/openpgp-ec-malformed-kdf.pgp"
 openpgp_ec_standard_variants="$work_dir/openpgp-ec-standard-variants"
 openpgp_ec_control_variants="$work_dir/openpgp-ec-control-variants"
-mkdir -p "$openpgp_ec_standard_variants" "$openpgp_ec_control_variants"
+openpgp_version_controls="$work_dir/openpgp-version-controls"
+openpgp_v6_pass_controls="$work_dir/openpgp-v6-pass-controls"
+openpgp_byte_cap_controls="$work_dir/openpgp-byte-cap-controls"
+openpgp_max_fragmentation="$work_dir/openpgp-max-fragmentation.pgp"
+mkdir -p \
+  "$openpgp_ec_standard_variants" \
+  "$openpgp_ec_control_variants" \
+  "$openpgp_partial_subkey_complete_variants" \
+  "$openpgp_version_controls" \
+  "$openpgp_v6_pass_controls" \
+  "$openpgp_byte_cap_controls"
 python3 - \
   "$openpgp_private_key/assets/private-key.asc" \
   "$openpgp_packet" \
@@ -1335,7 +1484,18 @@ python3 - \
   "$openpgp_ec_sha224" \
   "$openpgp_ec_malformed_kdf" \
   "$openpgp_ec_standard_variants" \
-  "$openpgp_ec_control_variants" <<'PY'
+  "$openpgp_ec_control_variants" \
+  "$openpgp_partial_subkey_collision" \
+  "$openpgp_partial_subkey_complete" \
+  "$openpgp_partial_subkey_recoverable" \
+  "$openpgp_partial_subkey_no_checksum" \
+  "$openpgp_partial_subkey_one_checksum" \
+  "$openpgp_partial_subkey_complete_variants" \
+  "$openpgp_fixed_subkey_control" \
+  "$openpgp_version_controls" \
+  "$openpgp_v6_pass_controls" \
+  "$openpgp_byte_cap_controls" \
+  "$openpgp_max_fragmentation" <<'PY'
 import base64
 import pathlib
 import sys
@@ -1360,6 +1520,21 @@ def crc24(data: bytes) -> int:
             if crc & 0x1000000:
                 crc ^= 0x1864CFB
     return crc & 0xFFFFFF
+
+
+def private_key_armor(packet: bytes) -> bytes:
+    encoded = base64.b64encode(packet)
+    lines = [encoded[index:index + 64] for index in range(0, len(encoded), 64)]
+    checksum = base64.b64encode(crc24(packet).to_bytes(3, 'big'))
+    boundary = b'-' * 5
+    return b'\n'.join([
+        boundary + b'BEGIN PGP PRIVATE KEY BLOCK' + boundary,
+        b'',
+        *lines,
+        b'=' + checksum,
+        boundary + b'END PGP PRIVATE KEY BLOCK' + boundary,
+        b'',
+    ])
 
 
 def partial_packet(tag: int, value: bytes, chunk_size: int = 64) -> bytes:
@@ -1391,11 +1566,108 @@ def fixed_packet(tag: int, value: bytes) -> bytes:
     return bytes([0xC0 | tag]) + length + value
 
 
+def overdeclared_fixed_packet(tag: int, value: bytes) -> bytes:
+    declared_length = len(value) + 1
+    if declared_length >= 192:
+        raise ValueError('overdeclared fixture needs one-octet length')
+    return bytes([0xC0 | tag, declared_length]) + value
+
+
+def old_fixed_packet(tag: int, declared_length: int, value: bytes) -> bytes:
+    if not 0 <= tag <= 15 or not 0 <= declared_length <= 0xFFFFFFFF:
+        raise ValueError('invalid old-format fixture')
+    if declared_length <= 0xFF:
+        length_type = 0
+        length = declared_length.to_bytes(1, 'big')
+    elif declared_length <= 0xFFFF:
+        length_type = 1
+        length = declared_length.to_bytes(2, 'big')
+    else:
+        length_type = 2
+        length = declared_length.to_bytes(4, 'big')
+    return bytes([0x80 | (tag << 2) | length_type]) + length + value
+
+
+def rsa_public(version: int, modulus: int, exponent: int) -> bytes:
+    material = mpi(modulus) + mpi(exponent)
+    if version == 3:
+        return b'\x03' + (0).to_bytes(4, 'big') + b'\x00\x00\x01' + material
+    if version == 4:
+        return b'\x04' + (0).to_bytes(4, 'big') + b'\x01' + material
+    if version == 6:
+        return (
+            b'\x06' + (0).to_bytes(4, 'big') + b'\x01' +
+            len(material).to_bytes(4, 'big') + material
+        )
+    raise ValueError('unsupported fixture key version')
+
+
+def dsa_public(
+    version: int, prime: int, subgroup: int, generator: int, value: int
+) -> bytes:
+    material = mpi(prime) + mpi(subgroup) + mpi(generator) + mpi(value)
+    prefix = bytes([version]) + (0).to_bytes(4, 'big') + b'\x11'
+    if version == 4:
+        return prefix + material
+    if version == 6:
+        return prefix + len(material).to_bytes(4, 'big') + material
+    raise ValueError('unsupported DSA fixture version')
+
+
+def elgamal_public(
+    version: int, prime: int, generator: int, value: int, algorithm: int = 16
+) -> bytes:
+    if algorithm not in {16, 20}:
+        raise ValueError('unsupported ElGamal fixture algorithm')
+    material = mpi(prime) + mpi(generator) + mpi(value)
+    if version == 4:
+        return (
+            b'\x04' + (0).to_bytes(4, 'big') + bytes([algorithm]) + material
+        )
+    if version == 6:
+        return (
+            b'\x06' + (0).to_bytes(4, 'big') + bytes([algorithm]) +
+            len(material).to_bytes(4, 'big') + material
+        )
+    raise ValueError('unsupported ElGamal fixture version')
+
+
+def private_algorithm_public(version: int, algorithm: int, material: bytes) -> bytes:
+    if not 100 <= algorithm <= 110:
+        raise ValueError('fixture algorithm is not private-use')
+    prefix = bytes([version]) + (0).to_bytes(4, 'big') + bytes([algorithm])
+    if version == 4:
+        return prefix + material
+    if version == 6:
+        return prefix + len(material).to_bytes(4, 'big') + material
+    raise ValueError('unsupported private-use fixture version')
+
+
+def native_public(version: int, algorithm: int, material: bytes) -> bytes:
+    prefix = bytes([version]) + (0).to_bytes(4, 'big') + bytes([algorithm])
+    if version == 4:
+        return prefix + material
+    if version == 6:
+        return prefix + len(material).to_bytes(4, 'big') + material
+    raise ValueError('unsupported native-key fixture version')
+
+
+def ec_public_version(
+    version: int, algorithm: int, oid: bytes, point: bytes, kdf: bytes = b''
+) -> bytes:
+    if algorithm not in {18, 19, 22} or not 0 < len(oid) <= 255:
+        raise ValueError('invalid EC fixture')
+    material = bytes([len(oid)]) + oid + mpi_bytes(point) + kdf
+    prefix = bytes([version]) + (0).to_bytes(4, 'big') + bytes([algorithm])
+    if version == 4:
+        return prefix + material
+    if version == 6:
+        return prefix + len(material).to_bytes(4, 'big') + material
+    raise ValueError('unsupported EC fixture version')
+
+
 def ec_public(oid: bytes, point: bytes, kdf: bytes) -> bytes:
-    return (
-        b'\x04' + (0).to_bytes(4, 'big') + b'\x12' + bytes([len(oid)]) +
-        oid + mpi_bytes(point) + kdf
-    )
+    return ec_public_version(4, 18, oid, point, kdf)
 
 
 def truncated_old_secret_packet(public: bytes) -> bytes:
@@ -1415,7 +1687,13 @@ d = (1 << 510) + 0x23457
 p = (1 << 255) + 0x34567
 q = (1 << 255) + 0x45679
 u = (1 << 254) + 0x56789
-public = b'\x04' + (0).to_bytes(4, 'big') + b'\x01' + mpi(n) + mpi(e)
+elgamal_prime = (1 << 1023) + 0xC5D7
+elgamal_generator = 2
+elgamal_secret_value = (1 << 255) + 0x6A5B
+elgamal_public_value = pow(
+    elgamal_generator, elgamal_secret_value, elgamal_prime
+)
+public = rsa_public(4, n, e)
 secret = mpi(d) + mpi(p) + mpi(q) + mpi(u)
 body = public + b'\x00' + secret + (sum(secret) & 0xFFFF).to_bytes(2, 'big')
 if len(body) < 192:
@@ -1505,6 +1783,881 @@ control_variants = {
 control_dir = pathlib.Path(sys.argv[16])
 for name, variant_public in control_variants.items():
     (control_dir / f'{name}.bin').write_bytes(truncated_old_secret_packet(variant_public))
+
+# This tag-7, 2^30 partial-length prefix reproduces the incomplete ARMv7
+# executable-code collision without copying candidate bytes. Complete and
+# recoverable private bodies remain rejection controls despite invalid framing.
+pathlib.Path(sys.argv[17]).write_bytes(
+    bytes([0xC0 | 7, 224 + 30]) + body[:128]
+)
+pathlib.Path(sys.argv[18]).write_bytes(partial_packet(7, body))
+pathlib.Path(sys.argv[19]).write_bytes(
+    bytes([0xC0 | 7, 224 + 30]) + body + b'non-packet trailing data'
+)
+pathlib.Path(sys.argv[20]).write_bytes(
+    bytes([0xC0 | 7, 224 + 30]) + body[:-2]
+)
+pathlib.Path(sys.argv[21]).write_bytes(
+    bytes([0xC0 | 7, 224 + 30]) + body[:-1]
+)
+complete_variant_dir = pathlib.Path(sys.argv[22])
+for name, variant_body in {
+    'no-checksum': body[:-2],
+    'one-checksum': body[:-1],
+    'zero-checksum': body[:-2] + b'\x00\x00',
+    'trailing': body + b'non-packet trailing data',
+}.items():
+    (complete_variant_dir / f'{name}.pgp').write_bytes(
+        partial_packet(7, variant_body)
+    )
+(complete_variant_dir / 'over-128-one-byte-chunks.pgp').write_bytes(
+    partial_packet(7, body, chunk_size=1)
+)
+pathlib.Path(sys.argv[23]).write_bytes(fixed_packet(7, body))
+
+version_control_dir = pathlib.Path(sys.argv[24])
+v6_pass_control_dir = pathlib.Path(sys.argv[25])
+byte_cap_control_dir = pathlib.Path(sys.argv[26])
+
+def write_rejection_matrix(name: str, key_body: bytes) -> None:
+    for tag in (5, 7):
+        for framing, encode in (('fixed', fixed_packet), ('partial', partial_packet)):
+            output = f'{name}-{framing}-tag{tag}.pgp'
+            (version_control_dir / output).write_bytes(encode(tag, key_body))
+
+
+reclassified_rejection_count = 0
+
+
+def write_reclassified_rejection_matrix(name: str, key_body: bytes) -> None:
+    global reclassified_rejection_count
+    write_rejection_matrix(name, key_body)
+    reclassified_rejection_count += 4
+
+
+def write_fixed_rejection(name: str, key_body: bytes, tag: int = 5) -> None:
+    output = f'{name}-fixed-tag{tag}.pgp'
+    (version_control_dir / output).write_bytes(fixed_packet(tag, key_body))
+
+
+version_bodies = {}
+for version in (3, 4, 6):
+    version_public = rsa_public(version, n, e)
+    checksum = (
+        (sum(secret) & 0xFFFF).to_bytes(2, 'big')
+        if version in {3, 4} else b''
+    )
+    version_body = version_public + b'\x00' + secret + checksum
+    version_bodies[version] = version_body
+    write_rejection_matrix(f'v{version}-unprotected', version_body)
+
+    if version in {3, 4}:
+        boundary_variants = {
+            'no-checksum': version_body[:-2],
+            'one-checksum': version_body[:-1],
+            'zero-checksum': version_body[:-2] + b'\x00\x00',
+            'trailing-data': version_body + b'isolated trailing data',
+        }
+    else:
+        boundary_variants = {
+            'trailing-data': version_body + b'isolated trailing data',
+        }
+    for variant_name, variant_body in boundary_variants.items():
+        for tag in (5, 7):
+            write_fixed_rejection(
+                f'v{version}-unprotected-{variant_name}', variant_body, tag
+            )
+
+    for tag in (5, 7):
+        secret_boundary = len(version_public) + 3
+        underdeclared = version_body[:secret_boundary]
+        remaining = version_body[secret_boundary:]
+        (version_control_dir / f'v{version}-underdeclared-new-tag{tag}.pgp').write_bytes(
+            fixed_packet(tag, underdeclared) + remaining
+        )
+        (version_control_dir / f'v{version}-underdeclared-old-tag{tag}.pgp').write_bytes(
+            old_fixed_packet(tag, len(underdeclared), version_body)
+        )
+        (version_control_dir / f'v{version}-underdeclared-partial-tag{tag}.pgp').write_bytes(
+            partial_packet(tag, underdeclared) + remaining
+        )
+        (version_control_dir / f'v{version}-zero-outer-length-tag{tag}.pgp').write_bytes(
+            bytes((0xC0 | tag, 0)) + version_body
+        )
+        (version_control_dir / f'v{version}-public-only-outer-length-tag{tag}.pgp').write_bytes(
+            fixed_packet(tag, version_public) + version_body[len(version_public):]
+        )
+
+# OpenPGP MPIs are structural fields, not a cryptographic-strength policy. Keys
+# below historical size floors and unusual values must still be recognized.
+for version in (4, 6):
+    dsa_secret = mpi(7)
+    elgamal_policy_secret = mpi(11)
+    policy_bodies = {
+        'rsa-low-modulus': (
+            rsa_public(version, (1 << 127) + 0x123, e), secret
+        ),
+        'rsa-large-exponent': (
+            rsa_public(version, n, (1 << 64) + 3), secret
+        ),
+        'dsa-below-old-floors': (
+            dsa_public(version, (1 << 127) + 5, (1 << 79) + 3, 2, 3),
+            dsa_secret,
+        ),
+        'elgamal-below-old-floor-and-range': (
+            elgamal_public(version, 127, 131, 137), elgamal_policy_secret
+        ),
+    }
+    for policy_name, (policy_public, policy_secret) in policy_bodies.items():
+        policy_checksum = (
+            (sum(policy_secret) & 0xFFFF).to_bytes(2, 'big')
+            if version == 4 else b''
+        )
+        write_rejection_matrix(
+            f'v{version}-{policy_name}',
+            policy_public + b'\x00' + policy_secret + policy_checksum,
+        )
+
+# Complete EC secret packets are classified by their length-delimited shape,
+# not by curve-size policy. The strict malformed-binary heuristic remains
+# separately bounded below.
+standard_oid = bytes.fromhex('2A8648CE3D030107')
+standard_point = b'\x04' + b'\x11' * 64
+ec_policy_variants = {
+    'ecdh-short-oid': (18, b'\x2a', standard_point, b'\x03\x01\x08\x07'),
+    'ecdsa-long-oid': (19, b'\x2a' + b'\x01' * 39, standard_point, b''),
+    'legacy-eddsa-short-point': (22, standard_oid, b'\x04\x01', b''),
+    'ecdsa-oversized-point': (
+        19, standard_oid, b'\x04' + b'\x01' * 140, b''
+    ),
+    'ecdh-short-kdf': (18, standard_oid, standard_point, b'\x01\x00'),
+}
+ec_policy_secret = mpi(5)
+for version in (4, 6):
+    ec_checksum = (
+        (sum(ec_policy_secret) & 0xFFFF).to_bytes(2, 'big')
+        if version == 4 else b''
+    )
+    for name, (algorithm, oid, point, kdf) in ec_policy_variants.items():
+        ec_policy_public = ec_public_version(
+            version, algorithm, oid, point, kdf
+        )
+        ec_policy_body = (
+            ec_policy_public + b'\x00' + ec_policy_secret + ec_checksum
+        )
+        write_fixed_rejection(f'v{version}-{name}', ec_policy_body)
+        write_fixed_rejection(f'v{version}-{name}', ec_policy_body, 7)
+for name, (algorithm, oid, point, kdf) in ec_policy_variants.items():
+    malformed = truncated_old_secret_packet(
+        ec_public_version(4, algorithm, oid, point, kdf)
+    )
+    (v6_pass_control_dir / f'{name}-malformed-after-binary-noise.pgp').write_bytes(
+        b'\x00opaque-binary-prefix\x01' + malformed
+    )
+
+# Private-use public-key algorithms have vendor-defined material layouts. A
+# complete secret-key packet at the file root or in a valid packet stream is
+# authoritative without guessing those layouts.
+private_algorithm_packets = {}
+for algorithm in range(100, 111):
+    for version in (4, 6):
+        private_body = (
+            private_algorithm_public(version, algorithm, b'\x42' * 8) +
+            b'\x00\x51\x52\x53'
+        )
+        packet = fixed_packet(5, private_body)
+        private_algorithm_packets[(version, algorithm)] = packet
+        write_fixed_rejection(
+            f'v{version}-private-algorithm-{algorithm}', private_body
+        )
+        write_fixed_rejection(
+            f'v{version}-private-algorithm-{algorithm}', private_body, 7
+        )
+for algorithm in (100, 110):
+    packet = private_algorithm_packets[(6, algorithm)]
+    for prefix_tag in (11, 60, 63):
+        (version_control_dir / (
+            f'v6-private-algorithm-{algorithm}-after-tag{prefix_tag}.pgp'
+        )).write_bytes(
+            fixed_packet(prefix_tag, b'benign-openpgp-prefix') + packet
+        )
+    (v6_pass_control_dir / (
+        f'v6-private-algorithm-{algorithm}-after-binary-noise.pgp'
+    )).write_bytes(b'\x00opaque-binary-prefix\x01' + packet)
+
+weak_malformed_public = rsa_public(
+    4, (1 << 127) + 0x123, (1 << 64) + 3
+)
+weak_malformed_packet = old_fixed_packet(
+    5, len(weak_malformed_public) + 32, weak_malformed_public
+)
+(version_control_dir / 'weak-rsa-malformed-root.pgp').write_bytes(
+    weak_malformed_packet
+)
+(v6_pass_control_dir / 'weak-rsa-malformed-after-binary-noise.pgp').write_bytes(
+    b'\x00opaque-binary-prefix\x01' + weak_malformed_packet
+)
+weak_unprotected_body = (
+    weak_malformed_public + b'\x00' + secret +
+    (sum(secret) & 0xFFFF).to_bytes(2, 'big')
+)
+weak_underdeclared_packet = (
+    fixed_packet(5, weak_malformed_public) +
+    weak_unprotected_body[len(weak_malformed_public):]
+)
+(version_control_dir / 'weak-rsa-underdeclared-root.pgp').write_bytes(
+    weak_underdeclared_packet
+)
+(v6_pass_control_dir / 'weak-rsa-underdeclared-after-binary-noise.pgp').write_bytes(
+    b'\x00opaque-binary-prefix\x01' + weak_underdeclared_packet
+)
+
+# The outer five-octet framing match starts two bytes before a complete old
+# indeterminate packet. Prefilter matches must overlap or the inner key is skipped.
+overlapping_body = bytearray(version_bodies[4])
+overlapping_body[3] = 4  # Also makes the outer candidate's body version-shaped.
+(version_control_dir / 'overlapping-prefilter-old-tag5.pgp').write_bytes(
+    b'\xC5\xFF\x97' + overlapping_body
+)
+
+elgamal_public_keys = {}
+elgamal_secret = mpi(elgamal_secret_value)
+for version in (4, 6):
+    public_key = elgamal_public(
+        version, elgamal_prime, elgamal_generator, elgamal_public_value
+    )
+    elgamal_public_keys[version] = public_key
+    checksum = (
+        (sum(elgamal_secret) & 0xFFFF).to_bytes(2, 'big')
+        if version == 4 else b''
+    )
+    write_rejection_matrix(
+        f'v{version}-elgamal-unprotected',
+        public_key + b'\x00' + elgamal_secret + checksum,
+    )
+
+elgamal20_public = elgamal_public(
+    4,
+    elgamal_prime,
+    elgamal_generator,
+    elgamal_public_value,
+    algorithm=20,
+)
+elgamal20_body = (
+    elgamal20_public + b'\x00' + elgamal_secret +
+    (sum(elgamal_secret) & 0xFFFF).to_bytes(2, 'big')
+)
+write_rejection_matrix('v4-elgamal20-unprotected', elgamal20_body)
+(version_control_dir / 'v4-elgamal20-armored.pgp').write_bytes(
+    private_key_armor(fixed_packet(5, elgamal20_body))
+)
+
+native_sizes = {25: 32, 26: 56, 27: 32, 28: 57}
+native_public_values = {}
+native_secret_values = {}
+for algorithm, octets in native_sizes.items():
+    public_value = bytes(((algorithm + index) % 251) + 1 for index in range(octets))
+    secret_value = bytes(((algorithm * 3 + index) % 251) + 1 for index in range(octets))
+    native_public_values[algorithm] = public_value
+    native_secret_values[algorithm] = secret_value
+    for version in (4, 6):
+        checksum = (
+            (sum(secret_value) & 0xFFFF).to_bytes(2, 'big')
+            if version == 4 else b''
+        )
+        native_body = (
+            native_public(version, algorithm, public_value) + b'\x00' +
+            secret_value + checksum
+        )
+        write_rejection_matrix(
+            f'v{version}-native-algorithm-{algorithm}', native_body
+        )
+        all_zero_body = (
+            native_public(version, algorithm, bytes(octets)) + b'\x00' +
+            secret_value + checksum
+        )
+        all_zero_name = (
+            f'v4-all-zero-native-public-{algorithm}'
+            if version == 4 else f'all-zero-native-public-{algorithm}'
+        )
+        write_reclassified_rejection_matrix(all_zero_name, all_zero_body)
+        public_key = native_public(version, algorithm, public_value)
+        private_suffix = native_body[len(public_key):]
+        for tag in (5, 7):
+            for framing, public_only in (
+                ('new', overdeclared_fixed_packet(tag, public_key)),
+                ('old', old_fixed_packet(tag, len(public_key) + 1, public_key)),
+            ):
+                (v6_pass_control_dir / (
+                    f'v{version}-native-{algorithm}-public-only-'
+                    f'overdeclared-{framing}-tag{tag}.pgp'
+                )).write_bytes(public_only)
+            for framing, underdeclared in (
+                ('new', fixed_packet(tag, public_key) + private_suffix),
+                ('old', old_fixed_packet(tag, len(public_key), native_body)),
+            ):
+                (version_control_dir / (
+                    f'v{version}-native-{algorithm}-secret-underdeclared-'
+                    f'{framing}-tag{tag}.pgp'
+                )).write_bytes(underdeclared)
+
+v6_public = rsa_public(6, n, e)
+v6_public_material = v6_public[10:]
+cipher_blocks = {
+    1: 8, 2: 8, 3: 8, 4: 8,
+    7: 16, 8: 16, 9: 16, 10: 16, 11: 16, 12: 16, 13: 16,
+}
+aead_nonces = {1: 16, 2: 15, 3: 12}
+def argon2_specifier(passes: int, parallelism: int, encoded_memory: int) -> bytes:
+    return (
+        b'\x04' + b'\x25' * 16 +
+        bytes((passes, parallelism, encoded_memory))
+    )
+
+
+s2k_specifiers = {
+    0: b'\x00\x08',
+    1: b'\x01\x08' + b'\x21' * 8,
+    3: b'\x03\x08' + b'\x23' * 8 + b'\x60',
+    4: argon2_specifier(3, 1, 16),
+}
+
+
+def protection_parameters(
+    usage: int,
+    cipher: int = 7,
+    aead: int = 2,
+    s2k: bytes = s2k_specifiers[3],
+    vector: bytes | None = None,
+) -> bytes:
+    output = bytearray([cipher])
+    if usage == 253:
+        output.append(aead)
+        vector_length = aead_nonces[aead]
+    elif vector is not None:
+        vector_length = len(vector)
+    else:
+        vector_length = cipher_blocks[cipher]
+    output.append(len(s2k))
+    output.extend(s2k)
+    output.extend(bytes([0x31 + usage % 7]) * vector_length if vector is None else vector)
+    return bytes(output)
+
+
+def v4_aead_parameters(
+    cipher: int = 7,
+    aead: int = 2,
+    s2k: bytes = s2k_specifiers[3],
+    vector: bytes | None = None,
+) -> bytes:
+    vector_length = aead_nonces[aead]
+    nonce = b'\x34' * vector_length if vector is None else vector
+    return bytes((cipher, aead)) + s2k + nonce
+
+
+def v4_cfb_parameters(
+    protection: int,
+    cipher: int = 7,
+    s2k: bytes = s2k_specifiers[3],
+    vector: bytes | None = None,
+) -> bytes:
+    effective_cipher = cipher if protection in {254, 255} else protection
+    output = bytearray()
+    if protection in {254, 255}:
+        output.append(cipher)
+        output.extend(s2k)
+    vector_length = (
+        len(vector) if vector is not None else cipher_blocks[effective_cipher]
+    )
+    output.extend(
+        bytes([0x35 + protection % 7]) * vector_length
+        if vector is None else vector
+    )
+    return bytes(output)
+
+
+def v4_aead_body(
+    parameters: bytes,
+    payload: bytes,
+    public_key: bytes = public,
+) -> bytes:
+    return public_key + b'\xFD' + parameters + payload
+
+
+def v4_cfb_body(
+    protection: int,
+    parameters: bytes,
+    payload: bytes,
+    public_key: bytes = public,
+) -> bytes:
+    return public_key + bytes((protection,)) + parameters + payload
+
+
+def protected_body(
+    usage: int,
+    parameters: bytes,
+    payload: bytes,
+    public_key: bytes = v6_public,
+) -> bytes:
+    return public_key + bytes([usage, len(parameters)]) + parameters + payload
+
+
+valid_parameters = {
+    253: protection_parameters(253),
+    254: protection_parameters(254),
+}
+valid_v4_253 = v4_aead_parameters()
+write_rejection_matrix(
+    'v4-rsa-protected-253',
+    v4_aead_body(valid_v4_253, b'\x6F' * 64),
+)
+valid_v4_cfb = {
+    7: v4_cfb_parameters(7),
+    254: v4_cfb_parameters(254),
+    255: v4_cfb_parameters(255),
+}
+for protection, parameters in valid_v4_cfb.items():
+    write_rejection_matrix(
+        f'v4-rsa-protected-{protection}',
+        v4_cfb_body(protection, parameters, b'\x6E' * 64),
+    )
+for algorithm, octets in native_sizes.items():
+    v4_native_public = native_public(
+        4, algorithm, native_public_values[algorithm]
+    )
+    write_rejection_matrix(
+        f'v4-native-{algorithm}-protected-253',
+        v4_aead_body(
+            valid_v4_253,
+            b'\x70' * (octets + 16),
+            v4_native_public,
+        ),
+    )
+    write_rejection_matrix(
+        f'v4-native-{algorithm}-overlong-protected-253',
+        v4_aead_body(
+            valid_v4_253,
+            b'\x78' * (octets + 16 + 1),
+            v4_native_public,
+        ),
+    )
+    for protection, parameters in valid_v4_cfb.items():
+        trailer_octets = 20 if protection == 254 else 2
+        write_rejection_matrix(
+            f'v4-native-{algorithm}-protected-{protection}',
+            v4_cfb_body(
+                protection,
+                parameters,
+                b'\x79' * (octets + trailer_octets),
+                v4_native_public,
+            ),
+        )
+        write_reclassified_rejection_matrix(
+            f'v4-native-{algorithm}-overlong-protected-{protection}',
+            v4_cfb_body(
+                protection,
+                parameters,
+                b'\x7d' * (octets + trailer_octets + 1),
+                v4_native_public,
+            ),
+        )
+write_rejection_matrix(
+    'v4-elgamal-protected-254',
+    v4_cfb_body(
+        254, valid_v4_cfb[254], b'\x67' * 32, elgamal_public_keys[4]
+    ),
+)
+write_rejection_matrix(
+    'v4-elgamal20-protected-253',
+    v4_aead_body(valid_v4_253, b'\x68' * 32, elgamal20_public),
+)
+for protection, parameters in valid_v4_cfb.items():
+    write_rejection_matrix(
+        f'v4-elgamal20-protected-{protection}',
+        v4_cfb_body(
+            protection, parameters, b'\x69' * 32, elgamal20_public
+        ),
+    )
+for usage, parameters in valid_parameters.items():
+    trailer_octets = 16 if usage == 253 else 20
+    write_rejection_matrix(
+        f'v6-elgamal-protected-{usage}',
+        protected_body(
+            usage,
+            parameters,
+            b'\x68' * (3 + trailer_octets),
+            elgamal_public_keys[6],
+        ),
+    )
+for usage, parameters in valid_parameters.items():
+    write_rejection_matrix(
+        f'v6-protected-{usage}',
+        protected_body(usage, parameters, bytes([usage & 0xFF]) * 64),
+    )
+for algorithm, octets in native_sizes.items():
+    public_key = native_public(6, algorithm, native_public_values[algorithm])
+    for usage, parameters in valid_parameters.items():
+        trailer_octets = 16 if usage == 253 else 20
+        write_fixed_rejection(
+            f'v6-native-{algorithm}-protected-{usage}',
+            protected_body(
+                usage,
+                parameters,
+                b'\x65' * (octets + trailer_octets),
+                public_key,
+            ),
+        )
+        write_reclassified_rejection_matrix(
+            f'native-{algorithm}-overlong-protected-{usage}',
+            protected_body(
+                usage,
+                parameters,
+                b'\x65' * (octets + trailer_octets + 1),
+                public_key,
+            ),
+        )
+
+# Every registered cipher family, AEAD mode, S2K shape, and hash accepted by
+# the parser gets an independent valid protected-key control.
+for cipher in cipher_blocks:
+    parameters = protection_parameters(254, cipher=cipher)
+    write_fixed_rejection(
+        f'v6-protected-cipher-{cipher}', protected_body(254, parameters, b'\x61' * 64)
+    )
+for aead in aead_nonces:
+    parameters = protection_parameters(253, aead=aead)
+    write_fixed_rejection(
+        f'v6-protected-aead-{aead}', protected_body(253, parameters, b'\x62' * 64)
+    )
+for s2k_type, s2k in s2k_specifiers.items():
+    usage = 253 if s2k_type == 4 else 254
+    parameters = protection_parameters(usage, s2k=s2k)
+    write_fixed_rejection(
+        f'v6-protected-s2k-{s2k_type}', protected_body(usage, parameters, b'\x63' * 64)
+    )
+for hash_id in (1, 2, 3, 8, 9, 10, 11, 12, 14):
+    parameters = protection_parameters(254, s2k=bytes((0, hash_id)))
+    write_fixed_rejection(
+        f'v6-protected-hash-{hash_id}', protected_body(254, parameters, b'\x64' * 64)
+    )
+
+# Exercise every private-use cipher id through a length-delimited V6 AEAD
+# packet, then cover each distinct V4/V6 protection grammar at both range ends.
+private_cipher_packets = {}
+for cipher in range(100, 111):
+    parameters = protection_parameters(253, cipher=cipher)
+    private_body = protected_body(253, parameters, b'\x6b' * 64)
+    private_cipher_packets[cipher] = fixed_packet(5, private_body)
+    write_fixed_rejection(f'v6-private-cipher-{cipher}-aead', private_body)
+for cipher in (100, 110):
+    private_vector = bytes([cipher]) * 8
+    write_fixed_rejection(
+        f'v4-private-cipher-{cipher}-aead',
+        v4_aead_body(
+            v4_aead_parameters(cipher=cipher), b'\x6c' * 64
+        ),
+    )
+    for protection in (254, 255):
+        write_fixed_rejection(
+            f'v4-private-cipher-{cipher}-protected-{protection}',
+            v4_cfb_body(
+                protection,
+                v4_cfb_parameters(
+                    protection, cipher=cipher, vector=private_vector
+                ),
+                b'\x6d' * 64,
+            ),
+        )
+    write_fixed_rejection(
+        f'v4-private-cipher-{cipher}-direct',
+        v4_cfb_body(
+            cipher,
+            v4_cfb_parameters(cipher, vector=private_vector),
+            b'\x6e' * 64,
+        ),
+    )
+    parameters = protection_parameters(
+        254, cipher=cipher, vector=private_vector
+    )
+    write_fixed_rejection(
+        f'v6-private-cipher-{cipher}-cfb',
+        protected_body(254, parameters, b'\x6f' * 64),
+    )
+for cipher in (100, 110):
+    packet = private_cipher_packets[cipher]
+    for prefix_tag in (11, 60, 63):
+        (version_control_dir / (
+            f'v6-private-cipher-{cipher}-after-tag{prefix_tag}.pgp'
+        )).write_bytes(
+            fixed_packet(prefix_tag, b'benign-openpgp-prefix') + packet
+        )
+    (v6_pass_control_dir / (
+        f'v6-private-cipher-{cipher}-after-binary-noise.pgp'
+    )).write_bytes(b'\x00opaque-binary-prefix\x01' + packet)
+
+valid_253 = valid_parameters[253]
+valid_254 = valid_parameters[254]
+# The protected packet bytes are identical; only their left context differs.
+context_protected_packet = fixed_packet(
+    5, protected_body(254, valid_254, b'\x6a' * 64)
+)
+(v6_pass_control_dir / 'protected-after-binary-noise.pgp').write_bytes(
+    b'\x00\x01opaque-binary-prefix\x02' + context_protected_packet
+)
+(version_control_dir / 'protected-after-benign-packet.pgp').write_bytes(
+    fixed_packet(11, b'benign-openpgp-prefix') + context_protected_packet
+)
+pass_bodies = {
+    'v4-aead-eight-byte-cipher': v4_aead_body(
+        v4_aead_parameters(cipher=1), b'\x70' * 64
+    ),
+    'v6-aead-eight-byte-cipher': protected_body(
+        253, protection_parameters(253, cipher=1), b'\x7e' * 64
+    ),
+    'v4-aead-invalid-cipher': v4_aead_body(
+        b'\x06' + valid_v4_253[1:], b'\x71' * 64
+    ),
+    'v4-aead-invalid-aead': v4_aead_body(
+        bytes((7, 4)) + valid_v4_253[2:], b'\x72' * 64
+    ),
+    'v4-aead-missing-s2k': v4_aead_body(b'\x07\x02', b'\x73' * 64),
+    'v4-aead-invalid-s2k-type': v4_aead_body(
+        b'\x07\x02\x02\x08' + b'\x34' * 15, b'\x74' * 64
+    ),
+    'v4-aead-invalid-s2k-hash': v4_aead_body(
+        b'\x07\x02\x00\x04' + b'\x34' * 15, b'\x75' * 64
+    ),
+    'v4-aead-truncated-nonce-and-payload': v4_aead_body(
+        valid_v4_253[:-1], b'\x76' * 28
+    ),
+    'v4-aead-insufficient-payload': v4_aead_body(
+        valid_v4_253, b'\x77' * 27
+    ),
+    'v4-cfb-invalid-cipher-254': v4_cfb_body(
+        254, b'\x06' + valid_v4_cfb[254][1:], b'\x7a' * 64
+    ),
+    'v4-cfb-invalid-s2k-254': v4_cfb_body(
+        254, b'\x07\x02\x08' + b'\x36' * 16, b'\x7b' * 64
+    ),
+    'v4-cfb-short-iv-254': v4_cfb_body(
+        254, valid_v4_cfb[254][:-1], b'\x7c' * 31
+    ),
+    'usage-255': protected_body(255, valid_254, b'\x51' * 64),
+    'legacy-usage': v6_public + b'\x07' + b'\x53' * 64,
+    'missing-parameter-length': v6_public + b'\xfd',
+    'zero-parameter-length': v6_public + b'\xfd\x00' + b'\x54' * 64,
+    'overrunning-parameter-length': v6_public + b'\xfe\x20' + b'\x41' * 8,
+    'underdeclared-parameter-length': (
+        v6_public + b'\xfd' + bytes([len(valid_253) - 1]) +
+        valid_253 + b'\x55' * 64
+    ),
+    'invalid-cipher': protected_body(
+        253, b'\x06' + valid_253[1:], b'\x56' * 64
+    ),
+    'invalid-aead': protected_body(
+        253, bytes((7, 4)) + valid_253[2:], b'\x57' * 64
+    ),
+    'missing-s2k-length': protected_body(253, b'\x07\x02', b'\x58' * 64),
+    'zero-s2k-length': protected_body(
+        253, b'\x07\x02\x00' + b'\x31' * 15, b'\x59' * 64
+    ),
+    'overrunning-s2k-length': protected_body(
+        253, b'\x07\x02\x20\x03\x08', b'\x5a' * 64
+    ),
+    'underdeclared-s2k-length': protected_body(
+        253, b'\x07\x02\x0a' + s2k_specifiers[3] + b'\x31' * 15, b'\x5b' * 64
+    ),
+    'invalid-s2k-type': protected_body(
+        253, b'\x07\x02\x02\x02\x08' + b'\x31' * 15, b'\x5c' * 64
+    ),
+    'invalid-s2k-size': protected_body(
+        253, b'\x07\x02\x03\x00\x08\x00' + b'\x31' * 15, b'\x5d' * 64
+    ),
+    'invalid-s2k-hash': protected_body(
+        253, b'\x07\x02\x02\x00\x04' + b'\x31' * 15, b'\x5e' * 64
+    ),
+    'argon2-with-cfb': protected_body(
+        254,
+        protection_parameters(254, s2k=s2k_specifiers[4]),
+        b'\x69' * 64,
+    ),
+    'argon2-zero-passes': protected_body(
+        253,
+        protection_parameters(253, s2k=argon2_specifier(0, 1, 16)),
+        b'\x6a' * 64,
+    ),
+    'argon2-zero-parallelism': protected_body(
+        253,
+        protection_parameters(253, s2k=argon2_specifier(3, 0, 16)),
+        b'\x6b' * 64,
+    ),
+    'argon2-memory-below-parallelism': protected_body(
+        253,
+        protection_parameters(253, s2k=argon2_specifier(3, 4, 4)),
+        b'\x6c' * 64,
+    ),
+    'argon2-memory-over-limit': protected_body(
+        253,
+        protection_parameters(253, s2k=argon2_specifier(3, 1, 32)),
+        b'\x6d' * 64,
+    ),
+    'wrong-nonce-length': protected_body(
+        253,
+        bytes((7, 2, len(s2k_specifiers[3]))) + s2k_specifiers[3] + b'\x31' * 14,
+        b'\x5f' * 64,
+    ),
+    'wrong-iv-length': protected_body(
+        254,
+        bytes((7, len(s2k_specifiers[3]))) + s2k_specifiers[3] + b'\x37' * 15,
+        b'\x60' * 64,
+    ),
+    'insufficient-aead-payload': protected_body(253, valid_253, b'\x52' * 27),
+    'insufficient-sha1-payload': protected_body(254, valid_254, b'\x52' * 31),
+    'underdeclared-public-material': (
+        v6_public[:6] + (len(v6_public_material) - 1).to_bytes(4, 'big') +
+        v6_public_material + b'\x00' + secret
+    ),
+    'overdeclared-public-material': (
+        v6_public[:6] + (len(v6_public_material) + 1).to_bytes(4, 'big') +
+        v6_public_material + b'\x00' + secret
+    ),
+    'unbounded-public-material': (
+        v6_public[:6] + (128 * 1024 + 1).to_bytes(4, 'big') +
+        v6_public_material + b'\x00' + secret
+    ),
+    'zero-native-public-length': (
+        b'\x06' + (0).to_bytes(4, 'big') + b'\x19' + (0).to_bytes(4, 'big') +
+        b'\x00' + native_secret_values[25]
+    ),
+}
+for algorithm, octets in native_sizes.items():
+    v4_public_key = native_public(4, algorithm, native_public_values[algorithm])
+    pass_bodies[f'v4-native-{algorithm}-insufficient-protected-253'] = (
+        v4_aead_body(
+            valid_v4_253,
+            b'\x78' * (octets + 16 - 1),
+            v4_public_key,
+        )
+    )
+    for protection, parameters in valid_v4_cfb.items():
+        trailer_octets = 20 if protection == 254 else 2
+        pass_bodies[
+            f'v4-native-{algorithm}-insufficient-protected-{protection}'
+        ] = v4_cfb_body(
+            protection,
+            parameters,
+            b'\x7c' * (octets + trailer_octets - 1),
+            v4_public_key,
+        )
+    public_key = native_public(6, algorithm, native_public_values[algorithm])
+    for usage, parameters in valid_parameters.items():
+        trailer_octets = 16 if usage == 253 else 20
+        pass_bodies[f'native-{algorithm}-insufficient-protected-{usage}'] = (
+            protected_body(
+                usage,
+                parameters,
+                b'\x66' * (octets + trailer_octets - 1),
+                public_key,
+            )
+        )
+native_25_public = native_public_values[25]
+native_25_header = b'\x06' + (0).to_bytes(4, 'big') + b'\x19'
+underdeclared_native_public = (
+    native_25_header + (31).to_bytes(4, 'big') + native_25_public +
+    b'\x00' + native_secret_values[25]
+)
+overdeclared_native_public = (
+    native_25_header + (33).to_bytes(4, 'big') + native_25_public +
+    b'\x00' + native_secret_values[25]
+)
+write_reclassified_rejection_matrix(
+    'underdeclared-native-public', underdeclared_native_public
+)
+write_reclassified_rejection_matrix(
+    'overdeclared-native-public', overdeclared_native_public
+)
+if reclassified_rejection_count != 120:
+    raise AssertionError('unexpected native fixture reclassification count')
+for name, pass_body in pass_bodies.items():
+    for tag in (5, 7):
+        for framing, encode in (('fixed', fixed_packet), ('partial', partial_packet)):
+            output = f'{name}-{framing}-tag{tag}.pgp'
+            (v6_pass_control_dir / output).write_bytes(encode(tag, pass_body))
+
+max_body_bytes = 128 * 1024
+max_fragmentation_path = pathlib.Path(sys.argv[27])
+cap_pass_dir = byte_cap_control_dir / 'pass'
+cap_reject_dir = byte_cap_control_dir / 'reject'
+cap_pass_dir.mkdir()
+cap_reject_dir.mkdir()
+
+def capped_partial_prefix(tag: int, prefix: bytes) -> bytes:
+    return bytes([0xC0 | tag, 224 + 30]) + prefix
+
+
+(cap_pass_dir / 'arbitrary-tag5.pgp').write_bytes(
+    capped_partial_prefix(5, b'\x80' * (max_body_bytes + 32))
+)
+public_only_prefix = public + b'\x80'
+(cap_pass_dir / 'public-layout-tag7.pgp').write_bytes(capped_partial_prefix(
+    7,
+    public_only_prefix + b'\x80' * (max_body_bytes + 32 - len(public_only_prefix)),
+))
+native_public_only = native_public(6, 25, native_public_values[25]) + b'\x0e'
+fixed_over_cap_body = native_public_only + b'\x80' * (
+    max_body_bytes + 1 - len(native_public_only)
+)
+if len(fixed_over_cap_body) != max_body_bytes + 1:
+    raise AssertionError('fixed over-cap fixture has the wrong body length')
+(cap_pass_dir / 'fixed-over-max-native-public-only-tag7.pgp').write_bytes(
+    fixed_packet(7, fixed_over_cap_body)
+)
+
+v4_private_over_cap = private_algorithm_public(4, 100, b'')
+v4_private_over_cap += b'\x42' * (
+    max_body_bytes + 1 - len(v4_private_over_cap)
+)
+v6_private_over_cap = private_algorithm_public(
+    6, 110, b'\x43' * max_body_bytes
+) + b'\x00\x51\x52\x53'
+private_cipher_over_cap = protected_body(
+    253,
+    protection_parameters(253, cipher=100),
+    b'\x44' * max_body_bytes,
+)
+over_cap_packets = {
+    'v4-private-algorithm-over-cap-new': fixed_packet(5, v4_private_over_cap),
+    'v4-private-algorithm-over-cap-old': old_fixed_packet(
+        5, len(v4_private_over_cap), v4_private_over_cap
+    ),
+    'v6-private-algorithm-over-cap-after-tag60': (
+        fixed_packet(60, b'benign-openpgp-prefix') +
+        fixed_packet(5, v6_private_over_cap)
+    ),
+    'v6-private-cipher-over-cap': fixed_packet(5, private_cipher_over_cap),
+    'v6-private-cipher-over-cap-after-tag63': (
+        fixed_packet(63, b'benign-openpgp-prefix') +
+        fixed_packet(5, private_cipher_over_cap)
+    ),
+    'v6-private-algorithm-after-over-cap-tag60': (
+        fixed_packet(60, b'\x45' * (max_body_bytes + 1)) +
+        private_algorithm_packets[(6, 100)]
+    ),
+}
+for name, packet in over_cap_packets.items():
+    (version_control_dir / f'{name}.pgp').write_bytes(packet)
+max_fragmentation_body = native_public_only + b'\x80' * (
+    max_body_bytes - len(native_public_only)
+)
+if len(max_fragmentation_body) != max_body_bytes:
+    raise AssertionError('fragmentation fixture has the wrong body length')
+max_fragmentation_path.write_bytes(
+    partial_packet(7, max_fragmentation_body, chunk_size=1)
+)
+(cap_reject_dir / 'recoverable-secret-tag5.pgp').write_bytes(capped_partial_prefix(
+    5,
+    body + b'\x80' * (max_body_bytes + 32 - len(body)),
+))
 PY
 openpgp_private_key_apk="$work_dir/openpgp-private-key.apk"
 make_apk "$openpgp_private_key" "$openpgp_private_key_apk"
@@ -1519,16 +2672,158 @@ make_apk "$openpgp_raw" "$openpgp_raw_apk"
 expect_failure_reason openpgp-raw "$openpgp_raw_apk" arm64-v8a \
   'private signing, deployment, or runtime secret material'
 
-for packet_variant in old-indeterminate partial malformed-partial; do
-  openpgp_variant="$work_dir/openpgp-$packet_variant"
-  copy_fixture "$base_arm64" "$openpgp_variant"
-  cp "$work_dir/openpgp-$packet_variant.pgp" \
-    "$openpgp_variant/assets/private-key.pgp"
-  openpgp_variant_apk="$work_dir/openpgp-$packet_variant.apk"
-  make_apk "$openpgp_variant" "$openpgp_variant_apk"
-  expect_failure_reason "openpgp-$packet_variant" "$openpgp_variant_apk" arm64-v8a \
+openpgp_old_indeterminate="$work_dir/openpgp-old-indeterminate"
+copy_fixture "$base_arm64" "$openpgp_old_indeterminate"
+cp "$openpgp_old_packet" "$openpgp_old_indeterminate/assets/private-key.pgp"
+openpgp_old_indeterminate_apk="$work_dir/openpgp-old-indeterminate.apk"
+make_apk "$openpgp_old_indeterminate" "$openpgp_old_indeterminate_apk"
+expect_failure_reason openpgp-old-indeterminate \
+  "$openpgp_old_indeterminate_apk" arm64-v8a \
+  'private signing, deployment, or runtime secret material'
+
+openpgp_partial="$work_dir/openpgp-partial"
+copy_fixture "$base_arm64" "$openpgp_partial"
+cp "$openpgp_partial_packet" "$openpgp_partial/assets/private-key.pgp"
+openpgp_partial_apk="$work_dir/openpgp-partial.apk"
+make_apk "$openpgp_partial" "$openpgp_partial_apk"
+expect_failure_reason openpgp-partial "$openpgp_partial_apk" arm64-v8a \
+  'private signing, deployment, or runtime secret material'
+
+openpgp_malformed="$work_dir/openpgp-malformed-partial"
+copy_fixture "$base_arm64" "$openpgp_malformed"
+cp "$openpgp_malformed_partial" "$openpgp_malformed/assets/collision.pgp"
+openpgp_malformed_apk="$work_dir/openpgp-malformed-partial.apk"
+make_apk "$openpgp_malformed" "$openpgp_malformed_apk"
+verify_apk "$openpgp_malformed_apk" arm64-v8a >/dev/null
+
+openpgp_partial_subkey="$work_dir/openpgp-partial-subkey-collision"
+copy_fixture "$base_arm64" "$openpgp_partial_subkey"
+cp "$openpgp_partial_subkey_collision" \
+  "$openpgp_partial_subkey/assets/partial-subkey-collision.pgp"
+openpgp_partial_subkey_apk="$work_dir/openpgp-partial-subkey-collision.apk"
+make_apk "$openpgp_partial_subkey" "$openpgp_partial_subkey_apk"
+verify_apk "$openpgp_partial_subkey_apk" arm64-v8a >/dev/null
+
+openpgp_partial_subkey_complete_dir="$work_dir/openpgp-partial-subkey-complete"
+copy_fixture "$base_arm64" "$openpgp_partial_subkey_complete_dir"
+cp "$openpgp_partial_subkey_complete" \
+  "$openpgp_partial_subkey_complete_dir/assets/partial-subkey.pgp"
+openpgp_partial_subkey_complete_apk="$work_dir/openpgp-partial-subkey-complete.apk"
+make_apk "$openpgp_partial_subkey_complete_dir" \
+  "$openpgp_partial_subkey_complete_apk"
+expect_failure_reason openpgp-partial-subkey-complete \
+  "$openpgp_partial_subkey_complete_apk" arm64-v8a \
+  'private signing, deployment, or runtime secret material'
+
+openpgp_partial_subkey_recoverable_dir="$work_dir/openpgp-partial-subkey-recoverable"
+copy_fixture "$base_arm64" "$openpgp_partial_subkey_recoverable_dir"
+cp "$openpgp_partial_subkey_recoverable" \
+  "$openpgp_partial_subkey_recoverable_dir/assets/recoverable-subkey.pgp"
+openpgp_partial_subkey_recoverable_apk="$work_dir/openpgp-partial-subkey-recoverable.apk"
+make_apk "$openpgp_partial_subkey_recoverable_dir" \
+  "$openpgp_partial_subkey_recoverable_apk"
+expect_failure_reason openpgp-partial-subkey-recoverable \
+  "$openpgp_partial_subkey_recoverable_apk" arm64-v8a \
+  'private signing, deployment, or runtime secret material'
+
+for checksum_variant in no-checksum one-checksum; do
+  openpgp_checksum_dir="$work_dir/openpgp-partial-subkey-$checksum_variant"
+  copy_fixture "$base_arm64" "$openpgp_checksum_dir"
+  cp "$work_dir/openpgp-partial-subkey-$checksum_variant.pgp" \
+    "$openpgp_checksum_dir/assets/recoverable-subkey.pgp"
+  openpgp_checksum_apk="$work_dir/openpgp-partial-subkey-$checksum_variant.apk"
+  make_apk "$openpgp_checksum_dir" "$openpgp_checksum_apk"
+  expect_failure_reason "openpgp-partial-subkey-$checksum_variant" \
+    "$openpgp_checksum_apk" arm64-v8a \
     'private signing, deployment, or runtime secret material'
 done
+
+for boundary_variant in \
+  no-checksum one-checksum zero-checksum trailing over-128-one-byte-chunks; do
+  openpgp_complete_boundary_dir="$work_dir/openpgp-partial-complete-$boundary_variant"
+  copy_fixture "$base_arm64" "$openpgp_complete_boundary_dir"
+  cp "$openpgp_partial_subkey_complete_variants/$boundary_variant.pgp" \
+    "$openpgp_complete_boundary_dir/assets/recoverable-subkey.pgp"
+  openpgp_complete_boundary_apk="$work_dir/openpgp-partial-complete-$boundary_variant.apk"
+  make_apk "$openpgp_complete_boundary_dir" "$openpgp_complete_boundary_apk"
+  expect_failure_reason "openpgp-partial-complete-$boundary_variant" \
+    "$openpgp_complete_boundary_apk" arm64-v8a \
+    'private signing, deployment, or runtime secret material'
+done
+
+openpgp_fixed_subkey="$work_dir/openpgp-fixed-subkey-control"
+copy_fixture "$base_arm64" "$openpgp_fixed_subkey"
+cp "$openpgp_fixed_subkey_control" \
+  "$openpgp_fixed_subkey/assets/fixed-subkey-control.pgp"
+openpgp_fixed_subkey_apk="$work_dir/openpgp-fixed-subkey-control.apk"
+make_apk "$openpgp_fixed_subkey" "$openpgp_fixed_subkey_apk"
+expect_failure_reason openpgp-fixed-subkey-control \
+  "$openpgp_fixed_subkey_apk" arm64-v8a \
+  'private signing, deployment, or runtime secret material'
+
+for version_control in "$openpgp_version_controls"/*.pgp; do
+  control_name="${version_control##*/}"
+  control_name="${control_name%.pgp}"
+  control_fixture="$work_dir/openpgp-$control_name"
+  copy_fixture "$base_arm64" "$control_fixture"
+  cp "$version_control" "$control_fixture/assets/$control_name.pgp"
+  control_apk="$work_dir/openpgp-$control_name.apk"
+  make_apk "$control_fixture" "$control_apk"
+  if [[ "$control_name" == 'v4-underdeclared-new-tag5' ]]; then
+    expect_failure_diagnostic \
+      "openpgp-$control_name" \
+      "$control_apk" \
+      arm64-v8a \
+      "assets/$control_name.pgp" \
+      'raw-private-format'
+  else
+    expect_failure_reason \
+      "openpgp-$control_name" \
+      "$control_apk" \
+      arm64-v8a \
+      'private signing, deployment, or runtime secret material'
+  fi
+done
+
+openpgp_v6_pass="$work_dir/openpgp-v6-malformed-controls"
+copy_fixture "$base_arm64" "$openpgp_v6_pass"
+mkdir -p "$openpgp_v6_pass/assets/openpgp-v6-controls"
+cp "$openpgp_v6_pass_controls"/*.pgp \
+  "$openpgp_v6_pass/assets/openpgp-v6-controls/"
+openpgp_v6_pass_apk="$work_dir/openpgp-v6-malformed-controls.apk"
+make_apk "$openpgp_v6_pass" "$openpgp_v6_pass_apk"
+verify_apk "$openpgp_v6_pass_apk" arm64-v8a >/dev/null
+
+openpgp_byte_cap_pass="$work_dir/openpgp-byte-cap-pass"
+copy_fixture "$base_arm64" "$openpgp_byte_cap_pass"
+mkdir -p "$openpgp_byte_cap_pass/assets/openpgp-byte-cap"
+cp "$openpgp_byte_cap_controls/pass"/*.pgp \
+  "$openpgp_byte_cap_pass/assets/openpgp-byte-cap/"
+openpgp_byte_cap_pass_apk="$work_dir/openpgp-byte-cap-pass.apk"
+make_apk "$openpgp_byte_cap_pass" "$openpgp_byte_cap_pass_apk"
+verify_apk "$openpgp_byte_cap_pass_apk" arm64-v8a >/dev/null
+
+openpgp_max_fragmentation_fixture="$work_dir/openpgp-max-fragmentation"
+copy_fixture "$base_arm64" "$openpgp_max_fragmentation_fixture"
+cp "$openpgp_max_fragmentation" \
+  "$openpgp_max_fragmentation_fixture/assets/max-fragmentation.pgp"
+openpgp_max_fragmentation_apk="$work_dir/openpgp-max-fragmentation.apk"
+make_apk "$openpgp_max_fragmentation_fixture" "$openpgp_max_fragmentation_apk"
+# One candidate operation plus 131071 one-byte partial chunks reaches the cap.
+verify_apk "$openpgp_max_fragmentation_apk" arm64-v8a \
+  JUMPGATE_TEST_OPENPGP_EXPECT_OPERATIONS=131072 >/dev/null
+
+openpgp_byte_cap_reject="$work_dir/openpgp-byte-cap-reject"
+copy_fixture "$base_arm64" "$openpgp_byte_cap_reject"
+cp "$openpgp_byte_cap_controls/reject/recoverable-secret-tag5.pgp" \
+  "$openpgp_byte_cap_reject/assets/recoverable-secret-tag5.pgp"
+openpgp_byte_cap_reject_apk="$work_dir/openpgp-byte-cap-reject.apk"
+make_apk "$openpgp_byte_cap_reject" "$openpgp_byte_cap_reject_apk"
+expect_failure_reason \
+  openpgp-byte-cap-recoverable \
+  "$openpgp_byte_cap_reject_apk" \
+  arm64-v8a \
+  'private signing, deployment, or runtime secret material'
 
 openpgp_nonsecret="$work_dir/openpgp-nonsecret-control"
 copy_fixture "$base_arm64" "$openpgp_nonsecret"

@@ -380,6 +380,7 @@ done
 
 if ! python3 - "$extract_dir" "$expected_abi" "$expected_core_library" <<'PY'
 import base64
+import bisect
 import binascii
 import codecs
 import contextlib
@@ -392,6 +393,7 @@ import re
 import stat
 import sys
 import unicodedata
+from array import array
 
 root = pathlib.Path(sys.argv[1])
 expected_abi = sys.argv[2]
@@ -405,6 +407,8 @@ MAX_DECODE_WORK_BYTES = 5 * MAX_TOTAL_BYTES
 CHUNK_BYTES = 1024 * 1024
 MAX_DER_BYTES = 128 * 1024
 MAX_DER_ATTEMPTS = 500_000
+MAX_OPENPGP_WORK = 500_000
+MAX_OPENPGP_COPY_BYTES = MAX_FILE_BYTES
 MAX_BASE64_CHARACTERS = 192 * 1024
 MAX_BASE64_ATTEMPTS = 100_000
 MAX_BASE64_DECODE_BYTES = 64 * 1024 * 1024
@@ -455,9 +459,44 @@ OPENSSH_MAGIC = b'openssh-key-v1\0'
 OPENPGP_SECRET_HEADERS = bytes((
     0xC5, 0xC7, 0x94, 0x95, 0x96, 0x97, 0x9C, 0x9D, 0x9E, 0x9F,
 ))
+OPENPGP_SECRET_CANDIDATE = re.compile(
+    rb'(?:'
+    rb'[\xc5\xc7](?=(?:'
+    rb'[\x00-\xbf\xe0-\xfe][\x03\x04\x06]|'
+    rb'[\xc0-\xdf][\x00-\xff][\x03\x04\x06]|'
+    rb'\xff[\x00-\xff]{4}[\x03\x04\x06]'
+    rb'))|'
+    rb'[\x94\x9c](?=[\x00-\xff][\x03\x04\x06])|'
+    rb'[\x95\x9d](?=[\x00-\xff]{2}[\x03\x04\x06])|'
+    rb'[\x96\x9e](?=[\x00-\xff]{4}[\x03\x04\x06])|'
+    rb'[\x97\x9f](?=[\x03\x04\x06])'
+    rb')'
+)
 MAX_OPENPGP_EC_POINT_BITS = 1059
 OPENPGP_STANDARD_KDF_HASHES = frozenset({8, 9, 10, 12, 14})
 OPENPGP_STANDARD_KDF_CIPHERS = frozenset({7, 8, 9})
+# Private-use ciphers have no standardized block geometry to validate.
+OPENPGP_CIPHER_BLOCK_BYTES = {
+    1: 8,   # IDEA
+    2: 8,   # TripleDES
+    3: 8,   # CAST5
+    4: 8,   # Blowfish
+    7: 16,  # AES-128
+    8: 16,  # AES-192
+    9: 16,  # AES-256
+    10: 16, # Twofish
+    11: 16, # Camellia-128
+    12: 16, # Camellia-192
+    13: 16, # Camellia-256
+}
+OPENPGP_AEAD_NONCE_BYTES = {1: 16, 2: 15, 3: 12}
+OPENPGP_REGISTERED_HASHES = frozenset({1, 2, 3, 8, 9, 10, 11, 12, 14})
+OPENPGP_NATIVE_KEY_BYTES = {25: 32, 26: 56, 27: 32, 28: 57}
+OPENPGP_PRIVATE_USE_IDS = frozenset(range(100, 111))
+OPENPGP_S2K_BYTES = {0: 2, 1: 10, 3: 11, 4: 20}
+OPENPGP_STREAM_TAGS = frozenset(
+    (*range(1, 15), 17, 18, 19, 20, 21, *range(60, 64))
+)
 BASE64_BYTES = frozenset(b'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=_-')
 UNICODE_WHITESPACE_CODEPOINTS = (
     *range(0x09, 0x0E), 0x20, 0x85, 0xA0, 0x1680,
@@ -560,6 +599,8 @@ class WorkBudget:
         self.der_attempts = 0
         self.base64_attempts = 0
         self.base64_decoded_bytes = 0
+        self.openpgp_operations = 0
+        self.openpgp_copied_bytes = 0
         self.text_bytes = 0
 
     def der(self) -> None:
@@ -576,10 +617,87 @@ class WorkBudget:
         ):
             fail()
 
+    def openpgp_operation(self) -> None:
+        self.openpgp_operations += 1
+        if self.openpgp_operations > MAX_OPENPGP_WORK:
+            fail()
+
+    def openpgp_copy(self, copied_bytes: int) -> None:
+        if copied_bytes < 0:
+            fail()
+        self.openpgp_copied_bytes += copied_bytes
+        if self.openpgp_copied_bytes > MAX_OPENPGP_COPY_BYTES:
+            fail()
+
     def text(self, encoded_bytes: int) -> None:
         self.text_bytes += encoded_bytes
         if self.text_bytes > MAX_DECODE_WORK_BYTES:
             fail()
+
+
+class OpenPgpSegmentedBody:
+    def __init__(self, data, budget: WorkBudget):
+        self._data = data
+        self._budget = budget
+        self._starts = array('I')
+        self._lengths = array('I')
+        self._offsets = array('I')
+        self._length = 0
+
+    def append_segment(self, start: int, length: int) -> None:
+        if start < 0 or length < 0 or start + length > len(self._data):
+            fail()
+        if length == 0:
+            return
+        self._offsets.append(self._length)
+        self._starts.append(start)
+        self._lengths.append(length)
+        self._length += length
+
+    def __len__(self) -> int:
+        return self._length
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            index = key + self._length if key < 0 else key
+            if not 0 <= index < self._length:
+                raise IndexError(index)
+            segment_index = bisect.bisect_right(self._offsets, index) - 1
+            logical_start = self._offsets[segment_index]
+            source_start = self._starts[segment_index]
+            return self._data[source_start + index - logical_start]
+        if not isinstance(key, slice):
+            raise TypeError('OpenPGP body indices must be integers or slices')
+
+        start, stop, step = key.indices(self._length)
+        positions = range(start, stop, step)
+        output_length = len(positions)
+        if output_length == 0:
+            return b''
+        self._budget.openpgp_copy(output_length)
+        if step != 1:
+            return bytearray(self[index] for index in positions)
+
+        output = bytearray(output_length)
+        logical = start
+        written = 0
+        source_view = memoryview(self._data)
+        try:
+            while logical < stop:
+                segment_index = bisect.bisect_right(self._offsets, logical) - 1
+                segment_logical = self._offsets[segment_index]
+                source_start = self._starts[segment_index]
+                segment_length = self._lengths[segment_index]
+                within_segment = logical - segment_logical
+                copied = min(segment_length - within_segment, stop - logical)
+                output[written:written + copied] = source_view[
+                    source_start + within_segment:source_start + within_segment + copied
+                ]
+                logical += copied
+                written += copied
+        finally:
+            source_view.release()
+        return output
 
 
 def read_der_tlv(data, offset: int, limit: int):
@@ -776,8 +894,8 @@ def read_openpgp_mpi(data, cursor: int, end: int):
     finish = cursor + 2 + length
     if bits == 0 or length > MAX_DER_BYTES or finish > end:
         return None
-    value = data[cursor + 2:finish]
-    if not value or value[0].bit_length() + (len(value) - 1) * 8 != bits:
+    first_octet = data[cursor + 2]
+    if first_octet.bit_length() + (length - 1) * 8 != bits:
         return None
     return bits, finish
 
@@ -799,9 +917,6 @@ def valid_openpgp_oid(value) -> bool:
     return True
 
 
-MAX_OPENPGP_PARTIAL_CHUNKS = 128
-
-
 def read_openpgp_new_length(data, cursor: int):
     if cursor >= len(data):
         return None
@@ -820,7 +935,7 @@ def read_openpgp_new_length(data, cursor: int):
     return 'fixed', int.from_bytes(data[cursor:cursor + 4], 'big'), cursor + 4
 
 
-def openpgp_packet_body(data, offset: int):
+def openpgp_semantic_candidate(data, offset: int):
     if offset >= len(data) or not data[offset] & 0x80:
         return None
     header = data[offset]
@@ -829,117 +944,251 @@ def openpgp_packet_body(data, offset: int):
         tag = header & 0x3F
         parsed_length = read_openpgp_new_length(data, cursor)
         if parsed_length is None:
-            return tag, b'', None, True
+            return None
+        kind, length, body_start = parsed_length
+        partial = kind == 'partial'
+    else:
+        tag = (header >> 2) & 0x0F
+        length_type = header & 0x03
+        partial = False
+        if length_type == 3:
+            body_start = cursor
+            length = len(data) - body_start
+        else:
+            length_bytes = (1, 2, 4)[length_type]
+            if cursor + length_bytes > len(data):
+                return None
+            length = int.from_bytes(data[cursor:cursor + length_bytes], 'big')
+            body_start = cursor + length_bytes
+    if (
+        tag not in {5, 7}
+        or body_start >= len(data)
+        or data[body_start] not in {3, 4, 6}
+    ):
+        return None
+    return tag, partial, body_start
+
+
+def view_openpgp_body(data, cursor: int, length: int):
+    source_view = memoryview(data)
+    try:
+        return source_view[cursor:cursor + length]
+    finally:
+        source_view.release()
+
+
+def openpgp_packet_body(data, offset: int, budget: WorkBudget):
+    if offset >= len(data) or not data[offset] & 0x80:
+        return None
+    header = data[offset]
+    cursor = offset + 1
+    if header & 0x40:
+        tag = header & 0x3F
+        parsed_length = read_openpgp_new_length(data, cursor)
+        if parsed_length is None:
+            return tag, b'', None, True, False
         kind, length, cursor = parsed_length
         if kind == 'fixed':
             end = cursor + length
-            available = bytes(data[cursor:min(end, len(data), cursor + MAX_DER_BYTES)])
-            malformed = length > MAX_DER_BYTES or end > len(data)
-            return tag, available, end if not malformed else None, malformed
+            available_length = min(length, max(0, len(data) - cursor))
+            viewed_length = min(available_length, MAX_DER_BYTES)
+            available = view_openpgp_body(data, cursor, viewed_length)
+            malformed = end > len(data)
+            return (
+                tag,
+                available,
+                end if end <= len(data) else None,
+                malformed,
+                available_length > viewed_length,
+            )
 
-        body = bytearray()
-        for _ in range(MAX_OPENPGP_PARTIAL_CHUNKS):
-            if length > MAX_DER_BYTES - len(body) or cursor + length > len(data):
-                available = min(len(data) - cursor, MAX_DER_BYTES - len(body))
-                if available > 0:
-                    body.extend(data[cursor:cursor + available])
-                return tag, bytes(body), None, True
-            body.extend(data[cursor:cursor + length])
+        body = OpenPgpSegmentedBody(data, budget)
+        # The byte cap bounds one packet. WorkBudget bounds aggregate parser
+        # effort and body bytes materialized to join partial chunks.
+        while kind == 'partial':
+            budget.openpgp_operation()
+            available_length = min(length, max(0, len(data) - cursor))
+            copied_length = min(available_length, MAX_DER_BYTES - len(body))
+            if copied_length > 0:
+                body.append_segment(cursor, copied_length)
+            if available_length > copied_length:
+                return tag, body, None, True, True
+            if available_length < length:
+                return tag, body, None, True, False
             cursor += length
             parsed_length = read_openpgp_new_length(data, cursor)
             if parsed_length is None:
-                return tag, bytes(body), None, True
+                return tag, body, None, True, False
             kind, length, cursor = parsed_length
-            if kind == 'partial':
-                continue
-            end = cursor + length
-            if length > MAX_DER_BYTES - len(body) or end > len(data):
-                available = min(len(data) - cursor, MAX_DER_BYTES - len(body))
-                if available > 0:
-                    body.extend(data[cursor:cursor + available])
-                return tag, bytes(body), None, True
-            body.extend(data[cursor:end])
-            return tag, bytes(body), end, False
-        return tag, bytes(body), None, True
+
+        end = cursor + length
+        available_length = min(length, max(0, len(data) - cursor))
+        remaining_capacity = MAX_DER_BYTES - len(body)
+        copied_length = min(available_length, remaining_capacity)
+        if copied_length > 0:
+            body.append_segment(cursor, copied_length)
+        bytes_omitted = available_length > copied_length
+        malformed = bytes_omitted or length > remaining_capacity
+        malformed = malformed or end > len(data)
+        return (
+            tag,
+            body,
+            end if not malformed else None,
+            malformed,
+            bytes_omitted,
+        )
 
     tag = (header >> 2) & 0x0F
     length_type = header & 0x03
     if length_type == 3:
         length = len(data) - cursor
-        body = bytes(data[cursor:min(len(data), cursor + MAX_DER_BYTES)])
-        return tag, body, len(data) if length <= MAX_DER_BYTES else None, length > MAX_DER_BYTES
+        viewed_length = min(length, MAX_DER_BYTES)
+        body = view_openpgp_body(data, cursor, viewed_length)
+        return (
+            tag,
+            body,
+            len(data),
+            False,
+            length > len(body),
+        )
     length_bytes = (1, 2, 4)[length_type]
     if cursor + length_bytes > len(data):
-        return tag, b'', None, True
+        return tag, b'', None, True, False
     length = int.from_bytes(data[cursor:cursor + length_bytes], 'big')
     cursor += length_bytes
     end = cursor + length
-    body = bytes(data[cursor:min(end, len(data), cursor + MAX_DER_BYTES)])
-    malformed = length > MAX_DER_BYTES or end > len(data)
-    return tag, body, end if not malformed else None, malformed
+    available_length = min(length, max(0, len(data) - cursor))
+    viewed_length = min(available_length, MAX_DER_BYTES)
+    body = view_openpgp_body(data, cursor, viewed_length)
+    malformed = end > len(data)
+    return (
+        tag,
+        body,
+        end if end <= len(data) else None,
+        malformed,
+        available_length > viewed_length,
+    )
 
 
-def openpgp_public_layout(data, require_standard_kdf: bool = False):
+def is_openpgp_stream_prefix(data, stop: int, budget: WorkBudget) -> bool:
+    cursor = 0
+    while cursor < stop:
+        budget.openpgp_operation()
+        packet = openpgp_packet_body(data, cursor, budget)
+        if packet is None:
+            return False
+        tag, body, packet_end, malformed, _ = packet
+        try:
+            if (
+                tag not in OPENPGP_STREAM_TAGS
+                or packet_end is None
+                or malformed
+                or not cursor < packet_end <= stop
+            ):
+                return False
+        finally:
+            if isinstance(body, memoryview):
+                body.release()
+        cursor = packet_end
+    return cursor == stop
+
+
+def openpgp_public_layout(
+    data, require_standard_layout: bool = False,
+    recover_native_length: bool = False,
+):
     end = len(data)
-    if end < 10 or data[0] != 4:
+    if end < 6:
         return None
-    algorithm = data[5]
-    cursor = 6
-    secret_mpi_count = 0
+    version = data[0]
+    if version == 3:
+        if end < 8:
+            return None
+        algorithm = data[7]
+        if algorithm not in {1, 2, 3}:
+            return None
+        cursor = 8
+        material_end = end
+    elif version == 4:
+        algorithm = data[5]
+        cursor = 6
+        material_end = end
+    elif version == 6:
+        if end < 10:
+            return None
+        algorithm = data[5]
+        material_length = int.from_bytes(data[6:10], 'big')
+        recover_native = (
+            recover_native_length and algorithm in OPENPGP_NATIVE_KEY_BYTES
+        )
+        if (
+            (material_length == 0 or material_length > MAX_DER_BYTES)
+            and not recover_native
+        ):
+            return None
+        cursor = 10
+        material_end = cursor + material_length
+        if material_end > end and not recover_native:
+            return None
+    else:
+        return None
+
+    secret_shape = None
+    secret_minimum = 0
     if algorithm in {1, 2, 3}:  # RSA
-        public = []
         for _ in range(2):
-            item = read_openpgp_mpi(data, cursor, end)
+            item = read_openpgp_mpi(data, cursor, material_end)
             if item is None:
                 return None
-            public.append(item[0])
             cursor = item[1]
-        if public[0] < 512 or not 2 <= public[1] <= 64:
-            return None
-        secret_mpi_count = 4
+        secret_shape = ('mpi', 4)
+        secret_minimum = 12
     elif algorithm == 17:  # DSA
-        public = []
         for _ in range(4):
-            item = read_openpgp_mpi(data, cursor, end)
+            item = read_openpgp_mpi(data, cursor, material_end)
             if item is None:
                 return None
-            public.append(item[0])
             cursor = item[1]
-        if public[0] < 512 or public[1] < 160:
-            return None
-        secret_mpi_count = 1
-    elif algorithm == 16:  # ElGamal
+        secret_shape = ('mpi', 1)
+        secret_minimum = 3
+    elif algorithm in {16, 20}:  # ElGamal, including historical Encrypt-or-Sign
         for _ in range(3):
-            item = read_openpgp_mpi(data, cursor, end)
-            if item is None or item[0] < 512:
+            item = read_openpgp_mpi(data, cursor, material_end)
+            if item is None:
                 return None
             cursor = item[1]
-        secret_mpi_count = 1
+        secret_shape = ('mpi', 1)
+        secret_minimum = 3
     elif algorithm in {18, 19, 22}:  # ECDH/ECDSA/legacy EdDSA
-        if cursor >= end or not 5 <= data[cursor] <= 32:
+        if cursor >= material_end or data[cursor] == 0:
             return None
         oid_length = data[cursor]
-        if cursor + 1 + oid_length > end:
+        if require_standard_layout and not 5 <= oid_length <= 32:
+            return None
+        if cursor + 1 + oid_length > material_end:
             return None
         if not valid_openpgp_oid(data[cursor + 1:cursor + 1 + oid_length]):
             return None
         cursor += 1 + oid_length
         point_start = cursor
-        point = read_openpgp_mpi(data, cursor, end)
+        point = read_openpgp_mpi(data, cursor, material_end)
         if (
             point is None
-            or not 200 <= point[0] <= MAX_OPENPGP_EC_POINT_BITS
             or data[point_start + 2] not in {0x04, 0x40}
+            or (
+                require_standard_layout
+                and not 200 <= point[0] <= MAX_OPENPGP_EC_POINT_BITS
+            )
         ):
             return None
         cursor = point[1]
         if algorithm == 18:
-            if cursor >= end or not 3 <= data[cursor] <= 16:
+            if cursor >= material_end:
                 return None
             kdf_length = data[cursor]
-            if cursor + 1 + kdf_length > end:
+            if cursor + 1 + kdf_length > material_end:
                 return None
-            if require_standard_kdf and (
+            if require_standard_layout and (
                 kdf_length != 3
                 or data[cursor + 1] != 1
                 or data[cursor + 2] not in OPENPGP_STANDARD_KDF_HASHES
@@ -947,62 +1196,379 @@ def openpgp_public_layout(data, require_standard_kdf: bool = False):
             ):
                 return None
             cursor += 1 + kdf_length
-        secret_mpi_count = 1
+        secret_shape = ('mpi', 1)
+        secret_minimum = 3
+    elif version in {4, 6} and algorithm in OPENPGP_NATIVE_KEY_BYTES:
+        native_octets = OPENPGP_NATIVE_KEY_BYTES[algorithm]
+        native_end = cursor + native_octets
+        if (
+            native_end > end
+            or (
+                version == 6
+                and not recover_native_length
+                and material_end - cursor != native_octets
+            )
+        ):
+            return None
+        cursor = native_end
+        secret_shape = ('octets', native_octets)
+        secret_minimum = native_octets
     else:
         return None
-    return cursor, secret_mpi_count
+    if (
+        version == 6
+        and not (
+            recover_native_length and algorithm in OPENPGP_NATIVE_KEY_BYTES
+        )
+        and cursor != material_end
+    ):
+        return None
+    return version, cursor, secret_shape, secret_minimum
+
+
+def read_openpgp_secret_material(data, cursor: int, end: int, secret_shape):
+    shape, count = secret_shape
+    if shape == 'mpi':
+        for _ in range(count):
+            item = read_openpgp_mpi(data, cursor, end)
+            if item is None:
+                return None
+            cursor = item[1]
+        return cursor
+    if shape == 'octets':
+        secret_end = cursor + count
+        return secret_end if secret_end <= end else None
+    return None
+
+
+def valid_openpgp_s2k(specifier, protection: int) -> bool:
+    if not specifier:
+        return False
+    s2k_type = specifier[0]
+    expected_length = OPENPGP_S2K_BYTES.get(s2k_type)
+    if expected_length is None or len(specifier) != expected_length:
+        return False
+    if s2k_type != 4:
+        return specifier[1] in OPENPGP_REGISTERED_HASHES
+    passes, parallelism, encoded_memory = specifier[17:20]
+    minimum_memory = 3 + (parallelism - 1).bit_length()
+    return (
+        protection == 253
+        and passes > 0
+        and parallelism > 0
+        and minimum_memory <= encoded_memory <= 31
+    )
+
+
+def valid_openpgp_encrypted_secret_length(
+    secret_shape, encrypted_length: int, minimum_length: int
+) -> bool:
+    return encrypted_length >= minimum_length
+
+
+def valid_openpgp_v4_aead_protection(
+    data, cursor: int, end: int, secret_shape, secret_minimum: int
+) -> bool:
+    if cursor + 2 > end:
+        return False
+    cipher = data[cursor]
+    aead = data[cursor + 1]
+    cursor += 2
+    block_bytes = OPENPGP_CIPHER_BLOCK_BYTES.get(cipher)
+    if block_bytes != 16 and cipher not in OPENPGP_PRIVATE_USE_IDS:
+        return False
+    vector_bytes = OPENPGP_AEAD_NONCE_BYTES.get(aead)
+    if vector_bytes is None or cursor >= end:
+        return False
+
+    s2k_bytes = OPENPGP_S2K_BYTES.get(data[cursor])
+    if s2k_bytes is None:
+        return False
+    s2k_end = cursor + s2k_bytes
+    if s2k_end > end or not valid_openpgp_s2k(data[cursor:s2k_end], 253):
+        return False
+    payload_start = s2k_end + vector_bytes
+    return payload_start <= end and valid_openpgp_encrypted_secret_length(
+        secret_shape, end - payload_start, secret_minimum + 16
+    )
+
+
+def valid_openpgp_v4_cfb_protection(
+    data, cursor: int, end: int, protection: int,
+    secret_shape, secret_minimum: int,
+) -> bool:
+    private_cipher = False
+    if protection in {254, 255}:
+        if cursor >= end:
+            return False
+        cipher = data[cursor]
+        cursor += 1
+        block_bytes = OPENPGP_CIPHER_BLOCK_BYTES.get(cipher)
+        private_cipher = cipher in OPENPGP_PRIVATE_USE_IDS
+        if (block_bytes is None and not private_cipher) or cursor >= end:
+            return False
+        s2k_bytes = OPENPGP_S2K_BYTES.get(data[cursor])
+        if s2k_bytes is None:
+            return False
+        s2k_end = cursor + s2k_bytes
+        if s2k_end > end or not valid_openpgp_s2k(
+            data[cursor:s2k_end], protection
+        ):
+            return False
+        cursor = s2k_end
+        trailer_bytes = 20 if protection == 254 else 2
+    else:
+        block_bytes = OPENPGP_CIPHER_BLOCK_BYTES.get(protection)
+        private_cipher = protection in OPENPGP_PRIVATE_USE_IDS
+        if block_bytes is None and not private_cipher:
+            return False
+        trailer_bytes = 2
+
+    if private_cipher:
+        # The private-use cipher defines its own IV geometry. A complete packet,
+        # parsed public section, and at least one opaque IV octet are sufficient.
+        return end - cursor >= 1 + secret_minimum + trailer_bytes
+    payload_start = cursor + block_bytes
+    return payload_start <= end and valid_openpgp_encrypted_secret_length(
+        secret_shape, end - payload_start, secret_minimum + trailer_bytes
+    )
+
+
+def valid_openpgp_v6_protection(
+    data, cursor: int, end: int, protection: int,
+    secret_shape, secret_minimum: int,
+) -> bool:
+    if cursor >= end:
+        return False
+    parameter_length = data[cursor]
+    cursor += 1
+    parameter_end = cursor + parameter_length
+    if parameter_length == 0 or parameter_end > end or cursor >= parameter_end:
+        return False
+
+    cipher = data[cursor]
+    cursor += 1
+    block_bytes = OPENPGP_CIPHER_BLOCK_BYTES.get(cipher)
+    private_cipher = cipher in OPENPGP_PRIVATE_USE_IDS
+    if block_bytes is None and not private_cipher:
+        return False
+
+    if protection == 253:
+        if cursor >= parameter_end:
+            return False
+        aead = data[cursor]
+        cursor += 1
+        vector_bytes = OPENPGP_AEAD_NONCE_BYTES.get(aead)
+        trailer_bytes = 16
+        if vector_bytes is None or (not private_cipher and block_bytes != 16):
+            return False
+    else:
+        vector_bytes = block_bytes
+        trailer_bytes = 20
+
+    if cursor >= parameter_end:
+        return False
+    s2k_length = data[cursor]
+    cursor += 1
+    s2k_end = cursor + s2k_length
+    if s2k_end > parameter_end or not valid_openpgp_s2k(
+        data[cursor:s2k_end], protection
+    ):
+        return False
+    cursor = s2k_end
+    if private_cipher and protection == 254:
+        # V6 length-delimits the private cipher's otherwise unknown IV.
+        vector_bytes = parameter_end - cursor
+        if vector_bytes <= 0:
+            return False
+    if parameter_end - cursor != vector_bytes:
+        return False
+    cursor += vector_bytes
+    if cursor != parameter_end:
+        return False
+    return valid_openpgp_encrypted_secret_length(
+        secret_shape, end - parameter_end, secret_minimum + trailer_bytes
+    )
+
+
+def recoverable_openpgp_secret_fields(data) -> bool:
+    layout = openpgp_public_layout(data, recover_native_length=True)
+    if layout is None:
+        return False
+    version, cursor, secret_shape, _ = layout
+    end = len(data)
+    if cursor >= end or data[cursor] != 0:
+        return False
+    cursor += 1
+    secret_start = cursor
+    secret_end = read_openpgp_secret_material(data, cursor, end, secret_shape)
+    if secret_end is None:
+        return False
+    if version in {3, 4} and secret_shape[0] == 'octets':
+        if secret_end + 2 > end:
+            return False
+        secret = data[secret_start:secret_end]
+        checksum = int.from_bytes(data[secret_end:secret_end + 2], 'big')
+        return sum(secret) & 0xFFFF == checksum
+    if version == 6 and secret_shape[0] == 'octets':
+        return secret_end == end
+    return True
+
+
+def is_openpgp_private_use_secret_body(
+    data, complete_body_length=None
+) -> bool:
+    if len(data) < 7 or data[0] not in {4, 6}:
+        return False
+    if data[5] not in OPENPGP_PRIVATE_USE_IDS:
+        return False
+    if data[0] == 4:
+        return True
+    if len(data) < 11:
+        return False
+    public_length = int.from_bytes(data[6:10], 'big')
+    body_length = (
+        len(data) if complete_body_length is None else complete_body_length
+    )
+    return 10 + public_length < body_length
 
 
 def is_openpgp_secret_body(data) -> bool:
-    layout = openpgp_public_layout(data)
+    layout = openpgp_public_layout(data, recover_native_length=True)
     if layout is None:
         return False
-    cursor, secret_mpi_count = layout
+    version, cursor, secret_shape, secret_minimum = layout
     end = len(data)
-
     if cursor >= end:
         return False
     protection = data[cursor]
     cursor += 1
     if protection == 0:
-        for _ in range(secret_mpi_count):
-            item = read_openpgp_mpi(data, cursor, end)
-            if item is None:
-                return False
-            cursor = item[1]
-        if cursor + 2 != end:
+        cursor = read_openpgp_secret_material(data, cursor, end, secret_shape)
+        if cursor is None:
             return False
-    elif protection in {254, 255}:
-        if end - cursor < 16:
-            return False
-    elif not 1 <= protection <= 13 or end - cursor < 16:
-        return False
-    return True
+        checksum_length = 0 if version == 6 else 2
+        return cursor + checksum_length == end
+    if version == 6:
+        return protection in {253, 254} and valid_openpgp_v6_protection(
+            data, cursor, end, protection, secret_shape, secret_minimum
+        )
+    if version == 4 and protection == 253:
+        return valid_openpgp_v4_aead_protection(
+            data, cursor, end, secret_shape, secret_minimum
+        )
+    return valid_openpgp_v4_cfb_protection(
+        data, cursor, end, protection, secret_shape, secret_minimum
+    )
 
 
-def openpgp_secret_packet_end(data, offset: int):
-    packet = openpgp_packet_body(data, offset)
-    if packet is None:
-        return None
-    tag, body, packet_end, malformed = packet
-    if tag not in {5, 7}:
+def contains_openpgp_secret_fields(data) -> bool:
+    return recoverable_openpgp_secret_fields(data) or is_openpgp_secret_body(data)
+
+
+def evaluate_openpgp_secret_packet(
+    data, packet_offset: int, candidate_tag: int, partial_key_packet: bool,
+    body_start: int, packet, budget: WorkBudget,
+):
+    tag, body, packet_end, malformed, _ = packet
+    if tag != candidate_tag:
+        fail()
+
+    if packet_end is not None and is_openpgp_private_use_secret_body(
+        body, packet_end - body_start
+    ):
+        if packet_offset == 0 or is_openpgp_stream_prefix(
+            data, packet_offset, budget
+        ):
+            return packet_end
+
+    # Recover unprotected private fields before framing decisions. Opaque
+    # protected material is conclusive only with a complete packet boundary.
+    if recoverable_openpgp_secret_fields(body):
+        if packet_end is not None:
+            return packet_end
+        fail()
+    if packet_end is not None and is_openpgp_secret_body(body):
+        if packet_offset == 0 or is_openpgp_stream_prefix(
+            data, packet_offset, budget
+        ):
+            return packet_end
+    # Outer lengths are not trusted to hide parseable unprotected fields.
+    # Opaque protected payloads are conclusive only inside the framed body.
+    # Fixed packets are contiguous, so this recovery view performs no copy.
+    if not partial_key_packet:
+        recovery_end = min(len(data), body_start + MAX_DER_BYTES)
+        source_view = memoryview(data)
+        recovery_view = source_view[body_start:recovery_end]
+        try:
+            recovered = recoverable_openpgp_secret_fields(recovery_view)
+        finally:
+            recovery_view.release()
+            source_view.release()
+        if recovered:
+            if packet_offset == 0 or is_openpgp_stream_prefix(
+                data, packet_offset, budget
+            ):
+                fail()
+    elif packet_end is not None and len(body) < MAX_DER_BYTES:
+        recovery_length = min(
+            max(0, len(data) - packet_end), MAX_DER_BYTES - len(body)
+        )
+        if recovery_length:
+            body.append_segment(packet_end, recovery_length)
+            if recoverable_openpgp_secret_fields(body):
+                if packet_offset == 0 or is_openpgp_stream_prefix(
+                    data, packet_offset, budget
+                ):
+                    fail()
+
+    if partial_key_packet:
+        # RFC 4880 4.2.2.4 and RFC 9580 4.2.1.4 do not permit partial
+        # lengths for key packets. Public layout and capacity omission alone
+        # are not secret-key evidence in native executable collisions.
         return None
     if malformed:
         # Random packet-tag bytes are common in binaries. A malformed bounded
-        # chain is private-key-like only after its public key section parses.
-        if openpgp_public_layout(body, require_standard_kdf=True) is not None:
-            fail()
+        # chain is private-key-like only after a structured MPI public section
+        # parses. Fixed-width native public bytes have no internal boundaries,
+        # so public layout alone is not secret-key evidence.
+        layout = openpgp_public_layout(body, require_standard_layout=True)
+        if layout is not None and layout[2][0] != 'octets':
+            if packet_offset == 0 or is_openpgp_stream_prefix(
+                data, packet_offset, budget
+            ):
+                fail()
         return None
-    if is_openpgp_secret_body(body):
-        return packet_end
     return None
 
 
-def contains_private_binary(data) -> bool:
+def openpgp_secret_packet_end(data, offset: int, budget: WorkBudget):
+    # Raw files can contain dense runs of tag-shaped bytes. Charge every visit,
+    # including candidates rejected by the semantic prefilter.
+    budget.openpgp_operation()
+    candidate = openpgp_semantic_candidate(data, offset)
+    if candidate is None:
+        return None
+    candidate_tag, partial_key_packet, body_start = candidate
+    packet = openpgp_packet_body(data, offset, budget)
+    if packet is None:
+        return None
+    body = packet[1]
+    try:
+        return evaluate_openpgp_secret_packet(
+            data, offset, candidate_tag, partial_key_packet, body_start,
+            packet, budget,
+        )
+    finally:
+        if isinstance(body, memoryview):
+            body.release()
+
+
+def contains_private_binary(data, budget: WorkBudget) -> bool:
     return (
         is_der_private_key(data, 0, require_end=True)
         or is_openssh_private_key(data)
-        or openpgp_secret_packet_end(data, 0) is not None
+        or openpgp_secret_packet_end(data, 0, budget) is not None
     )
 
 
@@ -1083,7 +1649,7 @@ def inspect_armor(label: str, body: str, paired: bool, budget: WorkBudget) -> No
     compact_label = ''.join(character for character in label.casefold() if character.isalnum())
     decoded_values = armor_candidates(label, body, budget)
     for decoded in decoded_values:
-        if contains_private_binary(decoded):
+        if contains_private_binary(decoded, budget):
             fail()
         if compact_label == 'encryptedprivatekey' and is_encrypted_private_key_info(decoded):
             fail()
@@ -1155,7 +1721,7 @@ class Base64Detector:
             for decoded in decode_base64_candidate(
                 ''.join(self.candidate), self.budget, semantic_prefix_only=True
             ):
-                if contains_private_binary(decoded):
+                if contains_private_binary(decoded, self.budget):
                     fail()
         self.candidate = []
         self.oversized = False
@@ -1328,13 +1894,11 @@ def scan_raw_private_formats(data, budget: WorkBudget) -> None:
             fail()
         offset = data.find(OPENSSH_MAGIC, offset + 1)
 
-    for header in OPENPGP_SECRET_HEADERS:
-        needle = bytes([header])
-        offset = data.find(needle)
-        while offset >= 0:
-            if openpgp_secret_packet_end(data, offset) is not None:
-                fail()
-            offset = data.find(needle, offset + 1)
+    # Framing and body-version filtering stay in the C regex engine. Python
+    # only visits structurally plausible candidates, each charged below.
+    for match in OPENPGP_SECRET_CANDIDATE.finditer(data):
+        if openpgp_secret_packet_end(data, match.start(), budget) is not None:
+            fail()
 
 
 def utf8_whitespace_width(data, offset: int) -> int:
@@ -1390,7 +1954,7 @@ def scan_encoded_base64_formats(data, excluded_span, budget: WorkBudget) -> None
         for decoded in decode_base64_candidate(
             candidate, budget, semantic_prefix_only=True
         ):
-            if contains_private_binary(decoded):
+            if contains_private_binary(decoded, budget):
                 fail()
 
     for encoding, pattern in UTF16_BASE64_STARTS.items():
@@ -1401,7 +1965,7 @@ def scan_encoded_base64_formats(data, excluded_span, budget: WorkBudget) -> None
             for decoded in decode_base64_candidate(
                 candidate, budget, semantic_prefix_only=True
             ):
-                if contains_private_binary(decoded):
+                if contains_private_binary(decoded, budget):
                     fail()
 
 
@@ -1681,6 +2245,66 @@ def main() -> None:
             scan_encoded_base64_formats(data, record_span, budget)
             set_scan_context(record, 'text-secret')
             scan_known_encodings(record, data, record_span, budget)
+
+    expected_copy_probe = os.environ.get(
+        'JUMPGATE_TEST_OPENPGP_EXPECT_COPIED_BYTES'
+    )
+    if expected_copy_probe is not None:
+        set_scan_context(None, 'openpgp-copy-count-probe')
+        if not re.fullmatch(r'[0-9]+', expected_copy_probe):
+            fail()
+        expected_copied_bytes = int(expected_copy_probe)
+        if (
+            expected_copied_bytes > MAX_OPENPGP_COPY_BYTES
+            or budget.openpgp_copied_bytes != expected_copied_bytes
+        ):
+            fail()
+
+    expected_operation_probe = os.environ.get(
+        'JUMPGATE_TEST_OPENPGP_EXPECT_OPERATIONS'
+    )
+    if expected_operation_probe is not None:
+        set_scan_context(None, 'openpgp-operation-count-probe')
+        if not re.fullmatch(r'[0-9]+', expected_operation_probe):
+            fail()
+        expected_operations = int(expected_operation_probe)
+        if (
+            expected_operations > MAX_OPENPGP_WORK
+            or budget.openpgp_operations != expected_operations
+        ):
+            fail()
+
+    work_probe = os.environ.get('JUMPGATE_TEST_OPENPGP_WORK')
+    if work_probe is not None:
+        set_scan_context(None, 'openpgp-work-budget-probe')
+        if not re.fullmatch(r'[0-9]+', work_probe):
+            fail()
+        target_operations = int(work_probe)
+        if (
+            target_operations > MAX_OPENPGP_WORK + 1
+            or budget.openpgp_operations > target_operations
+        ):
+            fail()
+        fixed_probe = bytes((0xC5, 6, 4, 0, 0, 0, 0, 0))
+        while budget.openpgp_operations < target_operations:
+            if openpgp_secret_packet_end(fixed_probe, 0, budget) is not None:
+                fail()
+        if budget.openpgp_operations != target_operations:
+            fail()
+
+    copy_probe = os.environ.get('JUMPGATE_TEST_OPENPGP_COPY_WORK')
+    if copy_probe is not None:
+        set_scan_context(None, 'openpgp-copy-budget-probe')
+        if copy_probe not in {'exact', 'overflow'}:
+            fail()
+        remaining = MAX_OPENPGP_COPY_BYTES - budget.openpgp_copied_bytes
+        if remaining < 0:
+            fail()
+        budget.openpgp_copy(remaining)
+        if copy_probe == 'overflow':
+            probe = OpenPgpSegmentedBody(b'\x00', budget)
+            probe.append_segment(0, 1)
+            probe[:1]
 
 
 try:
