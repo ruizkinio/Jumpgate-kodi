@@ -409,6 +409,7 @@ MAX_DER_BYTES = 128 * 1024
 MAX_DER_ATTEMPTS = 500_000
 MAX_OPENPGP_WORK = 500_000
 MAX_OPENPGP_COPY_BYTES = MAX_FILE_BYTES
+MAX_OPENPGP_CHECKSUM_BYTES = MAX_FILE_BYTES
 MAX_BASE64_CHARACTERS = 192 * 1024
 MAX_BASE64_ATTEMPTS = 100_000
 MAX_BASE64_DECODE_BYTES = 64 * 1024 * 1024
@@ -601,6 +602,7 @@ class WorkBudget:
         self.base64_decoded_bytes = 0
         self.openpgp_operations = 0
         self.openpgp_copied_bytes = 0
+        self.openpgp_checksum_bytes = 0
         self.text_bytes = 0
 
     def der(self) -> None:
@@ -627,6 +629,13 @@ class WorkBudget:
             fail()
         self.openpgp_copied_bytes += copied_bytes
         if self.openpgp_copied_bytes > MAX_OPENPGP_COPY_BYTES:
+            fail()
+
+    def openpgp_checksum(self, checked_bytes: int) -> None:
+        if checked_bytes < 0:
+            fail()
+        self.openpgp_checksum_bytes += checked_bytes
+        if self.openpgp_checksum_bytes > MAX_OPENPGP_CHECKSUM_BYTES:
             fail()
 
     def text(self, encoded_bytes: int) -> None:
@@ -1415,6 +1424,30 @@ def recoverable_openpgp_secret_fields(data) -> bool:
     return True
 
 
+def is_exact_openpgp_unprotected_secret_body(
+    data, budget: WorkBudget
+) -> bool:
+    layout = openpgp_public_layout(data)
+    if layout is None:
+        return False
+    version, cursor, secret_shape, _ = layout
+    end = len(data)
+    if cursor >= end or data[cursor] != 0:
+        return False
+    cursor += 1
+    secret_start = cursor
+    secret_end = read_openpgp_secret_material(data, cursor, end, secret_shape)
+    if secret_end is None:
+        return False
+    if version == 6:
+        return secret_end == end
+    if secret_end + 2 != end:
+        return False
+    expected_checksum = int.from_bytes(data[secret_end:end], 'big')
+    budget.openpgp_checksum(secret_end - secret_start)
+    return sum(data[secret_start:secret_end]) & 0xFFFF == expected_checksum
+
+
 def is_openpgp_private_use_secret_body(
     data, complete_body_length=None
 ) -> bool:
@@ -1474,24 +1507,37 @@ def evaluate_openpgp_secret_packet(
     if tag != candidate_tag:
         fail()
 
+    stream_context = None
+
+    def has_openpgp_context() -> bool:
+        nonlocal stream_context
+        if stream_context is None:
+            stream_context = packet_offset == 0 or is_openpgp_stream_prefix(
+                data, packet_offset, budget
+            )
+        return stream_context
+
     if packet_end is not None and is_openpgp_private_use_secret_body(
         body, packet_end - body_start
     ):
-        if packet_offset == 0 or is_openpgp_stream_prefix(
-            data, packet_offset, budget
-        ):
+        if has_openpgp_context():
             return packet_end
 
     # Recover unprotected private fields before framing decisions. Opaque
     # protected material is conclusive only with a complete packet boundary.
     if recoverable_openpgp_secret_fields(body):
-        if packet_end is not None:
-            return packet_end
-        fail()
+        exact_embedded_body = (
+            packet_end is not None
+            and not partial_key_packet
+            and not malformed
+            and is_exact_openpgp_unprotected_secret_body(body, budget)
+        )
+        if exact_embedded_body or has_openpgp_context():
+            if packet_end is not None:
+                return packet_end
+            fail()
     if packet_end is not None and is_openpgp_secret_body(body):
-        if packet_offset == 0 or is_openpgp_stream_prefix(
-            data, packet_offset, budget
-        ):
+        if has_openpgp_context():
             return packet_end
     # Outer lengths are not trusted to hide parseable unprotected fields.
     # Opaque protected payloads are conclusive only inside the framed body.
@@ -1506,9 +1552,7 @@ def evaluate_openpgp_secret_packet(
             recovery_view.release()
             source_view.release()
         if recovered:
-            if packet_offset == 0 or is_openpgp_stream_prefix(
-                data, packet_offset, budget
-            ):
+            if has_openpgp_context():
                 fail()
     elif packet_end is not None and len(body) < MAX_DER_BYTES:
         recovery_length = min(
@@ -1517,9 +1561,7 @@ def evaluate_openpgp_secret_packet(
         if recovery_length:
             body.append_segment(packet_end, recovery_length)
             if recoverable_openpgp_secret_fields(body):
-                if packet_offset == 0 or is_openpgp_stream_prefix(
-                    data, packet_offset, budget
-                ):
+                if has_openpgp_context():
                     fail()
 
     if partial_key_packet:
@@ -1534,9 +1576,7 @@ def evaluate_openpgp_secret_packet(
         # so public layout alone is not secret-key evidence.
         layout = openpgp_public_layout(body, require_standard_layout=True)
         if layout is not None and layout[2][0] != 'octets':
-            if packet_offset == 0 or is_openpgp_stream_prefix(
-                data, packet_offset, budget
-            ):
+            if has_openpgp_context():
                 fail()
         return None
     return None
@@ -2260,6 +2300,20 @@ def main() -> None:
         ):
             fail()
 
+    expected_checksum_probe = os.environ.get(
+        'JUMPGATE_TEST_OPENPGP_EXPECT_CHECKSUM_BYTES'
+    )
+    if expected_checksum_probe is not None:
+        set_scan_context(None, 'openpgp-checksum-count-probe')
+        if not re.fullmatch(r'[0-9]+', expected_checksum_probe):
+            fail()
+        expected_checksum_bytes = int(expected_checksum_probe)
+        if (
+            expected_checksum_bytes > MAX_OPENPGP_CHECKSUM_BYTES
+            or budget.openpgp_checksum_bytes != expected_checksum_bytes
+        ):
+            fail()
+
     expected_operation_probe = os.environ.get(
         'JUMPGATE_TEST_OPENPGP_EXPECT_OPERATIONS'
     )
@@ -2305,6 +2359,18 @@ def main() -> None:
             probe = OpenPgpSegmentedBody(b'\x00', budget)
             probe.append_segment(0, 1)
             probe[:1]
+
+    checksum_probe = os.environ.get('JUMPGATE_TEST_OPENPGP_CHECKSUM_WORK')
+    if checksum_probe is not None:
+        set_scan_context(None, 'openpgp-checksum-budget-probe')
+        if checksum_probe not in {'exact', 'overflow'}:
+            fail()
+        remaining = MAX_OPENPGP_CHECKSUM_BYTES - budget.openpgp_checksum_bytes
+        if remaining < 0:
+            fail()
+        budget.openpgp_checksum(remaining)
+        if checksum_probe == 'overflow':
+            budget.openpgp_checksum(1)
 
 
 try:

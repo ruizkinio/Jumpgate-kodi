@@ -872,6 +872,14 @@ expect_failure_phase_diagnostic \
   arm64-v8a \
   'openpgp-copy-budget-probe' \
   JUMPGATE_TEST_OPENPGP_COPY_WORK=overflow
+verify_apk "$arm64_apk" arm64-v8a \
+  JUMPGATE_TEST_OPENPGP_CHECKSUM_WORK=exact >/dev/null
+expect_failure_phase_diagnostic \
+  openpgp-checksum-budget \
+  "$arm64_apk" \
+  arm64-v8a \
+  'openpgp-checksum-budget-probe' \
+  JUMPGATE_TEST_OPENPGP_CHECKSUM_WORK=overflow
 
 openpgp_cross_packet_work="$work_dir/openpgp-cross-packet-work"
 copy_fixture "$base_arm64" "$openpgp_cross_packet_work"
@@ -2760,6 +2768,168 @@ make_apk "$openpgp_fixed_subkey" "$openpgp_fixed_subkey_apk"
 expect_failure_reason openpgp-fixed-subkey-control \
   "$openpgp_fixed_subkey_apk" arm64-v8a \
   'private signing, deployment, or runtime secret material'
+
+openpgp_embedded_payloads="$work_dir/openpgp-embedded-context-payloads"
+mkdir -p "$openpgp_embedded_payloads"
+python3 - "$openpgp_embedded_payloads" <<'PY'
+import pathlib
+import sys
+
+
+def mpi(value: int) -> bytes:
+    encoded = value.to_bytes((value.bit_length() + 7) // 8, 'big')
+    return value.bit_length().to_bytes(2, 'big') + encoded
+
+
+def packet_length(length: int) -> bytes:
+    if length < 192:
+        return bytes([length])
+    if length <= 8383:
+        adjusted = length - 192
+        return bytes([192 + (adjusted >> 8), adjusted & 0xFF])
+    return b'\xff' + length.to_bytes(4, 'big')
+
+
+def fixed_packet(tag: int, body: bytes, declared_length=None) -> bytes:
+    length = len(body) if declared_length is None else declared_length
+    return bytes([0xC0 | tag]) + packet_length(length) + body
+
+
+def partial_packet(tag: int, body: bytes, chunk_size: int = 64) -> bytes:
+    exponent = chunk_size.bit_length() - 1
+    output = bytearray([0xC0 | tag])
+    cursor = 0
+    while len(body) - cursor > chunk_size:
+        output.append(224 + exponent)
+        output.extend(body[cursor:cursor + chunk_size])
+        cursor += chunk_size
+    remaining = body[cursor:]
+    output.extend((len(remaining),))
+    output.extend(remaining)
+    return bytes(output)
+
+
+def rsa_public(version: int, modulus: int, exponent: int) -> bytes:
+    material = mpi(modulus) + mpi(exponent)
+    if version == 3:
+        return b'\x03' + (0).to_bytes(4, 'big') + b'\x00\x00\x01' + material
+    if version == 4:
+        return b'\x04' + (0).to_bytes(4, 'big') + b'\x01' + material
+    raise ValueError('unsupported embedded RSA fixture version')
+
+
+n = (1 << 511) + 0x12345
+e = 65537
+d = (1 << 510) + 0x23457
+p = (1 << 255) + 0x34567
+q = (1 << 255) + 0x45679
+u = (1 << 254) + 0x56789
+rsa_secret = mpi(d) + mpi(p) + mpi(q) + mpi(u)
+
+elgamal_prime = (1 << 1023) + 0xC5D7
+elgamal_generator = 2
+elgamal_secret = (1 << 255) + 0x6A5B
+elgamal_value = pow(elgamal_generator, elgamal_secret, elgamal_prime)
+elgamal_public = (
+    b'\x04' + (0).to_bytes(4, 'big') + b'\x14' +
+    mpi(elgamal_prime) + mpi(elgamal_generator) + mpi(elgamal_value)
+)
+elgamal_secret = mpi(elgamal_secret)
+
+native_public_value = bytes(range(1, 33))
+native_secret = bytes(range(65, 97))
+native_public = (
+    b'\x06' + (0).to_bytes(4, 'big') + b'\x19' +
+    len(native_public_value).to_bytes(4, 'big') + native_public_value
+)
+
+output = pathlib.Path(sys.argv[1])
+for name, public, secret, checksum_required in (
+    ('v3-rsa', rsa_public(3, n, e), rsa_secret, True),
+    ('v4-rsa', rsa_public(4, n, e), rsa_secret, True),
+    ('v4-elgamal20', elgamal_public, elgamal_secret, True),
+    ('v6-native25', native_public, native_secret, False),
+):
+    if checksum_required:
+        (output / f'{name}-checksum-bytes.txt').write_text(
+            str(len(secret)), encoding='ascii'
+        )
+    checksum = (
+        (sum(secret) & 0xFFFF).to_bytes(2, 'big')
+        if checksum_required else b''
+    )
+    body = public + b'\x00' + secret + checksum
+    for tag in (5, 7):
+        fixtures = {
+            'valid-fixed': fixed_packet(tag, body),
+            'valid-partial': partial_packet(tag, body),
+            'outer-overdeclared': fixed_packet(tag, body, len(body) + 1),
+        }
+        if checksum_required:
+            bad_checksum = body[:-1] + bytes([body[-1] ^ 1])
+            fixtures['bad-checksum-fixed'] = fixed_packet(tag, bad_checksum)
+        else:
+            for variant, declared_length in (
+                ('public-underdeclared-fixed', len(native_public_value) - 1),
+                ('public-overdeclared-fixed', len(native_public_value) + 1),
+            ):
+                malformed_public = (
+                    public[:6] + declared_length.to_bytes(4, 'big') + public[10:]
+                )
+                fixtures[variant] = fixed_packet(
+                    tag, malformed_public + b'\x00' + secret
+                )
+        for variant, packet in fixtures.items():
+            (output / f'{name}-{variant}-tag{tag}.pgp').write_bytes(packet)
+PY
+
+for abi in arm64-v8a armeabi-v7a; do
+  if [[ "$abi" == arm64-v8a ]]; then
+    embedded_base="$base_arm64"
+  else
+    embedded_base="$base_armv7"
+  fi
+  for key_shape in v3-rsa v4-rsa v4-elgamal20 v6-native25; do
+    for tag in 5 7; do
+      variants=(valid-fixed valid-partial outer-overdeclared)
+      if [[ "$key_shape" == v6-native25 ]]; then
+        variants+=(public-underdeclared-fixed public-overdeclared-fixed)
+      else
+        variants+=(bad-checksum-fixed)
+      fi
+      for variant in "${variants[@]}"; do
+        embedded_label="openpgp-embedded-$abi-$key_shape-$variant-tag$tag"
+        embedded_fixture="$work_dir/$embedded_label"
+        embedded_library="lib/$abi/libhelper.so"
+        copy_fixture "$embedded_base" "$embedded_fixture"
+        cat "$openpgp_embedded_payloads/$key_shape-$variant-tag$tag.pgp" >> \
+          "$embedded_fixture/$embedded_library"
+        if [[ "$variant" == 'outer-overdeclared' ]]; then
+          printf '\0benign-elf-suffix' >> "$embedded_fixture/$embedded_library"
+        fi
+        embedded_apk="$work_dir/$embedded_label.apk"
+        make_apk "$embedded_fixture" "$embedded_apk"
+        if [[ "$variant" == 'valid-fixed' ]]; then
+          expect_failure_diagnostic \
+            "$embedded_label" \
+            "$embedded_apk" \
+            "$abi" \
+            "$embedded_library" \
+            'raw-private-format'
+        elif [[ "$variant" == 'bad-checksum-fixed' ]]; then
+          checksum_bytes="$(
+            cat "$openpgp_embedded_payloads/$key_shape-checksum-bytes.txt"
+          )"
+          verify_apk "$embedded_apk" "$abi" \
+            JUMPGATE_TEST_OPENPGP_EXPECT_CHECKSUM_BYTES="$checksum_bytes" \
+            >/dev/null
+        else
+          verify_apk "$embedded_apk" "$abi" >/dev/null
+        fi
+      done
+    done
+  done
+done
 
 for version_control in "$openpgp_version_controls"/*.pgp; do
   control_name="${version_control##*/}"
