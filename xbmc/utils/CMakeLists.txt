@@ -44,6 +44,8 @@ set(SOURCES ActorProtocol.cpp
             JumpgatePlaybackHistoryState.cpp
             JumpgatePlaybackResultState.cpp
             JumpgatePlaybackRetry.cpp
+            JumpgatePairingCoordinator.cpp
+            JumpgatePairingPresenter.cpp
             JumpgatePlaybackClaimClient.cpp
             JumpgatePlaybackClaimCoordinator.cpp
             JumpgateSubtitleClient.cpp
@@ -59,6 +61,7 @@ set(SOURCES ActorProtocol.cpp
             JumpgateProfileHistoryPolicy.cpp
             JumpgateProfileRuntime.cpp
             JumpgateProfileStore.cpp
+            JumpgateQrCode.cpp
             JumpgateSourceFingerprint.cpp
             LabelFormatter.cpp
             LangCodeExpander.cpp
@@ -70,6 +73,7 @@ set(SOURCES ActorProtocol.cpp
             Mp4ChplReader.cpp
             Observer.cpp
             POUtils.cpp
+            qrcodegen.cpp
             PlayerUtils.cpp
             RecentlyAddedJob.cpp
             RegExp.cpp
@@ -162,6 +166,8 @@ set(HEADERS ActorProtocol.h
             JumpgatePlaybackHistoryState.h
             JumpgatePlaybackResultState.h
             JumpgatePlaybackRetry.h
+            JumpgatePairingCoordinator.h
+            JumpgatePairingPresenter.h
             JumpgatePlaybackClaimClient.h
             JumpgatePlaybackClaimCoordinator.h
             JumpgateSubtitleClient.h
@@ -177,6 +183,7 @@ set(HEADERS ActorProtocol.h
             JumpgateProfileHistoryPolicy.h
             JumpgateProfileRuntime.h
             JumpgateProfileStore.h
+            JumpgateQrCode.h
             JumpgateSourceFingerprint.h
             LabelFormatter.h
             LangCodeExpander.h
@@ -194,6 +201,7 @@ set(HEADERS ActorProtocol.h
             Observer.h
             params_check_macros.h
             POUtils.h
+            qrcodegen.hpp
             PlayerUtils.h
             ProgressJob.h
             RecentlyAddedJob.h

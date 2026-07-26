@@ -61,6 +61,7 @@ class CAndroidJumpgateSubtitleController;
 class CJumpgateProfileRuntime;
 class CJumpgateProfileStorage;
 class CJumpgatePlaybackClaimCoordinator;
+class CJumpgatePairingCoordinator;
 } // namespace KODI::JUMPGATE
 
 namespace KODI::MESSAGING
@@ -346,7 +347,6 @@ private:
   void QueuePairingRedemption(std::string responseJson,
                               const std::string& origin,
                               const std::string& profileName);
-  void QueuePairingError(const std::string& errorMessage);
   void UpdateLoadingOverlayContentInfo(bool force);
   uint64_t QueuePlaybackSourceClaim(const std::string& rawLaunchUri, int64_t launchedAtMs);
   std::optional<KODI::JUMPGATE::CJumpgatePlaybackAuthority::Event> BeginExternalPlaybackAdmission(
@@ -530,15 +530,11 @@ private:
   KODI::JUMPGATE::CJumpgateShutdownCoordinator m_shutdownCoordinator;
   std::atomic<bool> m_settingsRequested{false};
   mutable CCriticalSection m_pairingMutex;
-  std::thread m_pairingThread;
-  std::atomic<bool> m_pairingInProgress{false};
-  std::atomic<bool> m_pairingStopRequested{false};
+  std::shared_ptr<KODI::JUMPGATE::CJumpgatePairingCoordinator> m_pairingCoordinator;
   bool m_pairingRedemptionPending{false};
   std::string m_pairingRedemptionJson;
   std::string m_pairingRedemptionOrigin;
   std::string m_pairingApplyProfileName;
-  bool m_pairingErrorPending{false};
-  std::string m_pairingErrorMessage;
   bool m_updateChecked{false};
   bool m_overlayHidden{false};
   std::string m_lastOverlayTitle;

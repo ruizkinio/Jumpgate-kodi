@@ -1,0 +1,134 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<window type="dialog">
+  <defaultcontrol always="true">20</defaultcontrol>
+  <coordinates>
+    <left>0</left>
+    <top>0</top>
+  </coordinates>
+  <controls>
+    <control type="image">
+      <left>0</left>
+      <top>0</top>
+      <width>1920</width>
+      <height>1080</height>
+      <texture colordiffuse="D9101724">special://xbmc/addons/script.jumpgate.manager/resources/media/pixel.png</texture>
+    </control>
+    <control type="image">
+      <left>250</left>
+      <top>125</top>
+      <width>1420</width>
+      <height>830</height>
+      <texture colordiffuse="FF15263A" border="24">special://xbmc/addons/script.jumpgate.manager/resources/media/pixel.png</texture>
+    </control>
+    <control type="image">
+      <left>250</left>
+      <top>125</top>
+      <width>14</width>
+      <height>830</height>
+      <texture colordiffuse="FF36A9E8">special://xbmc/addons/script.jumpgate.manager/resources/media/pixel.png</texture>
+    </control>
+    <control type="label" id="11">
+      <left>330</left>
+      <top>190</top>
+      <width>1260</width>
+      <height>72</height>
+      <font>font40_title</font>
+      <textcolor>FFF4F8FC</textcolor>
+      <label>Pair Jumpgate</label>
+    </control>
+    <control type="label" id="12">
+      <left>333</left>
+      <top>275</top>
+      <width>1250</width>
+      <height>48</height>
+      <font>font13</font>
+      <textcolor>FF9FB7CB</textcolor>
+      <label></label>
+    </control>
+    <control type="image" id="10">
+      <left>330</left>
+      <top>360</top>
+      <width>360</width>
+      <height>360</height>
+      <aspectratio align="center" aligny="center">keep</aspectratio>
+      <texture></texture>
+    </control>
+    <control type="label" id="13">
+      <left>760</left>
+      <top>375</top>
+      <width>760</width>
+      <height>45</height>
+      <font>font13</font>
+      <textcolor>FF9FB7CB</textcolor>
+      <label></label>
+      <scroll>true</scroll>
+    </control>
+    <control type="label" id="14">
+      <left>755</left>
+      <top>445</top>
+      <width>780</width>
+      <height>110</height>
+      <font>font40_title</font>
+      <textcolor>FFF4F8FC</textcolor>
+      <label></label>
+    </control>
+    <control type="label" id="15">
+      <left>760</left>
+      <top>570</top>
+      <width>760</width>
+      <height>45</height>
+      <font>font13</font>
+      <textcolor>FF36A9E8</textcolor>
+      <label></label>
+    </control>
+    <control type="progress" id="17">
+      <left>760</left>
+      <top>630</top>
+      <width>760</width>
+      <height>10</height>
+      <texturebg colordiffuse="FF263B4E">special://xbmc/addons/script.jumpgate.manager/resources/media/pixel.png</texturebg>
+      <lefttexture colordiffuse="FF36A9E8">special://xbmc/addons/script.jumpgate.manager/resources/media/pixel.png</lefttexture>
+      <midtexture colordiffuse="FF36A9E8">special://xbmc/addons/script.jumpgate.manager/resources/media/pixel.png</midtexture>
+      <righttexture colordiffuse="FF36A9E8">special://xbmc/addons/script.jumpgate.manager/resources/media/pixel.png</righttexture>
+      <overlaytexture>-</overlaytexture>
+    </control>
+    <control type="label" id="16">
+      <left>760</left>
+      <top>670</top>
+      <width>760</width>
+      <height>85</height>
+      <font>font13</font>
+      <textcolor>FFD7E5EF</textcolor>
+      <label></label>
+      <wrapmultiline>true</wrapmultiline>
+    </control>
+    <control type="button" id="20">
+      <left>760</left>
+      <top>800</top>
+      <width>350</width>
+      <height>70</height>
+      <font>font13</font>
+      <textcolor>FFD7E5EF</textcolor>
+      <focusedcolor>FF07111B</focusedcolor>
+      <texturefocus colordiffuse="FF36A9E8" border="10">special://xbmc/addons/script.jumpgate.manager/resources/media/pixel.png</texturefocus>
+      <texturenofocus colordiffuse="FF263B4E" border="10">special://xbmc/addons/script.jumpgate.manager/resources/media/pixel.png</texturenofocus>
+      <label>Cancel</label>
+      <align>center</align>
+      <aligny>center</aligny>
+    </control>
+    <control type="button" id="21">
+      <left>1140</left>
+      <top>800</top>
+      <width>380</width>
+      <height>70</height>
+      <font>font13</font>
+      <textcolor>FFD7E5EF</textcolor>
+      <focusedcolor>FF07111B</focusedcolor>
+      <texturefocus colordiffuse="FF36A9E8" border="10">special://xbmc/addons/script.jumpgate.manager/resources/media/pixel.png</texturefocus>
+      <texturenofocus colordiffuse="FF263B4E" border="10">special://xbmc/addons/script.jumpgate.manager/resources/media/pixel.png</texturenofocus>
+      <label>Request New Code</label>
+      <align>center</align>
+      <aligny>center</aligny>
+    </control>
+  </controls>
+</window>

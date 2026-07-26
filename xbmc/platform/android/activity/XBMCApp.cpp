@@ -31,6 +31,7 @@
 #include "cores/AudioEngine/Interfaces/AE.h"
 #include "cores/AudioEngine/Sinks/AESinkAUDIOTRACK.h"
 #include "cores/VideoPlayer/VideoRenderers/RenderManager.h"
+#include "dialogs/GUIDialogJumpgatePairing.h"
 #include "dialogs/GUIDialogKaiToast.h"
 #include "dialogs/GUIDialogOK.h"
 #include "dialogs/GUIDialogSelect.h"
@@ -63,11 +64,13 @@
 #include "utils/Digest.h"
 #include "utils/JSONVariantParser.h"
 #include "utils/JSONVariantWriter.h"
+#include "utils/JumpgatePairingCoordinator.h"
 #include "utils/JumpgatePlaybackClaimCoordinator.h"
 #include "utils/JumpgatePlaybackContext.h"
 #include "utils/JumpgatePlaybackHistory.h"
 #include "utils/JumpgateProfileHistoryPolicy.h"
 #include "utils/JumpgateProfileRuntime.h"
+#include "utils/JumpgateQrCode.h"
 #include "utils/JumpgateSourceFingerprint.h"
 #include "utils/JumpgateThreadRegistry.h"
 #include "utils/StringUtils.h"
@@ -90,6 +93,7 @@
 #include <algorithm>
 #include <cctype>
 #include <charconv>
+#include <condition_variable>
 #include <cstdio>
 #include <memory>
 #include <mutex>
@@ -178,6 +182,118 @@ static void ClearSensitiveString(std::string& value)
   std::fill(value.begin(), value.end(), '\0');
   value.clear();
 }
+
+static int ParseHttpStatus(const std::string& protocolLine);
+
+namespace
+{
+int ParsePositiveHeaderInt(const std::string& value)
+{
+  int parsed = 0;
+  const auto result = std::from_chars(value.data(), value.data() + value.size(), parsed);
+  return result.ec == std::errc{} && result.ptr == value.data() + value.size() && parsed > 0
+             ? parsed
+             : 0;
+}
+
+class CJumpgateCurlDeadline final
+{
+public:
+  CJumpgateCurlDeadline(std::shared_ptr<XFILE::CCurlFile> curl,
+                        std::chrono::steady_clock::time_point deadline)
+    : m_curl(std::move(curl)),
+      m_deadline(deadline),
+      m_watcher(&CJumpgateCurlDeadline::Run, this)
+  {
+  }
+
+  ~CJumpgateCurlDeadline() { Finish(); }
+
+  void Finish()
+  {
+    {
+      std::lock_guard lock(m_mutex);
+      m_finished = true;
+    }
+    m_condition.notify_all();
+    if (m_watcher.joinable() && m_watcher.get_id() != std::this_thread::get_id())
+      m_watcher.join();
+  }
+
+private:
+  void Run()
+  {
+    std::unique_lock lock(m_mutex);
+    const bool timedOut = !m_condition.wait_until(lock, m_deadline, [this] { return m_finished; });
+    lock.unlock();
+    if (timedOut)
+      m_curl->Cancel();
+  }
+
+  std::shared_ptr<XFILE::CCurlFile> m_curl;
+  std::chrono::steady_clock::time_point m_deadline;
+  std::mutex m_mutex;
+  std::condition_variable m_condition;
+  bool m_finished{false};
+  std::thread m_watcher;
+};
+
+class CJumpgateCurlPairingTransport final : public KODI::JUMPGATE::IJumpgatePairingTransport
+{
+public:
+  KODI::JUMPGATE::JumpgatePairingHttpResponse Post(const std::string& url,
+                                                   const std::string& body,
+                                                   std::chrono::steady_clock::time_point deadline,
+                                                   const std::function<bool()>& cancelled) override
+  {
+    auto curl = std::make_shared<XFILE::CCurlFile>();
+    curl->SetRequestHeader("Content-Type", "application/json");
+    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+        deadline - std::chrono::steady_clock::now());
+    const auto boundedRemaining =
+        std::clamp(remaining, std::chrono::milliseconds(1), std::chrono::milliseconds(10000));
+    const int timeoutSeconds = static_cast<int>((boundedRemaining.count() + 999) / 1000);
+    curl->SetTimeout(std::min(8, timeoutSeconds));
+    curl->SetTotalTimeout(timeoutSeconds);
+    {
+      std::lock_guard lock(m_mutex);
+      m_active = curl;
+    }
+    if (cancelled && cancelled())
+      curl->Cancel();
+
+    CJumpgateCurlDeadline deadlineWatcher(curl, deadline);
+
+    KODI::JUMPGATE::JumpgatePairingHttpResponse response;
+    response.completed = curl->Post(NoRedirectUrl(url), body, response.body);
+    deadlineWatcher.Finish();
+    response.statusCode = ParseHttpStatus(curl->GetHttpHeader().GetProtoLine());
+    response.retryAfterSeconds =
+        ParsePositiveHeaderInt(curl->GetHttpHeader().GetValue("Retry-After"));
+    {
+      std::lock_guard lock(m_mutex);
+      if (m_active == curl)
+        m_active.reset();
+    }
+    return response;
+  }
+
+  void Cancel() override
+  {
+    std::shared_ptr<XFILE::CCurlFile> active;
+    {
+      std::lock_guard lock(m_mutex);
+      active = m_active;
+    }
+    if (active)
+      active->Cancel();
+  }
+
+private:
+  std::mutex m_mutex;
+  std::shared_ptr<XFILE::CCurlFile> m_active;
+};
+} // namespace
 
 static std::vector<std::string> ParseJumpgateSubtitleLanguages(const std::string& configured)
 {
@@ -2862,30 +2978,25 @@ void CXBMCApp::QueuePairingRedemption(std::string responseJson,
   m_pairingRedemptionOrigin = origin;
   m_pairingApplyProfileName = profileName;
   m_pairingRedemptionPending = true;
-  m_pairingErrorPending = false;
-  m_pairingErrorMessage.clear();
-}
-
-void CXBMCApp::QueuePairingError(const std::string& errorMessage)
-{
-  std::unique_lock lock(m_pairingMutex);
-  m_pairingErrorPending = true;
-  m_pairingErrorMessage = errorMessage;
-  m_pairingRedemptionPending = false;
-  ClearSensitiveString(m_pairingRedemptionJson);
-  m_pairingRedemptionOrigin.clear();
-  m_pairingApplyProfileName.clear();
 }
 
 void CXBMCApp::StopBridgePairingWorker(bool clearPendingState, bool waitForCompletion)
 {
-  m_pairingStopRequested.store(true, std::memory_order_release);
+  std::shared_ptr<KODI::JUMPGATE::CJumpgatePairingCoordinator> coordinator;
+  {
+    std::unique_lock lock(m_pairingMutex);
+    coordinator = m_pairingCoordinator;
+  }
+  if (coordinator)
+    coordinator->Stop(waitForCompletion);
 
-  if (waitForCompletion && m_pairingThread.joinable())
-    m_pairingThread.join();
-
-  if (waitForCompletion)
-    m_pairingInProgress.store(false, std::memory_order_relaxed);
+  if (auto* gui = CServiceBroker::GetGUI())
+  {
+    if (auto* dialog = gui->GetWindowManager().GetWindow<CGUIDialogJumpgatePairing>(
+            WINDOW_DIALOG_JUMPGATE_PAIRING);
+        dialog && dialog->IsActive())
+      dialog->Close(true, 0, false, waitForCompletion);
+  }
 
   if (clearPendingState)
   {
@@ -2894,8 +3005,8 @@ void CXBMCApp::StopBridgePairingWorker(bool clearPendingState, bool waitForCompl
     ClearSensitiveString(m_pairingRedemptionJson);
     m_pairingRedemptionOrigin.clear();
     m_pairingApplyProfileName.clear();
-    m_pairingErrorPending = false;
-    m_pairingErrorMessage.clear();
+    if (waitForCompletion && m_pairingCoordinator == coordinator)
+      m_pairingCoordinator.reset();
   }
 }
 
@@ -2913,37 +3024,30 @@ void CXBMCApp::StartBridgePairing()
     return;
   }
 
-  if (m_pairingInProgress.load(std::memory_order_relaxed))
   {
-    CGUIDialogKaiToast::QueueNotification(CGUIDialogKaiToast::Info, "Jumpgate",
-                                          "Pairing already in progress", 3000, true);
-    return;
+    std::shared_ptr<KODI::JUMPGATE::CJumpgatePairingCoordinator> coordinator;
+    {
+      std::unique_lock lock(m_pairingMutex);
+      coordinator = m_pairingCoordinator;
+    }
+    if (coordinator &&
+        (coordinator->GetSnapshot().stage == KODI::JUMPGATE::JumpgatePairingStage::Issuing ||
+         coordinator->GetSnapshot().stage ==
+             KODI::JUMPGATE::JumpgatePairingStage::AwaitingActivation ||
+         coordinator->GetSnapshot().stage == KODI::JUMPGATE::JumpgatePairingStage::Applying))
+    {
+      CGUIDialogKaiToast::QueueNotification(CGUIDialogKaiToast::Info, "Jumpgate",
+                                            "Pairing already in progress", 3000, true);
+      return;
+    }
   }
 
-  StopBridgePairingWorker(false); // join stale completed worker, if any
-  m_pairingStopRequested.store(false, std::memory_order_relaxed);
-  m_pairingInProgress.store(true, std::memory_order_relaxed);
-
-  {
-    std::unique_lock lock(m_pairingMutex);
-    m_pairingRedemptionPending = false;
-    ClearSensitiveString(m_pairingRedemptionJson);
-    m_pairingRedemptionOrigin.clear();
-    m_pairingApplyProfileName.clear();
-    m_pairingErrorPending = false;
-    m_pairingErrorMessage.clear();
-  }
-
-  auto failStart = [this](const std::string& msg)
-  {
-    CLog::Log(LOGWARNING, "CXBMCApp: Pairing start failed: {}", msg);
-    QueuePairingError(msg);
-    m_pairingInProgress.store(false, std::memory_order_relaxed);
-  };
+  StopBridgePairingWorker(true);
 
   if (!InitializeJumpgateProfileRuntime())
   {
-    failStart("Pairing failed: secure profile runtime is unavailable");
+    CGUIDialogKaiToast::QueueNotification(CGUIDialogKaiToast::Error, "Jumpgate",
+                                          "Secure profile runtime is unavailable", 5000, true);
     return;
   }
 
@@ -2952,181 +3056,51 @@ void CXBMCApp::StartBridgePairing()
   const std::string origin = m_jumpgateProfileRuntime->GetPairingOrigin();
   if (!KODI::JUMPGATE::IsValidPairingOrigin(origin, true))
   {
-    failStart("Pairing failed: invalid Bridge origin");
+    CGUIDialogKaiToast::QueueNotification(CGUIDialogKaiToast::Error, "Jumpgate",
+                                          "Pairing Bridge origin is invalid", 5000, true);
     return;
   }
 
-  XFILE::CCurlFile curl;
-  curl.SetRequestHeader("Content-Type", "application/json");
-  curl.SetTimeout(8);
-  curl.SetTotalTimeout(10);
-
-  CVariant body(CVariant::VariantTypeObject);
-  std::string bodyJson;
-  if (!CJSONVariantWriter::Write(body, bodyJson, true))
-    bodyJson = "{}";
-
-  std::string response;
-  if (!curl.Post(NoRedirectUrl(origin + "/pair/device/code"), bodyJson, response))
+  auto transport = std::make_shared<CJumpgateCurlPairingTransport>();
+  auto coordinator = std::make_shared<KODI::JUMPGATE::CJumpgatePairingCoordinator>(transport);
   {
-    failStart("Pairing failed: unable to reach Bridge");
-    return;
+    std::unique_lock lock(m_pairingMutex);
+    m_pairingCoordinator = coordinator;
   }
 
-  CVariant data;
-  if (!CJSONVariantParser::Parse(response, data))
-  {
-    failStart("Pairing failed: invalid Bridge response");
-    return;
-  }
-
-  if (data.isMember("ok") && !data["ok"].asBoolean())
-  {
-    const std::string err =
-        data.isMember("error") ? data["error"].asString() : std::string("Pairing start rejected");
-    failStart(err);
-    return;
-  }
-
-  std::string userCode = data.isMember("user_code") ? data["user_code"].asString() : "";
-  if (userCode.empty())
-    userCode = data.isMember("userCode") ? data["userCode"].asString() : "";
-
-  std::string deviceCode = data.isMember("device_code") ? data["device_code"].asString() : "";
-  if (deviceCode.empty())
-    deviceCode = data.isMember("deviceCode") ? data["deviceCode"].asString() : "";
-
-  std::string verificationUrl =
-      data.isMember("verification_url") ? data["verification_url"].asString() : "";
-  if (verificationUrl.empty())
-    verificationUrl = data.isMember("verificationUrl") ? data["verificationUrl"].asString() : "";
-
-  int expiresIn =
-      data.isMember("expires_in") ? static_cast<int>(data["expires_in"].asInteger(0)) : 0;
-  if (expiresIn <= 0)
-    expiresIn = data.isMember("expiresIn") ? static_cast<int>(data["expiresIn"].asInteger(0)) : 0;
-  int interval = data.isMember("interval") ? static_cast<int>(data["interval"].asInteger(0)) : 0;
-
-  if (verificationUrl.empty())
-    verificationUrl = origin + "/configure";
-  if (expiresIn <= 0)
-    expiresIn = 600;
-  if (interval <= 0)
-    interval = 2;
-
-  if (userCode.empty() || deviceCode.empty())
-  {
-    failStart("Pairing failed: invalid code response");
-    return;
-  }
-
-  CGUIDialogOK::ShowAndGetInput(CVariant{"Pair Jumpgate"},
-                                CVariant{"On your phone or laptop, open:"},
-                                CVariant{verificationUrl}, CVariant{"Enter code: " + userCode});
-
-  m_pairingThread = std::thread(
-      [this, origin, deviceCode, expiresIn, interval]()
+  KODI::JUMPGATE::JumpgatePairingRequest request;
+  request.bridgeOrigin = origin;
+  request.deviceName = "Jumpgate";
+  const bool started = coordinator->Start(
+      std::move(request),
+      [this](std::string responseJson, const std::string& responseOrigin,
+             const std::string& profileName)
       {
-        auto getStringOrEmpty = [](const CVariant& payload, const char* key)
-        { return payload.isMember(key) ? payload[key].asString() : std::string{}; };
+        // AndroidKeyStore and profile activation remain on Kodi's main thread.
+        QueuePairingRedemption(std::move(responseJson), responseOrigin, profileName);
+      },
+      [](const std::string& verificationUrl) { return RenderJumpgatePairingQr(verificationUrl); },
+      [](const std::string& path) { XFILE::CFile::Delete(path); });
+  if (!started)
+  {
+    StopBridgePairingWorker(true);
+    CGUIDialogKaiToast::QueueNotification(CGUIDialogKaiToast::Error, "Jumpgate",
+                                          "Pairing could not be started", 5000, true);
+    return;
+  }
 
-        const int pollIntervalSec = std::max(1, interval);
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(expiresIn);
-
-        while (!m_pairingStopRequested.load(std::memory_order_relaxed) &&
-               std::chrono::steady_clock::now() < deadline)
-        {
-          CVariant pollBody(CVariant::VariantTypeObject);
-          pollBody["device_code"] = deviceCode;
-
-          std::string pollBodyJson;
-          if (!CJSONVariantWriter::Write(pollBody, pollBodyJson, true))
-          {
-            if (!m_pairingStopRequested.load(std::memory_order_relaxed))
-              QueuePairingError("Pairing failed: request serialization error");
-            m_pairingInProgress.store(false, std::memory_order_relaxed);
-            return;
-          }
-
-          XFILE::CCurlFile pollCurl;
-          pollCurl.SetRequestHeader("Content-Type", "application/json");
-          pollCurl.SetTimeout(8);
-          pollCurl.SetTotalTimeout(10);
-
-          std::string pollResponse;
-          if (!pollCurl.Post(NoRedirectUrl(origin + "/pair/device/token"), pollBodyJson,
-                             pollResponse))
-          {
-            if (!m_pairingStopRequested.load(std::memory_order_relaxed))
-              QueuePairingError("Pairing failed: unable to reach Bridge");
-            m_pairingInProgress.store(false, std::memory_order_relaxed);
-            return;
-          }
-
-          CVariant pollData;
-          if (!CJSONVariantParser::Parse(pollResponse, pollData))
-          {
-            ClearSensitiveString(pollResponse);
-            if (!m_pairingStopRequested.load(std::memory_order_relaxed))
-              QueuePairingError("Pairing failed: invalid token response");
-            m_pairingInProgress.store(false, std::memory_order_relaxed);
-            return;
-          }
-
-          if (pollData.isMember("ok") && !pollData["ok"].asBoolean())
-          {
-            std::string err = getStringOrEmpty(pollData, "error");
-            if (err.empty())
-              err = getStringOrEmpty(pollData, "message");
-            if (err.empty())
-              err = "Pairing failed";
-            ClearSensitiveString(pollResponse);
-            if (!m_pairingStopRequested.load(std::memory_order_relaxed))
-              QueuePairingError(err);
-            m_pairingInProgress.store(false, std::memory_order_relaxed);
-            return;
-          }
-
-          const bool paired = pollData.isMember("paired") && pollData["paired"].asBoolean();
-          if (paired)
-          {
-            if (m_pairingStopRequested.load(std::memory_order_acquire))
-            {
-              ClearSensitiveString(pollResponse);
-              m_pairingInProgress.store(false, std::memory_order_relaxed);
-              return;
-            }
-            std::string profileName = getStringOrEmpty(pollData, "name");
-            if (profileName.empty())
-              profileName = getStringOrEmpty(pollData, "profile_name");
-            if (profileName.empty())
-              profileName = getStringOrEmpty(pollData, "profileName");
-
-            // Commit through AndroidKeyStore on Kodi's main thread. The polling
-            // worker never makes JNI calls or mutates the active profile runtime.
-            QueuePairingRedemption(std::move(pollResponse), origin, profileName);
-            ClearSensitiveString(pollResponse);
-            m_pairingInProgress.store(false, std::memory_order_relaxed);
-            return;
-          }
-
-          ClearSensitiveString(pollResponse);
-
-          const int sleepMs = pollIntervalSec * 1000;
-          for (int elapsed = 0; elapsed < sleepMs; elapsed += 200)
-          {
-            if (m_pairingStopRequested.load(std::memory_order_relaxed) ||
-                std::chrono::steady_clock::now() >= deadline)
-              break;
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
-          }
-        }
-
-        if (!m_pairingStopRequested.load(std::memory_order_relaxed))
-          QueuePairingError("Pairing expired, try again");
-
-        m_pairingInProgress.store(false, std::memory_order_relaxed);
-      });
+  auto* dialog = CServiceBroker::GetGUI()->GetWindowManager().GetWindow<CGUIDialogJumpgatePairing>(
+      WINDOW_DIALOG_JUMPGATE_PAIRING);
+  if (!dialog)
+  {
+    StopBridgePairingWorker(true);
+    CGUIDialogKaiToast::QueueNotification(CGUIDialogKaiToast::Error, "Jumpgate",
+                                          "Pairing dialog is unavailable", 5000, true);
+    return;
+  }
+  dialog->SetCoordinator(coordinator);
+  dialog->Open();
+  StopBridgePairingWorker(false);
 }
 
 void CXBMCApp::CheckForUpdate()
@@ -3598,17 +3572,13 @@ void CXBMCApp::ProcessSlow()
     std::string pairingProfileName;
     std::string pairingErrorMessage;
     std::string pairingWarningMessage;
+    std::shared_ptr<KODI::JUMPGATE::CJumpgatePairingCoordinator> pairingCoordinator;
     bool pairingProfilePreviouslyKnown = false;
     bool pairingRedemptionPending = false;
     {
       std::unique_lock lock(m_pairingMutex);
       pairingRedemptionPending = m_pairingRedemptionPending;
-      if (!pairingRedemptionPending && m_pairingErrorPending)
-      {
-        pairingErrorMessage = m_pairingErrorMessage;
-        m_pairingErrorPending = false;
-        m_pairingErrorMessage.clear();
-      }
+      pairingCoordinator = m_pairingCoordinator;
     }
 
     std::optional<KODI::JUMPGATE::CJumpgatePlaybackAuthority::Token> transitionToken;
@@ -3626,8 +3596,30 @@ void CXBMCApp::ProcessSlow()
           pairingProfileName.swap(m_pairingApplyProfileName);
           m_pairingRedemptionPending = false;
           m_pairingApplyProfileName.clear();
-          m_pairingErrorPending = false;
-          m_pairingErrorMessage.clear();
+        }
+      }
+      else
+      {
+        bool rejectedPendingRedemption = false;
+        {
+          std::unique_lock lock(m_pairingMutex);
+          if (m_pairingRedemptionPending)
+          {
+            pairingRedemptionJson.swap(m_pairingRedemptionJson);
+            m_pairingRedemptionOrigin.clear();
+            m_pairingApplyProfileName.clear();
+            m_pairingRedemptionPending = false;
+            rejectedPendingRedemption = true;
+          }
+        }
+        ClearSensitiveString(pairingRedemptionJson);
+        if (rejectedPendingRedemption)
+        {
+          pairingErrorMessage = transitionError.empty()
+                                    ? "Pairing could not acquire local profile authority"
+                                    : transitionError;
+          if (pairingCoordinator)
+            pairingCoordinator->CompleteApply(false, pairingErrorMessage);
         }
       }
     }
@@ -3740,6 +3732,8 @@ void CXBMCApp::ProcessSlow()
       }
 
       FinishJumpgateProfileAuthorityTransition(*transitionToken, pairingCommitted);
+      if (pairingCoordinator)
+        pairingCoordinator->CompleteApply(pairingCommitted, pairingErrorMessage);
       if (pairingCommitted)
       {
         const std::string toast = "Paired and applied (" + pairingProfileName + ")";

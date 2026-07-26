@@ -87,6 +87,7 @@
 #include "dialogs/GUIDialogContextMenu.h"
 #include "dialogs/GUIDialogExtendedProgressBar.h"
 #include "dialogs/GUIDialogGamepad.h"
+#include "dialogs/GUIDialogJumpgatePairing.h"
 #include "dialogs/GUIDialogKaiToast.h"
 #include "dialogs/GUIDialogKeyboardGeneric.h"
 #include "dialogs/GUIDialogKeyboardTouch.h"
@@ -212,6 +213,7 @@ void CGUIWindowManager::CreateWindows()
   Add(new CGUIDialogSubMenu);
   Add(new CGUIDialogContextMenu);
   Add(new CGUIDialogKaiToast);
+  Add(new CGUIDialogJumpgatePairing);
   Add(new CGUIDialogNumeric);
   Add(new CGUIDialogGamepad);
   Add(new CGUIDialogButtonMenu);
@@ -475,6 +477,7 @@ bool CGUIWindowManager::DestroyWindows()
 
     DestroyWindow(WINDOW_DIALOG_PERIPHERALS);
     DestroyWindow(WINDOW_DIALOG_PERIPHERAL_SETTINGS);
+    DestroyWindow(WINDOW_DIALOG_JUMPGATE_PAIRING);
   }
   catch (...)
   {
