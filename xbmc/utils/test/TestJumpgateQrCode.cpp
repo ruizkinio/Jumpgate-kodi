@@ -8,6 +8,7 @@
 
 #include "filesystem/File.h"
 #include "utils/JumpgateQrCode.h"
+#include "utils/URIUtils.h"
 
 #include <algorithm>
 #include <array>
@@ -57,7 +58,15 @@ TEST(TestJumpgateQrCode, WritesPngAndCleansUpOwnedArtifact)
 {
   const std::string pngPath = RenderJumpgatePairingQr("https://bridge.example/pair");
   ASSERT_FALSE(pngPath.empty());
+  EXPECT_TRUE(URIUtils::IsSpecial(pngPath));
+  EXPECT_TRUE(URIUtils::PathHasParent(pngPath, "special://temp/"));
   ASSERT_TRUE(XFILE::CFile::Exists(pngPath, false));
+
+  const std::string secondPngPath = RenderJumpgatePairingQr("https://bridge.example/pair");
+  ASSERT_FALSE(secondPngPath.empty());
+  EXPECT_NE(secondPngPath, pngPath);
+  EXPECT_TRUE(URIUtils::PathHasParent(secondPngPath, "special://temp/"));
+  ASSERT_TRUE(XFILE::CFile::Exists(secondPngPath, false));
 
   XFILE::CFile file;
   ASSERT_TRUE(file.Open(pngPath));
@@ -78,6 +87,8 @@ TEST(TestJumpgateQrCode, WritesPngAndCleansUpOwnedArtifact)
 
   EXPECT_TRUE(XFILE::CFile::Delete(pngPath));
   EXPECT_FALSE(XFILE::CFile::Exists(pngPath, false));
+  EXPECT_TRUE(XFILE::CFile::Delete(secondPngPath));
+  EXPECT_FALSE(XFILE::CFile::Exists(secondPngPath, false));
 }
 
 TEST(TestJumpgateQrCode, RejectsEmptyAndOversizedInput)

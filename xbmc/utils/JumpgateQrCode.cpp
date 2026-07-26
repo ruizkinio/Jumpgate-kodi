@@ -10,15 +10,14 @@
 
 #include "filesystem/File.h"
 #include "pictures/Picture.h"
-#include "platform/Filesystem.h"
 #include "qrcodegen.hpp"
 #include "utils/StringUtils.h"
 #include "utils/URIUtils.h"
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <exception>
-#include <system_error>
 
 using namespace KODI::JUMPGATE;
 
@@ -27,6 +26,8 @@ namespace
 constexpr int QUIET_ZONE_MODULES = 4;
 constexpr int PIXELS_PER_MODULE = 8;
 constexpr int BYTES_PER_PIXEL = 4;
+constexpr std::array<unsigned char, 8> PNG_SIGNATURE{0x89, 0x50, 0x4e, 0x47,
+                                                     0x0d, 0x0a, 0x1a, 0x0a};
 
 bool RenderPixels(const JumpgateQrMatrix& matrix,
                   int& imageSize,
@@ -72,6 +73,22 @@ void RemoveIfPresent(const std::string& path) noexcept
 {
   if (!path.empty() && XFILE::CFile::Exists(path, false))
     XFILE::CFile::Delete(path);
+}
+
+bool IsReadablePng(const std::string& path)
+{
+  if (!XFILE::CFile::Exists(path, false))
+    return false;
+
+  XFILE::CFile file;
+  if (!file.Open(path))
+    return false;
+
+  std::array<unsigned char, PNG_SIGNATURE.size()> signature{};
+  const bool readable =
+      file.Read(signature.data(), signature.size()) == static_cast<ssize_t>(signature.size());
+  file.Close();
+  return readable && std::equal(PNG_SIGNATURE.begin(), PNG_SIGNATURE.end(), signature.begin());
 }
 } // namespace
 
@@ -124,16 +141,20 @@ std::string CJumpgateQrCode::RenderPng(std::string_view verificationUrl)
   if (!RenderPixels(matrix, imageSize, pixels))
     return {};
 
-  std::error_code error;
-  const std::string temporaryDirectory = KODI::PLATFORM::FILESYSTEM::temp_directory_path(error);
   const std::string uniqueId = StringUtils::CreateUUID();
-  if (error || temporaryDirectory.empty() || uniqueId.empty())
+  if (uniqueId.empty())
     return {};
-  const std::string pngPath =
-      URIUtils::AddFileToFolder(temporaryDirectory, "jumpgate-pairing-" + uniqueId + ".png");
+  const std::string pngPath = URIUtils::AddFileToFolder(
+      "special://temp/", "jumpgate-pairing-" + uniqueId + ".png");
 
   const int stride = imageSize * BYTES_PER_PIXEL;
   if (!CPicture::CreateThumbnailFromSurface(pixels.data(), imageSize, imageSize, stride, pngPath))
+  {
+    RemoveIfPresent(pngPath);
+    return {};
+  }
+
+  if (!IsReadablePng(pngPath))
   {
     RemoveIfPresent(pngPath);
     return {};
