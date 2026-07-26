@@ -47,6 +47,8 @@ public:
   {
     std::unique_lock lock(m_mutex);
     const TimePoint target = m_now + duration;
+    ++m_waitCount;
+    m_condition.notify_all();
     m_condition.wait(lock, [&] { return m_now >= target || interrupted(); });
     return interrupted();
   }
@@ -83,6 +85,12 @@ public:
     return m_condition.wait_for(lock, timeout, [this] { return m_nowBlocked; });
   }
 
+  bool WaitForWaitCount(std::size_t count, std::chrono::milliseconds timeout = 2s)
+  {
+    std::unique_lock lock(m_mutex);
+    return m_condition.wait_for(lock, timeout, [this, count] { return m_waitCount >= count; });
+  }
+
   void ReleaseBlockedNow()
   {
     {
@@ -98,6 +106,7 @@ private:
   mutable bool m_blockNextNow{false};
   mutable bool m_nowBlocked{false};
   mutable bool m_releaseNow{false};
+  std::size_t m_waitCount{0};
   TimePoint m_now{};
 };
 
@@ -415,8 +424,10 @@ TEST(TestJumpgatePairingCoordinator, PollsInOrderAndWaitsForSecureCommitBeforeAp
   ASSERT_TRUE(WaitForStage(harness.coordinator, JumpgatePairingStage::AwaitingActivation));
   EXPECT_EQ(harness.coordinator.GetSnapshot().remainingSeconds, 600);
 
+  ASSERT_TRUE(harness.clock->WaitForWaitCount(1));
   harness.clock->Advance(2s);
   ASSERT_TRUE(harness.transport->WaitForCalls(2));
+  ASSERT_TRUE(harness.clock->WaitForWaitCount(2));
   harness.clock->Advance(2s);
   ASSERT_TRUE(harness.transport->WaitForCalls(3));
   ASSERT_TRUE(WaitForStage(harness.coordinator, JumpgatePairingStage::Applying));
@@ -444,11 +455,13 @@ TEST(TestJumpgatePairingCoordinator, CountdownUsesIssueResponseDeadlineAndExpire
   ASSERT_TRUE(harness.transport->WaitForCalls(1));
   ASSERT_TRUE(WaitForStage(harness.coordinator, JumpgatePairingStage::AwaitingActivation));
 
+  ASSERT_TRUE(harness.clock->WaitForWaitCount(1));
   harness.clock->Advance(2s);
   ASSERT_TRUE(harness.transport->WaitForCalls(2));
   ASSERT_EQ(harness.transport->Deadlines().size(), 2U);
   EXPECT_EQ(harness.transport->Deadlines()[1], IJumpgatePairingClock::TimePoint{} + 3s);
   EXPECT_EQ(harness.coordinator.GetSnapshot().remainingSeconds, 1);
+  ASSERT_TRUE(harness.clock->WaitForWaitCount(2));
   harness.clock->Advance(1s);
   ASSERT_TRUE(WaitForStage(harness.coordinator, JumpgatePairingStage::Expired));
   EXPECT_TRUE(harness.CleanedQr().empty());
@@ -508,6 +521,7 @@ TEST(TestJumpgatePairingCoordinator, CancelInterruptsAnInflightTransport)
   ASSERT_TRUE(harness.Start());
   ASSERT_TRUE(harness.transport->WaitForCalls(1));
   ASSERT_TRUE(WaitForStage(harness.coordinator, JumpgatePairingStage::AwaitingActivation));
+  ASSERT_TRUE(harness.clock->WaitForWaitCount(1));
   harness.clock->Advance(2s);
   ASSERT_TRUE(harness.transport->WaitForCalls(2));
 
@@ -529,6 +543,7 @@ TEST(TestJumpgatePairingCoordinator, CancelAfterPollStopCheckRejectsLateTerminal
   harness.transport->BlockCall(2);
   ASSERT_TRUE(harness.Start());
   ASSERT_TRUE(WaitForStage(harness.coordinator, JumpgatePairingStage::AwaitingActivation));
+  ASSERT_TRUE(harness.clock->WaitForWaitCount(1));
   harness.clock->Advance(2s);
   ASSERT_TRUE(harness.transport->WaitForCalls(2));
 
@@ -557,6 +572,7 @@ TEST(TestJumpgatePairingCoordinator, RejectsPairedResponseReturnedAtDeadline)
   ASSERT_TRUE(harness.Start());
   ASSERT_TRUE(WaitForStage(harness.coordinator, JumpgatePairingStage::AwaitingActivation));
 
+  ASSERT_TRUE(harness.clock->WaitForWaitCount(1));
   harness.clock->Advance(2s);
   ASSERT_TRUE(harness.transport->WaitForCalls(2));
   harness.clock->Advance(1s);
@@ -578,6 +594,7 @@ TEST(TestJumpgatePairingCoordinator, UserCancelCannotOverrideSecureApplyBoundary
   ASSERT_TRUE(harness.Start());
   ASSERT_TRUE(WaitForStage(harness.coordinator, JumpgatePairingStage::AwaitingActivation));
 
+  ASSERT_TRUE(harness.clock->WaitForWaitCount(1));
   harness.clock->Advance(2s);
   ASSERT_TRUE(harness.WaitForRedemption());
   ASSERT_TRUE(WaitForStage(harness.coordinator, JumpgatePairingStage::Applying));
@@ -633,8 +650,10 @@ TEST(TestJumpgatePairingCoordinator, RateLimitUsesRetryAfterWithoutAbandoningCod
   ASSERT_TRUE(harness.Start());
   ASSERT_TRUE(harness.transport->WaitForCalls(1));
   ASSERT_TRUE(WaitForStage(harness.coordinator, JumpgatePairingStage::AwaitingActivation));
+  ASSERT_TRUE(harness.clock->WaitForWaitCount(1));
   harness.clock->Advance(2s);
   ASSERT_TRUE(harness.transport->WaitForCalls(2));
+  ASSERT_TRUE(harness.clock->WaitForWaitCount(2));
   harness.clock->Advance(5s);
   ASSERT_TRUE(harness.transport->WaitForCalls(3));
   ASSERT_TRUE(WaitForStage(harness.coordinator, JumpgatePairingStage::Applying));
