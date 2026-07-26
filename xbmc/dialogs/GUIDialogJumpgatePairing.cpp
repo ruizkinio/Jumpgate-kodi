@@ -10,6 +10,7 @@
 
 #include "ServiceBroker.h"
 #include "guilib/GUIImage.h"
+#include "guilib/GUIMessage.h"
 #include "guilib/GUIProgressControl.h"
 #include "utils/JumpgatePairingCoordinator.h"
 #include "utils/JumpgatePairingPresenter.h"
