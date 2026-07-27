@@ -1,4 +1,5 @@
 xbmc/utils/test/fixtures/source-fingerprint-v1.json text eol=lf
+tools/depends/target/libandroidjni/*.patch text eol=lf
 
 # Preserve audited Nayuki QR v1.8.0 source bytes; CI pins their SHA-256 values.
 xbmc/utils/qrcodegen.cpp -text -whitespace
