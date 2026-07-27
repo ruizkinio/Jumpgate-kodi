@@ -1,0 +1,2413 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+name: Jumpgate Android Release
+
+run-name: Release ${{ inputs.release_tag }} from ${{ inputs.reviewed_ref }}
+
+'on':
+  workflow_dispatch:
+    inputs:
+      reviewed_ref:
+        description: Reviewed full commit SHA or refs/tags/<tag> resolving to this default-branch workflow commit
+        required: true
+        type: string
+      release_tag:
+        description: Canonical v<Jumpgate-semver> tag derived from VERSION_TAG
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jumpgate-android-release
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  ANDROID_PLATFORM_VERSION: '36'
+  ANDROID_MIN_SDK_VERSION: '24'
+  ANDROID_BUILD_TOOLS_VERSION: '36.0.0'
+  ANDROID_NDK_VERSION: '28.2.13676358'
+  JAVA_VERSION: '17'
+  CACHE_SCHEMA_VERSION: release-v4
+  CANONICAL_REPOSITORY: ruizkinio/Jumpgate-kodi
+  CANONICAL_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+  SYFT_VERSION: 1.46.0
+  SYFT_LINUX_AMD64_SHA256: d654f678b709eb53c393d38519d5ed7d2e57205529404018614cfefa0fb2b5ca
+
+jobs:
+  validate_release_inputs:
+    name: Validate reviewed source and release tag
+    if: ${{ github.event_name == 'workflow_dispatch' && github.repository == 'ruizkinio/Jumpgate-kodi' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      default_branch: ${{ steps.release_inputs.outputs.default_branch }}
+      source_sha: ${{ steps.release_inputs.outputs.source_sha }}
+      reviewed_ref: ${{ steps.release_inputs.outputs.reviewed_ref }}
+      reviewed_ref_kind: ${{ steps.release_inputs.outputs.reviewed_ref_kind }}
+      reviewed_ref_object_sha: ${{ steps.release_inputs.outputs.reviewed_ref_object_sha }}
+      release_tag: ${{ steps.release_inputs.outputs.release_tag }}
+      app_name: ${{ steps.release_inputs.outputs.app_name }}
+      apk_prefix: ${{ steps.release_inputs.outputs.apk_prefix }}
+      core_library: ${{ steps.release_inputs.outputs.core_library }}
+      package: ${{ steps.release_inputs.outputs.package }}
+      version_name: ${{ steps.release_inputs.outputs.version_name }}
+      version_code: ${{ steps.release_inputs.outputs.version_code }}
+      jumpgate_semver: ${{ steps.release_inputs.outputs.jumpgate_semver }}
+      history_fingerprint: ${{ steps.release_history.outputs.history_fingerprint }}
+    steps:
+      - name: Check out reviewed source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Resolve immutable release inputs
+        id: release_inputs
+        env:
+          REVIEWED_REF: ${{ inputs.reviewed_ref }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          fail() {
+            echo "::error file=.github/workflows/jumpgate-android-release.yml::$*" >&2
+            exit 1
+          }
+          read_version_field() {
+            local key="$1"
+            awk -v key="$key" '
+              $1 == key {
+                $1 = ""
+                sub(/^[[:space:]]+/, "")
+                print
+                matches++
+              }
+              END { if (matches != 1) exit 1 }
+            ' version.txt
+          }
+          derive_android_version_code() {
+            local source="$1"
+            local code_major code_minor code_patch
+            local major_value minor_value patch_value value
+            [[ "$source" =~ ^[0-9]+\.[0-9]{1,2}\.[0-9]{1,3}$ ]] || return 1
+            IFS=. read -r code_major code_minor code_patch <<< "$source"
+            [[ ${#code_major} -le 5 &&
+               ${#code_minor} -le 2 &&
+               ${#code_patch} -le 3 ]] || return 1
+            major_value=$((10#$code_major))
+            minor_value=$((10#$code_minor))
+            patch_value=$((10#$code_patch))
+            value=$(((major_value * 100 + minor_value) * 1000 + patch_value))
+            ((value >= 1 && value <= 2100000000)) || return 1
+            printf '%s\n' "$value"
+          }
+
+          [[ "$GITHUB_EVENT_NAME" == 'workflow_dispatch' ]] ||
+            fail 'Release workflow only accepts workflow_dispatch'
+          [[ "$GITHUB_REPOSITORY" == "$CANONICAL_REPOSITORY" ]] ||
+            fail 'Release workflow only runs in the canonical repository'
+          git check-ref-format "refs/heads/$CANONICAL_DEFAULT_BRANCH" >/dev/null ||
+            fail 'Repository default branch is not a valid Git branch'
+          [[ "$GITHUB_REF" == "refs/heads/$CANONICAL_DEFAULT_BRANCH" ]] ||
+            fail 'Release workflow must be invoked from the canonical default branch'
+          [[ "$REVIEWED_REF" != *$'\n'* && "$REVIEWED_REF" != *$'\r'* ]] ||
+            fail 'Reviewed ref contains a line break'
+          [[ "$RELEASE_TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] ||
+            fail 'Release tag must be a safe single path component'
+          git check-ref-format "refs/tags/$RELEASE_TAG" >/dev/null ||
+            fail 'Release tag is not a valid Git tag'
+
+          source_sha="$(git rev-parse --verify HEAD^{commit})"
+          [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]] || fail 'Unable to resolve source commit'
+          workflow_sha="${WORKFLOW_SHA,,}"
+          [[ "$workflow_sha" =~ ^[0-9a-f]{40}$ ]] || fail 'Workflow commit SHA is malformed'
+          [[ "$source_sha" == "$workflow_sha" ]] ||
+            fail 'Reviewed source must exactly match github.workflow_sha'
+          remote_default_sha="$(
+            git ls-remote --exit-code --heads origin \
+              "refs/heads/$CANONICAL_DEFAULT_BRANCH" |
+              awk -v ref="refs/heads/$CANONICAL_DEFAULT_BRANCH" '
+                $2 == ref { sha = $1; matches++ }
+                END { if (matches != 1) exit 1; print sha }
+              '
+          )" || fail 'Unable to resolve the canonical default-branch head'
+          [[ "$remote_default_sha" == "$source_sha" ]] ||
+            fail 'Workflow commit is no longer the canonical default-branch head'
+          case "$REVIEWED_REF" in
+            refs/tags/*)
+              git check-ref-format "$REVIEWED_REF" >/dev/null ||
+                fail 'Reviewed tag ref is malformed'
+              remote_reviewed_tag="$(
+                git ls-remote --exit-code --tags origin \
+                  "$REVIEWED_REF" "$REVIEWED_REF^{}"
+              )" ||
+                fail 'Reviewed tag does not exist in the canonical repository'
+              reviewed_binding="$(
+                awk -v ref="$REVIEWED_REF" '
+                  $2 == ref { direct = $1; direct_matches++ }
+                  $2 == ref "^{}" { peeled = $1; peeled_matches++ }
+                  END {
+                    if (direct_matches != 1 || peeled_matches > 1) exit 1
+                    print direct "\t" (peeled != "" ? peeled : direct)
+                  }
+                ' <<< "$remote_reviewed_tag"
+              )" || fail 'Reviewed tag binding is malformed or ambiguous'
+              IFS=$'\t' read -r reviewed_ref_object_sha remote_source_sha <<< "$reviewed_binding"
+              [[ "$reviewed_ref_object_sha" =~ ^[0-9a-f]{40}$ &&
+                 "$remote_source_sha" =~ ^[0-9a-f]{40}$ ]] ||
+                fail 'Reviewed tag binding contains malformed object IDs'
+              [[ "$remote_source_sha" == "$source_sha" ]] ||
+                fail 'Reviewed tag moved or does not resolve to the checked-out commit'
+              reviewed_ref_kind=tag
+              ;;
+            [0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]*)
+              [[ "$REVIEWED_REF" =~ ^[0-9a-fA-F]{40}$ ]] ||
+                fail 'Reviewed commit must be a full 40-character SHA'
+              [[ "${REVIEWED_REF,,}" == "$source_sha" ]] ||
+                fail 'Checked-out commit does not match the reviewed SHA'
+              reviewed_ref_kind=commit
+              reviewed_ref_object_sha="$source_sha"
+              ;;
+            *)
+              fail 'Reviewed ref must be a full commit SHA or refs/tags/<tag>'
+              ;;
+          esac
+
+          app_name="$(read_version_field APP_NAME)"
+          expected_package="$(read_version_field APP_PACKAGE)"
+          version_major="$(read_version_field VERSION_MAJOR)"
+          version_minor="$(read_version_field VERSION_MINOR)"
+          version_tag="$(read_version_field VERSION_TAG)"
+          version_code_source="$(read_version_field VERSION_CODE)"
+          [[ "$app_name" =~ ^[A-Za-z][A-Za-z0-9_]{0,63}$ ]] ||
+            fail 'version.txt contains an invalid application name'
+          [[ "$expected_package" =~ ^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$ ]] ||
+            fail 'version.txt contains an invalid Android package'
+          [[ "$app_name" == 'Jumpgate' ]] ||
+            fail 'Reviewed source is not branded as Jumpgate'
+          [[ "$expected_package" == 'io.github.ruizkinio.jumpgate' ]] ||
+            fail 'Reviewed source does not use the Jumpgate Android package'
+          [[ "$version_major" =~ ^[0-9]+$ && "$version_minor" =~ ^[0-9]+$ ]] ||
+            fail 'version.txt contains an invalid display version'
+          [[ "$version_tag" =~ ^([A-Za-z0-9]+([._-][A-Za-z0-9]+)*-)?Jumpgate-((0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))$ ]] ||
+            fail 'VERSION_TAG must end in a canonical Jumpgate semantic version'
+          jumpgate_semver="${BASH_REMATCH[3]}"
+          canonical_release_tag="v$jumpgate_semver"
+          [[ "$RELEASE_TAG" == "$canonical_release_tag" ]] ||
+            fail "Release tag must be exactly $canonical_release_tag"
+          expected_version_code="$(derive_android_version_code "$version_code_source")" ||
+            fail 'VERSION_CODE must derive to Android range 1..2100000000'
+          expected_version_name="${version_major}.${version_minor}-${version_tag}"
+          [[ ${#expected_version_name} -le 128 ]] ||
+            fail 'version.txt display version is too long for deterministic release names'
+          app_name_lower="${app_name,,}"
+          apk_prefix="${app_name_lower}app"
+          core_library="lib${app_name_lower}.so"
+
+          set +e
+          git ls-remote --exit-code --tags origin \
+            "refs/tags/$canonical_release_tag" >/dev/null 2>&1
+          release_tag_status="$?"
+          set -e
+          case "$release_tag_status" in
+            0) fail 'Canonical release tag already exists' ;;
+            2) ;;
+            *) fail 'Unable to prove that the canonical release tag does not exist' ;;
+          esac
+
+          {
+            echo "default_branch=$CANONICAL_DEFAULT_BRANCH"
+            echo "source_sha=$source_sha"
+            echo "reviewed_ref=$REVIEWED_REF"
+            echo "reviewed_ref_kind=$reviewed_ref_kind"
+            echo "reviewed_ref_object_sha=$reviewed_ref_object_sha"
+            echo "release_tag=$RELEASE_TAG"
+            echo "app_name=$app_name"
+            echo "apk_prefix=$apk_prefix"
+            echo "core_library=$core_library"
+            echo "package=$expected_package"
+            echo "version_name=$expected_version_name"
+            echo "version_code=$expected_version_code"
+            echo "jumpgate_semver=$jumpgate_semver"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Enforce canonical semantic version and Android versionCode monotonicity
+        id: release_history
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CURRENT_RELEASE_TAG: ${{ steps.release_inputs.outputs.release_tag }}
+          CURRENT_VERSION_CODE: ${{ steps.release_inputs.outputs.version_code }}
+          CURRENT_SOURCE_SHA: ${{ steps.release_inputs.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          : "${GH_TOKEN:?GitHub token is required to inspect all releases, including drafts}"
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import hashlib
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          import urllib.error
+          import urllib.request
+
+
+          canonical_tag_pattern = re.compile(
+              r"^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$"
+          )
+          jumpgate_version_pattern = re.compile(
+              r"^(?:[A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)*-)?Jumpgate-"
+              r"((?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))$"
+          )
+
+
+          def run_git(*args: str) -> str:
+              result = subprocess.run(
+                  ["git", *args],
+                  check=False,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+                  text=True,
+              )
+              if result.returncode != 0:
+                  detail = result.stderr.strip() or result.stdout.strip() or "unknown git error"
+                  raise SystemExit(f"git {' '.join(args)} failed: {detail}")
+              return result.stdout
+
+
+          def parse_version_file(value: str, tag: str) -> int:
+              fields: dict[str, str] = {}
+              duplicates: set[str] = set()
+              for raw_line in value.splitlines():
+                  line = raw_line.strip()
+                  if not line or line.startswith("#"):
+                      continue
+                  parts = line.split(None, 1)
+                  if len(parts) != 2:
+                      continue
+                  key, field_value = parts
+                  if key in fields:
+                      duplicates.add(key)
+                  fields[key] = field_value.strip()
+              required = {"APP_NAME", "APP_PACKAGE", "VERSION_TAG", "VERSION_CODE"}
+              if duplicates & required or not required.issubset(fields):
+                  raise SystemExit(f"{tag} has missing or duplicate release identity fields")
+              if fields["APP_NAME"] != "Jumpgate":
+                  raise SystemExit(f"{tag} is not a Jumpgate source release")
+              if fields["APP_PACKAGE"] != "io.github.ruizkinio.jumpgate":
+                  raise SystemExit(f"{tag} has an unexpected Android package")
+              version_match = jumpgate_version_pattern.fullmatch(fields["VERSION_TAG"])
+              if version_match is None or f"v{version_match.group(1)}" != tag:
+                  raise SystemExit(f"{tag} does not match its source VERSION_TAG")
+              code_match = re.fullmatch(r"([0-9]+)\.([0-9]{1,2})\.([0-9]{1,3})", fields["VERSION_CODE"])
+              if code_match is None:
+                  raise SystemExit(f"{tag} has an invalid Android VERSION_CODE")
+              major, minor, patch = (int(part) for part in code_match.groups())
+              return (major * 100 + minor) * 1000 + patch
+
+
+          current_tag = os.environ["CURRENT_RELEASE_TAG"]
+          current_source_sha = os.environ["CURRENT_SOURCE_SHA"]
+          current_tag_match = canonical_tag_pattern.fullmatch(current_tag)
+          if current_tag_match is None:
+              raise SystemExit("Current release tag is outside the canonical v<semver> namespace")
+          current_semver = tuple(int(part) for part in current_tag_match.groups())
+          if re.fullmatch(r"[0-9a-f]{40}", current_source_sha) is None:
+              raise SystemExit("Current source SHA is malformed")
+          try:
+              current_version_code = int(os.environ["CURRENT_VERSION_CODE"])
+          except ValueError as error:
+              raise SystemExit("Current Android versionCode is malformed") from error
+          if current_version_code <= 0:
+              raise SystemExit("Current Android versionCode must be positive")
+
+          refs_output = run_git(
+              "ls-remote", "--tags", "--refs", "origin", "refs/tags/v*"
+          )
+          tag_refs: dict[str, str] = {}
+          for line in refs_output.splitlines():
+              parts = line.split()
+              if len(parts) != 2 or re.fullmatch(r"[0-9a-f]{40}", parts[0]) is None:
+                  raise SystemExit("Canonical tag listing contains malformed data")
+              prefix = "refs/tags/"
+              if not parts[1].startswith(prefix):
+                  raise SystemExit("Canonical tag listing escaped refs/tags")
+              tag = parts[1][len(prefix):]
+              if canonical_tag_pattern.fullmatch(tag) is None:
+                  raise SystemExit(f"Non-canonical tag occupies the v namespace: {tag}")
+              if tag in tag_refs:
+                  raise SystemExit(f"Duplicate canonical tag returned by origin: {tag}")
+              tag_refs[tag] = parts[0]
+
+          token = os.environ["GH_TOKEN"]
+          api_url = os.environ.get("GITHUB_API_URL", "https://api.github.com").rstrip("/")
+          repository = os.environ["GITHUB_REPOSITORY"]
+          release_tags: set[str] = set()
+          release_count = 0
+          for page in range(1, 1001):
+              request = urllib.request.Request(
+                  f"{api_url}/repos/{repository}/releases?per_page=100&page={page}",
+                  headers={
+                      "Accept": "application/vnd.github+json",
+                      "Authorization": f"Bearer {token}",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                  },
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      page_releases = json.load(response)
+              except (OSError, urllib.error.HTTPError, json.JSONDecodeError) as error:
+                  raise SystemExit(f"Unable to enumerate canonical GitHub releases: {error}") from error
+              if not isinstance(page_releases, list):
+                  raise SystemExit("GitHub releases API returned a non-list response")
+              for release in page_releases:
+                  if not isinstance(release, dict) or not isinstance(release.get("tag_name"), str):
+                      raise SystemExit("GitHub releases API returned malformed release data")
+                  tag = release["tag_name"]
+                  if canonical_tag_pattern.fullmatch(tag) is None:
+                      raise SystemExit(f"Release is outside the canonical v<semver> namespace: {tag}")
+                  if tag in release_tags:
+                      raise SystemExit(f"Duplicate canonical GitHub release: {tag}")
+                  release_tags.add(tag)
+                  release_count += 1
+              if len(page_releases) < 100:
+                  break
+          else:
+              raise SystemExit("Canonical release enumeration exceeded the fail-closed page limit")
+
+          if release_tags != set(tag_refs):
+              missing_releases = sorted(set(tag_refs) - release_tags)
+              missing_tags = sorted(release_tags - set(tag_refs))
+              raise SystemExit(
+                  "Canonical GitHub releases and refs/tags/v* differ "
+                  f"(tags without releases={missing_releases}, releases without tags={missing_tags})"
+              )
+          if current_tag in release_tags or current_tag in tag_refs:
+              raise SystemExit(f"Current canonical release already exists: {current_tag}")
+
+          if not release_tags and not tag_refs:
+              print("Strict first-release path: no canonical releases or v<semver> tags", file=sys.stderr)
+          else:
+              for prior_tag in sorted(release_tags):
+                  prior_tag_match = canonical_tag_pattern.fullmatch(prior_tag)
+                  if prior_tag_match is None:
+                      raise SystemExit(f"Prior release tag is not canonical: {prior_tag}")
+                  prior_semver = tuple(int(part) for part in prior_tag_match.groups())
+                  if current_semver <= prior_semver:
+                      raise SystemExit(
+                          "Current Jumpgate semantic version must be greater than every prior "
+                          f"canonical release ({current_tag} <= {prior_tag})"
+                      )
+                  local_ref = f"refs/jumpgate-release-history/{prior_tag}"
+                  run_git(
+                      "fetch",
+                      "--no-tags",
+                      "--force",
+                      "--depth=1",
+                      "origin",
+                      f"refs/tags/{prior_tag}:{local_ref}",
+                  )
+                  fetched_object = run_git("rev-parse", "--verify", local_ref).strip()
+                  if fetched_object != tag_refs[prior_tag]:
+                      raise SystemExit(f"Canonical tag moved while validating history: {prior_tag}")
+                  prior_commit = run_git("rev-parse", "--verify", f"{local_ref}^{{commit}}").strip()
+                  prior_version_file = run_git("show", f"{prior_commit}:version.txt")
+                  prior_version_code = parse_version_file(prior_version_file, prior_tag)
+                  if current_version_code <= prior_version_code:
+                      raise SystemExit(
+                          "Current Android versionCode must be greater than every prior canonical "
+                          f"Jumpgate release ({current_version_code} <= {prior_version_code} at {prior_tag})"
+                      )
+
+          fingerprint_lines = [f"release\t{tag}\n" for tag in sorted(release_tags)]
+          fingerprint_lines.extend(
+              f"tag\t{tag}\t{tag_refs[tag]}\n" for tag in sorted(tag_refs)
+          )
+          history_fingerprint = hashlib.sha256("".join(fingerprint_lines).encode("utf-8")).hexdigest()
+          print(f"history_fingerprint={history_fingerprint}")
+          print(
+              f"Validated {release_count} prior canonical release(s); history={history_fingerprint}",
+              file=sys.stderr,
+          )
+          PY
+
+  build_candidates:
+    name: Build candidate / ${{ matrix.abi }}
+    needs: validate_release_inputs
+    if: ${{ github.event_name == 'workflow_dispatch' && github.repository == 'ruizkinio/Jumpgate-kodi' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - host: aarch64-linux-android
+            abi: arm64-v8a
+            cache_id: arm64
+          - host: arm-linux-androideabi
+            abi: armeabi-v7a
+            cache_id: armv7
+    steps:
+      - name: Check out Kodi
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ needs.validate_release_inputs.outputs.source_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00 # v4.7.1
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          check-latest: false
+
+      - name: Install documented Ubuntu build packages
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
+            autoconf \
+            bison \
+            build-essential \
+            ccache \
+            curl \
+            flex \
+            gawk \
+            git \
+            gperf \
+            lib32stdc++6 \
+            lib32z1 \
+            lib32z1-dev \
+            libcurl4-openssl-dev \
+            python3 \
+            python3-yaml \
+            unzip \
+            zip \
+            zlib1g-dev
+
+      - name: Install exact Android SDK and NDK components
+        run: |
+          set -euo pipefail
+          : "${ANDROID_SDK_ROOT:?ANDROID_SDK_ROOT is required on the runner}"
+          sdkmanager_bin="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          if [[ ! -x "$sdkmanager_bin" ]]; then
+            sdkmanager_bin="$(
+              find "$ANDROID_SDK_ROOT/cmdline-tools" \
+                -path '*/bin/sdkmanager' -type f -perm -u+x -print 2>/dev/null |
+                LC_ALL=C sort -V |
+                tail -n 1 || true
+            )"
+          fi
+          if [[ -z "$sdkmanager_bin" || ! -x "$sdkmanager_bin" ]]; then
+            echo "Unable to locate sdkmanager below $ANDROID_SDK_ROOT/cmdline-tools" >&2
+            exit 1
+          fi
+
+          set +o pipefail
+          yes | "$sdkmanager_bin" --sdk_root="$ANDROID_SDK_ROOT" --licenses >/dev/null
+          license_status="${PIPESTATUS[1]}"
+          set -o pipefail
+          if [[ "$license_status" -ne 0 ]]; then
+            echo 'Android SDK license acceptance failed' >&2
+            exit 1
+          fi
+
+          "$sdkmanager_bin" --sdk_root="$ANDROID_SDK_ROOT" --install \
+            platform-tools \
+            "platforms;android-${ANDROID_PLATFORM_VERSION}" \
+            "build-tools;${ANDROID_BUILD_TOOLS_VERSION}" \
+            "ndk;${ANDROID_NDK_VERSION}"
+
+          ndk_root="$ANDROID_SDK_ROOT/ndk/$ANDROID_NDK_VERSION"
+          build_tools_root="$ANDROID_SDK_ROOT/build-tools/$ANDROID_BUILD_TOOLS_VERSION"
+          test -x "$build_tools_root/aapt2"
+          test -x "$build_tools_root/apksigner"
+          test -x "$build_tools_root/zipalign"
+          test -f "$build_tools_root/lib/apksigner.jar"
+          test -f "$ndk_root/source.properties"
+          grep -Eq "^Pkg\.Revision[[:space:]]*=[[:space:]]*${ANDROID_NDK_VERSION}$" \
+            "$ndk_root/source.properties"
+          java_major="$(java -XshowSettings:properties -version 2>&1 |
+            sed -n 's/^[[:space:]]*java\.version = \([0-9][0-9]*\).*/\1/p' | head -n 1)"
+          test "$java_major" = "$JAVA_VERSION"
+
+          {
+            echo "ANDROID_HOME=$ANDROID_SDK_ROOT"
+            echo "ANDROID_NDK_ROOT=$ndk_root"
+            echo "ANDROID_BUILD_TOOLS_ROOT=$build_tools_root"
+            echo "TARBALLS_DIR=$HOME/android-tools/xbmc-tarballs"
+            echo "DEPENDS_PREFIX=$HOME/android-tools/xbmc-depends-${{ matrix.cache_id }}"
+            echo "DEPENDS_STATE_DIR=$HOME/android-tools/xbmc-depends-state-${{ matrix.cache_id }}"
+            echo "GRADLE_USER_HOME=$HOME/.cache/jumpgate-gradle-${{ matrix.cache_id }}"
+            echo "CCACHE_DIR=$HOME/.cache/jumpgate-ccache-${{ matrix.cache_id }}"
+            echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE"
+            echo 'CCACHE_COMPILERCHECK=content'
+            echo "KODI_BUILD_DIR=$RUNNER_TEMP/kodi-build-${{ matrix.cache_id }}-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+            echo "ARTIFACT_DIR=$RUNNER_TEMP/jumpgate-release-build-${{ matrix.cache_id }}-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          } >> "$GITHUB_ENV"
+          echo "$build_tools_root" >> "$GITHUB_PATH"
+          echo "$ANDROID_SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
+
+      - name: Run static symbol and APK verifier tests
+        if: ${{ matrix.cache_id == 'arm64' }}
+        run: |
+          python3 tools/ci/jumpgate/test-manager-addon.py
+          python3 tools/ci/jumpgate/test-android-branding.py
+          python3 tools/ci/jumpgate/test-jumpgate-android-release-workflow.py
+          bash tools/ci/jumpgate/test-verify-shairplay-crypto-symbols.sh
+          python3 tools/ci/jumpgate/test-verify-android-python-runtime.py
+          bash tools/ci/jumpgate/test-verify-android-apk.sh
+          bash tools/ci/jumpgate/test-verify-android-release.sh
+
+      - name: Derive tracked-source cache keys
+        id: source-keys
+        run: |
+          set -euo pipefail
+          hash_tracked_tree() {
+            local tree="$1"
+            local first_file
+            first_file="$(git ls-files -- "$tree" | sed -n '1p')"
+            if [[ -z "$first_file" ]]; then
+              echo "No tracked files found under $tree" >&2
+              return 1
+            fi
+            git ls-files -z -- "$tree" |
+              LC_ALL=C sort -z |
+              xargs -0 sha256sum |
+              sha256sum |
+              cut -d ' ' -f 1
+          }
+
+          depends_hash="$(hash_tracked_tree tools/depends)"
+          gradle_hash="$(hash_tracked_tree tools/android/packaging)"
+          identity_hash="$(sha256sum version.txt | cut -d ' ' -f 1)"
+          toolchain_hash="$({
+            printf 'image=%s\n' "${ImageOS:-unknown}"
+            printf 'image-version=%s\n' "${ImageVersion:-unknown}"
+            printf 'android-min-sdk=%s\n' "$ANDROID_MIN_SDK_VERSION"
+            printf 'android-target-sdk=%s\n' "$ANDROID_PLATFORM_VERSION"
+            java -version 2>&1
+            gcc -dumpfullversion -dumpversion
+            dpkg-query -W -f='${binary:Package}=${Version}\n' \
+              autoconf bison build-essential ccache curl flex gawk git gperf \
+              lib32stdc++6 lib32z1 lib32z1-dev libcurl4-openssl-dev python3 \
+              python3-yaml \
+              unzip zip zlib1g-dev
+            sha256sum \
+              "$ANDROID_NDK_ROOT/source.properties" \
+              "$ANDROID_BUILD_TOOLS_ROOT/package.xml" \
+              "$ANDROID_SDK_ROOT/platforms/android-${ANDROID_PLATFORM_VERSION}/package.xml"
+          } | sha256sum | cut -d ' ' -f 1)"
+          {
+            echo "depends_hash=$depends_hash"
+            echo "gradle_hash=$gradle_hash"
+            echo "identity_hash=$identity_hash"
+            echo "toolchain_hash=$toolchain_hash"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Restore shared source tarballs
+        id: restore-tarballs
+        uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: ${{ env.TARBALLS_DIR }}
+          key: jumpgate-android-release-${{ env.CACHE_SCHEMA_VERSION }}-tarballs-${{ needs.validate_release_inputs.outputs.source_sha }}-${{ steps.source-keys.outputs.depends_hash }}
+
+      - name: Restore ABI dependency state
+        id: restore-depends
+        uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: |
+            ${{ env.DEPENDS_PREFIX }}
+            ${{ env.DEPENDS_STATE_DIR }}
+          key: jumpgate-android-release-${{ env.CACHE_SCHEMA_VERSION }}-depends-${{ needs.validate_release_inputs.outputs.source_sha }}-${{ runner.os }}-${{ runner.arch }}-${{ matrix.host }}-${{ steps.source-keys.outputs.toolchain_hash }}-${{ steps.source-keys.outputs.depends_hash }}-${{ steps.source-keys.outputs.identity_hash }}
+
+      - name: Restore ABI ccache
+        id: restore-ccache
+        uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: jumpgate-android-release-${{ env.CACHE_SCHEMA_VERSION }}-ccache-${{ needs.validate_release_inputs.outputs.source_sha }}-${{ runner.os }}-${{ matrix.host }}-${{ steps.source-keys.outputs.toolchain_hash }}
+
+      - name: Restore ABI Gradle cache
+        id: restore-gradle
+        uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: |
+            ${{ env.GRADLE_USER_HOME }}/caches
+            ${{ env.GRADLE_USER_HOME }}/wrapper
+          key: jumpgate-android-release-${{ env.CACHE_SCHEMA_VERSION }}-gradle-${{ needs.validate_release_inputs.outputs.source_sha }}-${{ runner.os }}-${{ matrix.host }}-${{ steps.source-keys.outputs.toolchain_hash }}-${{ steps.source-keys.outputs.gradle_hash }}-${{ steps.source-keys.outputs.identity_hash }}
+
+      - name: Create explicit candidate signing key
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/jumpgate-signing"
+          keystore="$RUNNER_TEMP/jumpgate-signing/${{ matrix.cache_id }}.keystore"
+          certificate="$RUNNER_TEMP/jumpgate-signing/${{ matrix.cache_id }}.cer"
+          store_password="$(head -c 48 /dev/urandom | base64 | tr -d '\n' | tr '/+' '_-')"
+          echo "::add-mask::$store_password"
+          keytool -genkeypair \
+            -keystore "$keystore" \
+            -storetype PKCS12 \
+            -alias jumpgate-ci \
+            -dname "CN=Jumpgate Ephemeral CI,O=Jumpgate,C=NL" \
+            -keyalg RSA \
+            -keysize 3072 \
+            -validity 2 \
+            -storepass "$store_password" \
+            -keypass "$store_password" \
+            -noprompt >/dev/null
+          chmod 600 "$keystore"
+          keytool -exportcert \
+            -keystore "$keystore" \
+            -storetype PKCS12 \
+            -alias jumpgate-ci \
+            -storepass "$store_password" \
+            -file "$certificate" >/dev/null
+          chmod 600 "$certificate"
+          signer_sha256="$(sha256sum "$certificate" | cut -d ' ' -f 1)"
+          [[ "$signer_sha256" =~ ^[0-9a-f]{64}$ ]]
+
+          {
+            echo "KODI_ANDROID_STORE_FILE=$keystore"
+            echo "KODI_ANDROID_CERT_FILE=$certificate"
+            echo "KODI_ANDROID_STORE_PASSWORD=$store_password"
+            echo 'KODI_ANDROID_KEY_ALIAS=jumpgate-ci'
+            echo "KODI_ANDROID_KEY_PASSWORD=$store_password"
+            echo "EXPECTED_APK_SIGNER_SHA256=$signer_sha256"
+          } >> "$GITHUB_ENV"
+
+      - name: Configure tools and dependencies
+        run: |
+          set -euo pipefail
+          mkdir -p "$TARBALLS_DIR" "$DEPENDS_PREFIX" "$DEPENDS_STATE_DIR" \
+            "$GRADLE_USER_HOME" "$CCACHE_DIR"
+          ccache --max-size=2G
+          ccache --zero-stats
+
+          pushd tools/depends >/dev/null
+          ./bootstrap
+          ./configure \
+            --with-tarballs="$TARBALLS_DIR" \
+            --host="${{ matrix.host }}" \
+            --with-sdk-path="$ANDROID_SDK_ROOT" \
+            --with-ndk-path="$ANDROID_NDK_ROOT" \
+            --with-ndk-api="$ANDROID_MIN_SDK_VERSION" \
+            --prefix="$DEPENDS_PREFIX" \
+            --disable-debug
+          popd >/dev/null
+
+          native_platform="$(awk -F= '$1 == "NATIVEPLATFORM" { print $2 }' tools/depends/Makefile.include)"
+          target_platform="$(awk -F= '$1 == "PLATFORM" { print $2 }' tools/depends/Makefile.include)"
+          ndk_level="$(awk -F= '$1 == "NDK_LEVEL" { print $2 }' tools/depends/Makefile.include)"
+          test -n "$native_platform"
+          test -n "$target_platform"
+          [[ "$ndk_level" =~ ^[0-9]+$ ]]
+          test "$ndk_level" = "$ANDROID_MIN_SDK_VERSION"
+          expected_target_platform="${{ matrix.host }}-${ndk_level}-release"
+          test "$target_platform" = "$expected_target_platform"
+
+          if [[ -f "$DEPENDS_STATE_DIR/native.complete" &&
+                -f "$DEPENDS_STATE_DIR/target.complete" ]] &&
+              grep -Fxq "native=$native_platform" "$DEPENDS_STATE_DIR/native.complete"; then
+            install -m 0644 "$DEPENDS_STATE_DIR/native.complete" \
+              "tools/depends/native/.installed-$native_platform"
+            install -m 0644 "$DEPENDS_STATE_DIR/target.complete" \
+              "tools/depends/target/.installed-$target_platform"
+          else
+            rm -f tools/depends/native/.installed-* tools/depends/target/.installed-*
+          fi
+
+      - name: Build tools and dependencies
+        run: |
+          set -Eeuo pipefail
+          trap 'status=$?; echo "::error file=.github/workflows/jumpgate-android.yml::Dependency validation failed at line $LINENO: $BASH_COMMAND (exit $status)" >&2; exit "$status"' ERR
+          fail() {
+            echo "::error file=.github/workflows/jumpgate-android.yml::$*" >&2
+            exit 1
+          }
+          require_file() {
+            [[ -f "$1" ]] || {
+              echo "Missing required file: $1" >&2
+              find "$(dirname "$1")" -maxdepth 1 -mindepth 1 -printf '%f\n' 2>/dev/null | LC_ALL=C sort >&2 || true
+              fail "$2"
+            }
+          }
+          require_nonempty() {
+            [[ -s "$1" ]] || fail "$2: $1"
+          }
+          require_executable() {
+            [[ -x "$1" ]] || fail "$2: $1"
+          }
+          require_equal() {
+            [[ "$1" == "$2" ]] || fail "$3 (expected '$2', found '$1')"
+          }
+          make -C tools/depends -j"$(getconf _NPROCESSORS_ONLN)"
+
+          native_platform="$(awk -F= '$1 == "NATIVEPLATFORM" { print $2 }' tools/depends/Makefile.include)"
+          target_platform="$(awk -F= '$1 == "PLATFORM" { print $2 }' tools/depends/Makefile.include)"
+          ndk_level="$(awk -F= '$1 == "NDK_LEVEL" { print $2 }' tools/depends/Makefile.include)"
+          [[ "$ndk_level" =~ ^[0-9]+$ ]] || fail "Invalid configured NDK level: '$ndk_level'"
+          require_equal "$ndk_level" "$ANDROID_MIN_SDK_VERSION" 'Configured NDK level mismatch'
+          require_equal \
+            "$target_platform" \
+            "${{ matrix.host }}-${ndk_level}-release" \
+            'Configured target platform mismatch'
+          echo "Validated dependency platforms: native=$native_platform target=$target_platform"
+          shairplay_archive="$DEPENDS_PREFIX/$target_platform/lib/libshairplay.a"
+          crypto_archive="$DEPENDS_PREFIX/$target_platform/lib/libcrypto.a"
+          shairplay_lib_dir="$(dirname "$shairplay_archive")"
+          llvm_ar="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
+          llvm_nm="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
+          require_nonempty "$shairplay_archive" 'Static Shairplay archive is missing or empty'
+          require_nonempty "$crypto_archive" 'Static OpenSSL crypto archive is missing or empty'
+          require_executable "$llvm_ar" 'NDK llvm-ar is unavailable'
+          require_executable "$llvm_nm" 'NDK llvm-nm is unavailable'
+
+          "$llvm_ar" t "$shairplay_archive" > "$RUNNER_TEMP/shairplay-archive-members.txt"
+          require_nonempty \
+            "$RUNNER_TEMP/shairplay-archive-members.txt" \
+            'Static Shairplay archive has no members'
+          if find "$shairplay_lib_dir" -maxdepth 1 \( -type f -o -type l \) \
+              -name 'libshairplay.so*' -print -quit | grep -q .; then
+            echo 'Unexpected installed libshairplay shared library:' >&2
+            find "$shairplay_lib_dir" -maxdepth 1 \( -type f -o -type l \) \
+              -name 'libshairplay.so*' -print >&2
+            exit 1
+          fi
+
+          bash tools/ci/jumpgate/verify-shairplay-crypto-symbols.sh \
+            "$llvm_nm" \
+            "$shairplay_archive" \
+            "$crypto_archive"
+
+          cat > "$RUNNER_TEMP/shairplay-expected-symbol-owners.txt" <<'EOF'
+          dnssd_destroy libshairplay_la-dnssd.o
+          dnssd_init libshairplay_la-dnssd.o
+          dnssd_register_airplay libshairplay_la-dnssd.o
+          dnssd_register_raop libshairplay_la-dnssd.o
+          dnssd_unregister_airplay libshairplay_la-dnssd.o
+          dnssd_unregister_raop libshairplay_la-dnssd.o
+          raop_destroy libshairplay_la-raop.o
+          raop_init libshairplay_la-raop.o
+          raop_init_from_keyfile libshairplay_la-raop.o
+          raop_is_running libshairplay_la-raop.o
+          raop_set_log_callback libshairplay_la-raop.o
+          raop_set_log_level libshairplay_la-raop.o
+          raop_start libshairplay_la-raop.o
+          raop_stop libshairplay_la-raop.o
+          EOF
+          "$llvm_nm" \
+            --format=posix \
+            --print-file-name \
+            --defined-only \
+            --extern-only \
+            "$shairplay_archive" > "$RUNNER_TEMP/shairplay-nm.txt"
+          require_nonempty "$RUNNER_TEMP/shairplay-nm.txt" 'Static Shairplay symbol table is empty'
+          awk '
+            NR == FNR { required[$1] = 1; next }
+            $1 ~ /\[[^][]+\]:$/ && ($2 in required) && $3 ~ /^[[:alpha:]]$/ {
+              owner = $1
+              sub(/^.*\[/, "", owner)
+              sub(/\]:$/, "", owner)
+              print $2 " " owner
+            }
+          ' \
+            "$RUNNER_TEMP/shairplay-expected-symbol-owners.txt" \
+            "$RUNNER_TEMP/shairplay-nm.txt" |
+            LC_ALL=C sort -u > "$RUNNER_TEMP/shairplay-actual-symbol-owners.txt"
+          if ! diff -u \
+              "$RUNNER_TEMP/shairplay-expected-symbol-owners.txt" \
+              "$RUNNER_TEMP/shairplay-actual-symbol-owners.txt"; then
+            fail 'Static Shairplay public symbol ownership is incomplete or unexpected'
+          fi
+          target_stamp="tools/depends/target/.installed-$target_platform"
+          require_file "$target_stamp" 'Kodi target dependency aggregate stamp is missing'
+          native_sentinel="$DEPENDS_STATE_DIR/native.complete.tmp"
+          printf 'native=%s\n' "$native_platform" > "$native_sentinel"
+          install -m 0644 "$native_sentinel" "$DEPENDS_STATE_DIR/native.complete"
+          rm -f "$native_sentinel"
+          install -m 0644 "tools/depends/target/.installed-$target_platform" \
+            "$DEPENDS_STATE_DIR/target.complete"
+          echo 'Static Shairplay and dependency cache sentinels validated.'
+
+      - name: Configure and build Kodi Release APK
+        run: |
+          set -euo pipefail
+          rm -rf "$KODI_BUILD_DIR"
+          mkdir -p "$KODI_BUILD_DIR"
+          target_platform="$(awk -F= '$1 == "PLATFORM" { print $2 }' tools/depends/Makefile.include)"
+          shairplay_archive="$DEPENDS_PREFIX/$target_platform/lib/libshairplay.a"
+          cmake_cache="$KODI_BUILD_DIR/CMakeCache.txt"
+          read_cmake_cache_value() {
+            local key="$1"
+            awk -v key="$key" '
+              index($0, key ":") == 1 && index($0, "=") != 0 {
+                print substr($0, index($0, "=") + 1)
+                matches++
+              }
+              END { if (matches != 1) exit 1 }
+            ' "$cmake_cache"
+          }
+          make -C tools/depends/target/cmakebuildsys BUILD_DIR="$KODI_BUILD_DIR"
+          test -s "$cmake_cache"
+          cached_shairplay_library="$(read_cmake_cache_value SHAIRPLAY_LIBRARY)"
+          test "$cached_shairplay_library" = "$shairplay_archive"
+          have_shairplay_callback_cls="$(read_cmake_cache_value HAVE_SHAIRPLAY_CALLBACK_CLS)"
+          case "${have_shairplay_callback_cls^^}" in
+            ''|0|OFF|NO|FALSE|N|IGNORE|NOTFOUND|*-NOTFOUND)
+              echo "HAVE_SHAIRPLAY_CALLBACK_CLS is not truthy: $have_shairplay_callback_cls" >&2
+              exit 1
+              ;;
+          esac
+          make -C "$KODI_BUILD_DIR" -j"$(getconf _NPROCESSORS_ONLN)"
+          make -C "$KODI_BUILD_DIR" apk
+          ccache --show-stats
+
+      - name: Verify and stage APK
+        run: |
+          set -euo pipefail
+          read_version_field() {
+            local key="$1"
+            awk -v key="$key" '
+              $1 == key {
+                $1 = ""
+                sub(/^[[:space:]]+/, "")
+                print
+                matches++
+              }
+              END { if (matches != 1) exit 1 }
+            ' version.txt
+          }
+          derive_android_version_code() {
+            local source="$1"
+            local code_major code_minor code_patch
+            local major_value minor_value patch_value value
+            [[ "$source" =~ ^[0-9]+\.[0-9]{1,2}\.[0-9]{1,3}$ ]] || return 1
+            IFS=. read -r code_major code_minor code_patch <<< "$source"
+            [[ ${#code_major} -le 5 &&
+               ${#code_minor} -le 2 &&
+               ${#code_patch} -le 3 ]] || return 1
+            major_value=$((10#$code_major))
+            minor_value=$((10#$code_minor))
+            patch_value=$((10#$code_patch))
+            value=$(((major_value * 100 + minor_value) * 1000 + patch_value))
+            ((value >= 1 && value <= 2100000000)) || return 1
+            printf '%s\n' "$value"
+          }
+
+          expected_package="$(read_version_field APP_PACKAGE)"
+          version_major="$(read_version_field VERSION_MAJOR)"
+          version_minor="$(read_version_field VERSION_MINOR)"
+          version_tag="$(read_version_field VERSION_TAG)"
+          version_code_source="$(read_version_field VERSION_CODE)"
+          [[ "$version_major" =~ ^[0-9]+$ ]]
+          [[ "$version_minor" =~ ^[0-9]+$ ]]
+          [[ "$version_tag" =~ ^[A-Za-z0-9._-]+$ ]]
+          expected_version_code="$(derive_android_version_code "$version_code_source")"
+          expected_version_name="${version_major}.${version_minor}-${version_tag}"
+          test "$expected_package" = "${{ needs.validate_release_inputs.outputs.package }}"
+          test "$expected_version_name" = "${{ needs.validate_release_inputs.outputs.version_name }}"
+          test "$expected_version_code" = "${{ needs.validate_release_inputs.outputs.version_code }}"
+          expected_core_library="${{ needs.validate_release_inputs.outputs.core_library }}"
+          [[ "$expected_core_library" =~ ^lib[A-Za-z0-9._+-]+\.so$ ]]
+          target_platform="$(awk -F= '$1 == "PLATFORM" { print $2 }' tools/depends/Makefile.include)"
+          target_prefix="$DEPENDS_PREFIX/$target_platform"
+          source_apk="${{ needs.validate_release_inputs.outputs.apk_prefix }}-${{ matrix.abi }}-release.apk"
+          artifact_apk="$ARTIFACT_DIR/jumpgate-release-candidate-${{ matrix.abi }}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.apk"
+          test -n "$expected_package"
+          test -n "$target_platform"
+          test -d "$target_prefix"
+          [[ "${EXPECTED_APK_SIGNER_SHA256:-}" =~ ^[0-9a-f]{64}$ ]]
+          test -f "$source_apk"
+          mkdir -p "$ARTIFACT_DIR"
+          install -m 0644 "$source_apk" "$artifact_apk"
+          bash tools/ci/jumpgate/verify-android-apk.sh \
+            "$artifact_apk" \
+            "${{ matrix.abi }}" \
+            "$expected_package" \
+            "$ANDROID_MIN_SDK_VERSION" \
+            "$ANDROID_PLATFORM_VERSION" \
+            "$expected_version_name" \
+            "$expected_version_code" \
+            "$EXPECTED_APK_SIGNER_SHA256" \
+            "$expected_core_library"
+          python3 tools/ci/jumpgate/verify-android-python-runtime.py \
+            "$artifact_apk" \
+            "${{ matrix.abi }}" \
+            "$target_prefix"
+          printf '%s\n' "$EXPECTED_APK_SIGNER_SHA256" > "$artifact_apk.signer-sha256"
+
+      - name: Save shared source tarballs
+        if: ${{ github.repository == env.CANONICAL_REPOSITORY && matrix.cache_id == 'arm64' && steps.restore-tarballs.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: ${{ env.TARBALLS_DIR }}
+          key: jumpgate-android-release-${{ env.CACHE_SCHEMA_VERSION }}-tarballs-${{ needs.validate_release_inputs.outputs.source_sha }}-${{ steps.source-keys.outputs.depends_hash }}
+
+      - name: Save ABI dependency state
+        if: ${{ github.repository == env.CANONICAL_REPOSITORY && steps.restore-depends.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: |
+            ${{ env.DEPENDS_PREFIX }}
+            ${{ env.DEPENDS_STATE_DIR }}
+          key: jumpgate-android-release-${{ env.CACHE_SCHEMA_VERSION }}-depends-${{ needs.validate_release_inputs.outputs.source_sha }}-${{ runner.os }}-${{ runner.arch }}-${{ matrix.host }}-${{ steps.source-keys.outputs.toolchain_hash }}-${{ steps.source-keys.outputs.depends_hash }}-${{ steps.source-keys.outputs.identity_hash }}
+
+      - name: Save ABI ccache
+        if: ${{ github.repository == env.CANONICAL_REPOSITORY && steps.restore-ccache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: jumpgate-android-release-${{ env.CACHE_SCHEMA_VERSION }}-ccache-${{ needs.validate_release_inputs.outputs.source_sha }}-${{ runner.os }}-${{ matrix.host }}-${{ steps.source-keys.outputs.toolchain_hash }}
+
+      - name: Save ABI Gradle cache
+        if: ${{ github.repository == env.CANONICAL_REPOSITORY && steps.restore-gradle.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: |
+            ${{ env.GRADLE_USER_HOME }}/caches
+            ${{ env.GRADLE_USER_HOME }}/wrapper
+          key: jumpgate-android-release-${{ env.CACHE_SCHEMA_VERSION }}-gradle-${{ needs.validate_release_inputs.outputs.source_sha }}-${{ runner.os }}-${{ matrix.host }}-${{ steps.source-keys.outputs.toolchain_hash }}-${{ steps.source-keys.outputs.gradle_hash }}-${{ steps.source-keys.outputs.identity_hash }}
+
+      - name: Remove ephemeral signing material
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${KODI_ANDROID_STORE_FILE:-}" ]]; then
+            rm -f -- "$KODI_ANDROID_STORE_FILE"
+          fi
+          if [[ -n "${KODI_ANDROID_CERT_FILE:-}" ]]; then
+            rm -f -- "$KODI_ANDROID_CERT_FILE"
+          fi
+
+      - name: Upload verified release candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: jumpgate-android-release-candidate-${{ matrix.abi }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.ARTIFACT_DIR }}/jumpgate-release-candidate-${{ matrix.abi }}-${{ github.run_id }}-${{ github.run_attempt }}.apk
+            ${{ env.ARTIFACT_DIR }}/jumpgate-release-candidate-${{ matrix.abi }}-${{ github.run_id }}-${{ github.run_attempt }}.apk.sha256
+            ${{ env.ARTIFACT_DIR }}/jumpgate-release-candidate-${{ matrix.abi }}-${{ github.run_id }}-${{ github.run_attempt }}.apk.signer-sha256
+          if-no-files-found: error
+          compression-level: 0
+          include-hidden-files: false
+          retention-days: 7
+
+  sign_release_apks:
+    name: Sign both release ABIs
+    needs:
+      - validate_release_inputs
+      - build_candidates
+    if: ${{ github.event_name == 'workflow_dispatch' && github.repository == 'ruizkinio/Jumpgate-kodi' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment:
+      name: android-release
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Check out trusted release tooling
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00 # v4.7.1
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          check-latest: false
+
+      - name: Install exact Android signing tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
+            binutils curl python3 python3-yaml unzip
+          : "${ANDROID_SDK_ROOT:?ANDROID_SDK_ROOT is required on the runner}"
+          sdkmanager_bin="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          if [[ ! -x "$sdkmanager_bin" ]]; then
+            sdkmanager_bin="$(
+              find "$ANDROID_SDK_ROOT/cmdline-tools" \
+                -path '*/bin/sdkmanager' -type f -perm -u+x -print 2>/dev/null |
+                LC_ALL=C sort -V |
+                tail -n 1 || true
+            )"
+          fi
+          [[ -n "$sdkmanager_bin" && -x "$sdkmanager_bin" ]]
+          set +o pipefail
+          yes | "$sdkmanager_bin" --sdk_root="$ANDROID_SDK_ROOT" --licenses >/dev/null
+          license_status="${PIPESTATUS[1]}"
+          set -o pipefail
+          [[ "$license_status" -eq 0 ]]
+          "$sdkmanager_bin" --sdk_root="$ANDROID_SDK_ROOT" --install \
+            "platforms;android-${ANDROID_PLATFORM_VERSION}" \
+            "build-tools;${ANDROID_BUILD_TOOLS_VERSION}"
+          build_tools_root="$ANDROID_SDK_ROOT/build-tools/$ANDROID_BUILD_TOOLS_VERSION"
+          test -x "$build_tools_root/aapt2"
+          test -x "$build_tools_root/apksigner"
+          test -x "$build_tools_root/zipalign"
+          test -f "$build_tools_root/package.xml"
+          {
+            echo "ANDROID_BUILD_TOOLS_ROOT=$build_tools_root"
+            echo "CANDIDATE_ROOT=$RUNNER_TEMP/jumpgate-release-candidates-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+            echo "SIGNED_ROOT=$RUNNER_TEMP/jumpgate-release-signed-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          } >> "$GITHUB_ENV"
+          echo "$build_tools_root" >> "$GITHUB_PATH"
+
+      - name: Download current-run arm64-v8a candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: jumpgate-android-release-candidate-arm64-v8a-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/jumpgate-release-candidates-${{ github.run_id }}-${{ github.run_attempt }}/arm64-v8a
+
+      - name: Download current-run armeabi-v7a candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: jumpgate-android-release-candidate-armeabi-v7a-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/jumpgate-release-candidates-${{ github.run_id }}-${{ github.run_attempt }}/armeabi-v7a
+
+      - name: Reverify candidate artifacts before secret access
+        env:
+          EXPECTED_PACKAGE: ${{ needs.validate_release_inputs.outputs.package }}
+          EXPECTED_CORE_LIBRARY: ${{ needs.validate_release_inputs.outputs.core_library }}
+          EXPECTED_VERSION_NAME: ${{ needs.validate_release_inputs.outputs.version_name }}
+          EXPECTED_VERSION_CODE: ${{ needs.validate_release_inputs.outputs.version_code }}
+        run: |
+          set -euo pipefail
+          fail() {
+            echo "::error file=.github/workflows/jumpgate-android-release.yml::$*" >&2
+            exit 1
+          }
+          for abi in arm64-v8a armeabi-v7a; do
+            candidate_dir="$CANDIDATE_ROOT/$abi"
+            candidate_name="jumpgate-release-candidate-${abi}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.apk"
+            candidate="$candidate_dir/$candidate_name"
+            expected_names="$candidate_name
+          $candidate_name.sha256
+          $candidate_name.signer-sha256"
+            actual_names="$(
+              find "$candidate_dir" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' |
+                LC_ALL=C sort
+            )"
+            [[ "$actual_names" == "$expected_names" ]] ||
+              fail "Candidate artifact for $abi has missing or unexpected files"
+            if find "$candidate_dir" -mindepth 1 -maxdepth 1 ! -type f -print -quit |
+                grep -q .; then
+              fail "Candidate artifact for $abi contains a non-regular entry"
+            fi
+            (
+              cd "$candidate_dir"
+              sha256sum --check --strict "$candidate_name.sha256"
+            )
+            candidate_signer="$(tr -d '\r\n' < "$candidate.signer-sha256")"
+            [[ "$candidate_signer" =~ ^[0-9a-f]{64}$ ]] ||
+              fail "Candidate signer digest for $abi is malformed"
+            bash tools/ci/jumpgate/verify-android-apk.sh \
+              "$candidate" \
+              "$abi" \
+              "$EXPECTED_PACKAGE" \
+              "$ANDROID_MIN_SDK_VERSION" \
+              "$ANDROID_PLATFORM_VERSION" \
+              "$EXPECTED_VERSION_NAME" \
+              "$EXPECTED_VERSION_CODE" \
+              "$candidate_signer" \
+              "$EXPECTED_CORE_LIBRARY"
+          done
+
+      - name: Revalidate reviewed source binding before secret access
+        env:
+          REVIEWED_REF: ${{ needs.validate_release_inputs.outputs.reviewed_ref }}
+          REVIEWED_REF_KIND: ${{ needs.validate_release_inputs.outputs.reviewed_ref_kind }}
+          REVIEWED_REF_OBJECT_SHA: ${{ needs.validate_release_inputs.outputs.reviewed_ref_object_sha }}
+          SOURCE_SHA: ${{ needs.validate_release_inputs.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          fail() {
+            echo "::error file=.github/workflows/jumpgate-android-release.yml::$*" >&2
+            exit 1
+          }
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ &&
+             "$REVIEWED_REF_OBJECT_SHA" =~ ^[0-9a-f]{40}$ ]] ||
+            fail 'Reviewed source binding contains malformed object IDs'
+          case "$REVIEWED_REF_KIND" in
+            tag)
+              [[ "$REVIEWED_REF" == refs/tags/* ]] ||
+                fail 'Reviewed tag binding kind does not match its ref'
+              git check-ref-format "$REVIEWED_REF" >/dev/null ||
+                fail 'Reviewed tag ref is malformed before signing'
+              remote_reviewed_tag="$(
+                git ls-remote --exit-code --tags origin \
+                  "$REVIEWED_REF" "$REVIEWED_REF^{}"
+              )" || fail 'Reviewed tag was deleted before signing'
+              reviewed_binding="$(
+                awk -v ref="$REVIEWED_REF" '
+                  $2 == ref { direct = $1; direct_matches++ }
+                  $2 == ref "^{}" { peeled = $1; peeled_matches++ }
+                  END {
+                    if (direct_matches != 1 || peeled_matches > 1) exit 1
+                    print direct "\t" (peeled != "" ? peeled : direct)
+                  }
+                ' <<< "$remote_reviewed_tag"
+              )" || fail 'Reviewed tag binding became malformed before signing'
+              IFS=$'\t' read -r current_object_sha current_source_sha <<< "$reviewed_binding"
+              [[ "$current_object_sha" == "$REVIEWED_REF_OBJECT_SHA" &&
+                 "$current_source_sha" == "$SOURCE_SHA" ]] ||
+                fail 'Reviewed tag moved before signing'
+              ;;
+            commit)
+              [[ "$REVIEWED_REF" =~ ^[0-9a-fA-F]{40}$ &&
+                 "${REVIEWED_REF,,}" == "$SOURCE_SHA" &&
+                 "$REVIEWED_REF_OBJECT_SHA" == "$SOURCE_SHA" ]] ||
+                fail 'Reviewed commit binding changed before signing'
+              ;;
+            *)
+              fail 'Reviewed source binding kind is invalid before signing'
+              ;;
+          esac
+
+      - name: Import one protected PKCS12 and sign both ABIs
+        env:
+          RELEASE_KEYSTORE_P12_BASE64: ${{ secrets.JUMPGATE_ANDROID_RELEASE_KEYSTORE_P12_BASE64 }}
+          RELEASE_KEYSTORE_PASSWORD: ${{ secrets.JUMPGATE_ANDROID_RELEASE_KEYSTORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.JUMPGATE_ANDROID_RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.JUMPGATE_ANDROID_RELEASE_KEY_PASSWORD }}
+          RELEASE_SIGNER_SHA256: ${{ secrets.JUMPGATE_ANDROID_RELEASE_SIGNER_SHA256 }}
+          EXPECTED_VERSION_NAME: ${{ needs.validate_release_inputs.outputs.version_name }}
+        run: |
+          set -euo pipefail
+          umask 077
+          fail() {
+            echo "::error file=.github/workflows/jumpgate-android-release.yml::$*" >&2
+            exit 1
+          }
+          signing_dir="$RUNNER_TEMP/jumpgate-protected-signing-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          keystore="$signing_dir/jumpgate-release.p12"
+          certificate="$signing_dir/jumpgate-release.cer"
+          alias_listing="$signing_dir/key-alias.txt"
+          cleanup() {
+            rm -rf -- "$signing_dir"
+            find "$SIGNED_ROOT" -maxdepth 1 -type f -name '*.aligned.apk' -delete 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          [[ -n "$RELEASE_KEYSTORE_P12_BASE64" ]] || fail 'PKCS12 keystore secret is absent'
+          [[ -n "$RELEASE_KEYSTORE_PASSWORD" ]] || fail 'PKCS12 store password secret is absent'
+          [[ -n "$RELEASE_KEY_ALIAS" ]] || fail 'PKCS12 key alias secret is absent'
+          [[ -n "$RELEASE_KEY_PASSWORD" ]] || fail 'PKCS12 key password secret is absent'
+          [[ -n "$RELEASE_SIGNER_SHA256" ]] || fail 'Expected signer fingerprint secret is absent'
+          [[ "$RELEASE_KEYSTORE_P12_BASE64" =~ ^[A-Za-z0-9+/]+={0,2}$ ]] ||
+            fail 'PKCS12 keystore secret is not strict base64'
+          (( ${#RELEASE_KEYSTORE_P12_BASE64} % 4 == 0 )) ||
+            fail 'PKCS12 keystore base64 length is malformed'
+          [[ "$RELEASE_KEYSTORE_PASSWORD" != *$'\n'* && "$RELEASE_KEYSTORE_PASSWORD" != *$'\r'* ]] ||
+            fail 'PKCS12 store password contains a line break'
+          [[ "$RELEASE_KEY_PASSWORD" != *$'\n'* && "$RELEASE_KEY_PASSWORD" != *$'\r'* ]] ||
+            fail 'PKCS12 key password contains a line break'
+          [[ "$RELEASE_KEY_ALIAS" =~ ^[A-Za-z0-9._-]{1,128}$ ]] ||
+            fail 'PKCS12 key alias is malformed'
+          [[ "${RELEASE_KEY_ALIAS,,}" != 'androiddebugkey' ]] ||
+            fail 'Android debug key alias is forbidden for releases'
+          [[ "${RELEASE_KEYSTORE_PASSWORD,,}" != 'android' ]] ||
+            fail 'Android debug store password is forbidden for releases'
+          [[ "${RELEASE_KEY_PASSWORD,,}" != 'android' ]] ||
+            fail 'Android debug key password is forbidden for releases'
+          expected_signer="${RELEASE_SIGNER_SHA256,,}"
+          [[ "$expected_signer" =~ ^[0-9a-f]{64}$ ]] ||
+            fail 'Expected signer fingerprint must be 64 hexadecimal characters'
+
+          mkdir -p "$signing_dir" "$SIGNED_ROOT"
+          printf '%s' "$RELEASE_KEYSTORE_P12_BASE64" | base64 --decode > "$keystore" ||
+            fail 'PKCS12 keystore secret cannot be decoded'
+          test -s "$keystore" || fail 'Decoded PKCS12 keystore is empty'
+          chmod 600 "$keystore"
+          keytool -list -v \
+            -keystore "$keystore" \
+            -storetype PKCS12 \
+            -storepass:env RELEASE_KEYSTORE_PASSWORD \
+            -alias "$RELEASE_KEY_ALIAS" > "$alias_listing" 2>&1 ||
+            fail 'PKCS12 keystore, password, or alias is invalid'
+          grep -Fq 'Entry type: PrivateKeyEntry' "$alias_listing" ||
+            fail 'Selected PKCS12 alias is not a private-key entry'
+          keytool -exportcert \
+            -keystore "$keystore" \
+            -storetype PKCS12 \
+            -storepass:env RELEASE_KEYSTORE_PASSWORD \
+            -alias "$RELEASE_KEY_ALIAS" \
+            -file "$certificate" >/dev/null ||
+            fail 'Unable to export the selected signing certificate'
+          chmod 600 "$certificate"
+          certificate_details="$(keytool -printcert -file "$certificate")"
+          if grep -Eiq '(^|[[:space:],])CN=Android Debug([[:space:],]|$)' <<< "$certificate_details"; then
+            fail 'Android debug certificate is forbidden for releases'
+          fi
+          actual_signer="$(sha256sum "$certificate" | cut -d ' ' -f 1)"
+          [[ "$actual_signer" == "$expected_signer" ]] ||
+            fail 'Protected certificate does not match the expected signer fingerprint'
+
+          for abi in arm64-v8a armeabi-v7a; do
+            candidate="$CANDIDATE_ROOT/$abi/jumpgate-release-candidate-${abi}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.apk"
+            aligned="$SIGNED_ROOT/Jumpgate-${EXPECTED_VERSION_NAME}-${abi}.aligned.apk"
+            output="$SIGNED_ROOT/Jumpgate-${EXPECTED_VERSION_NAME}-${abi}.apk"
+            test -f "$candidate"
+            test ! -e "$output" || fail "Signed output already exists for $abi"
+            zipalign -f -p 4 "$candidate" "$aligned"
+            apksigner sign \
+              --ks "$keystore" \
+              --ks-type PKCS12 \
+              --ks-key-alias "$RELEASE_KEY_ALIAS" \
+              --ks-pass env:RELEASE_KEYSTORE_PASSWORD \
+              --key-pass env:RELEASE_KEY_PASSWORD \
+              --v1-signing-enabled true \
+              --v2-signing-enabled true \
+              --v3-signing-enabled true \
+              --v4-signing-enabled false \
+              --out "$output" \
+              "$aligned"
+            rm -f -- "$aligned"
+          done
+          printf '%s\n' "$actual_signer" > "$SIGNED_ROOT/expected-release-signer.sha256"
+
+      - name: Independently verify protected signatures and release identities
+        env:
+          EXPECTED_PACKAGE: ${{ needs.validate_release_inputs.outputs.package }}
+          EXPECTED_CORE_LIBRARY: ${{ needs.validate_release_inputs.outputs.core_library }}
+          EXPECTED_VERSION_NAME: ${{ needs.validate_release_inputs.outputs.version_name }}
+          EXPECTED_VERSION_CODE: ${{ needs.validate_release_inputs.outputs.version_code }}
+        run: |
+          set -euo pipefail
+          expected_signer="$(tr -d '\r\n' < "$SIGNED_ROOT/expected-release-signer.sha256")"
+          [[ "$expected_signer" =~ ^[0-9a-f]{64}$ ]]
+          for abi in arm64-v8a armeabi-v7a; do
+            output="$SIGNED_ROOT/Jumpgate-${EXPECTED_VERSION_NAME}-${abi}.apk"
+            bash tools/ci/jumpgate/verify-android-apk.sh \
+              "$output" \
+              "$abi" \
+              "$EXPECTED_PACKAGE" \
+              "$ANDROID_MIN_SDK_VERSION" \
+              "$ANDROID_PLATFORM_VERSION" \
+              "$EXPECTED_VERSION_NAME" \
+              "$EXPECTED_VERSION_CODE" \
+              "$expected_signer" \
+              "$EXPECTED_CORE_LIBRARY"
+            printf '%s\n' "$expected_signer" > "$output.signer-sha256"
+          done
+          rm -f -- "$SIGNED_ROOT/expected-release-signer.sha256"
+
+      - name: Upload current-run arm64-v8a release APK
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: jumpgate-android-release-signed-arm64-v8a-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.SIGNED_ROOT }}/Jumpgate-${{ needs.validate_release_inputs.outputs.version_name }}-arm64-v8a.apk
+            ${{ env.SIGNED_ROOT }}/Jumpgate-${{ needs.validate_release_inputs.outputs.version_name }}-arm64-v8a.apk.sha256
+            ${{ env.SIGNED_ROOT }}/Jumpgate-${{ needs.validate_release_inputs.outputs.version_name }}-arm64-v8a.apk.signer-sha256
+          if-no-files-found: error
+          compression-level: 0
+          include-hidden-files: false
+          retention-days: 30
+
+      - name: Upload current-run armeabi-v7a release APK
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: jumpgate-android-release-signed-armeabi-v7a-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.SIGNED_ROOT }}/Jumpgate-${{ needs.validate_release_inputs.outputs.version_name }}-armeabi-v7a.apk
+            ${{ env.SIGNED_ROOT }}/Jumpgate-${{ needs.validate_release_inputs.outputs.version_name }}-armeabi-v7a.apk.sha256
+            ${{ env.SIGNED_ROOT }}/Jumpgate-${{ needs.validate_release_inputs.outputs.version_name }}-armeabi-v7a.apk.signer-sha256
+          if-no-files-found: error
+          compression-level: 0
+          include-hidden-files: false
+          retention-days: 30
+
+  assemble_release:
+    name: Reverify, inventory, and attest release
+    needs:
+      - validate_release_inputs
+      - sign_release_apks
+    if: ${{ github.event_name == 'workflow_dispatch' && github.repository == 'ruizkinio/Jumpgate-kodi' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+    outputs:
+      attestation_url: ${{ steps.provenance.outputs.attestation-url }}
+    steps:
+      - name: Check out trusted release tooling
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00 # v4.7.1
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          check-latest: false
+
+      - name: Install exact Android verification tools and pinned Syft
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
+            binutils curl python3 python3-yaml unzip
+          : "${ANDROID_SDK_ROOT:?ANDROID_SDK_ROOT is required on the runner}"
+          sdkmanager_bin="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          if [[ ! -x "$sdkmanager_bin" ]]; then
+            sdkmanager_bin="$(
+              find "$ANDROID_SDK_ROOT/cmdline-tools" \
+                -path '*/bin/sdkmanager' -type f -perm -u+x -print 2>/dev/null |
+                LC_ALL=C sort -V |
+                tail -n 1 || true
+            )"
+          fi
+          [[ -n "$sdkmanager_bin" && -x "$sdkmanager_bin" ]]
+          set +o pipefail
+          yes | "$sdkmanager_bin" --sdk_root="$ANDROID_SDK_ROOT" --licenses >/dev/null
+          license_status="${PIPESTATUS[1]}"
+          set -o pipefail
+          [[ "$license_status" -eq 0 ]]
+          "$sdkmanager_bin" --sdk_root="$ANDROID_SDK_ROOT" --install \
+            "platforms;android-${ANDROID_PLATFORM_VERSION}" \
+            "build-tools;${ANDROID_BUILD_TOOLS_VERSION}"
+          build_tools_root="$ANDROID_SDK_ROOT/build-tools/$ANDROID_BUILD_TOOLS_VERSION"
+          test -x "$build_tools_root/aapt2"
+          test -x "$build_tools_root/apksigner"
+          test -f "$build_tools_root/package.xml"
+
+          syft_archive="$RUNNER_TEMP/syft_${SYFT_VERSION}_linux_amd64.tar.gz"
+          syft_root="$RUNNER_TEMP/syft-$SYFT_VERSION"
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            --output "$syft_archive" \
+            "https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/syft_${SYFT_VERSION}_linux_amd64.tar.gz"
+          printf '%s  %s\n' "$SYFT_LINUX_AMD64_SHA256" "$syft_archive" |
+            sha256sum --check --strict
+          mkdir -p "$syft_root"
+          tar -xzf "$syft_archive" -C "$syft_root" syft
+          test -x "$syft_root/syft"
+          "$syft_root/syft" version -o json |
+            python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["version"] == sys.argv[1]' "$SYFT_VERSION"
+          {
+            echo "ANDROID_BUILD_TOOLS_ROOT=$build_tools_root"
+            echo "SYFT_BIN=$syft_root/syft"
+            echo "SIGNED_INPUT_ROOT=$RUNNER_TEMP/jumpgate-signed-inputs-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+            echo "RELEASE_DIR=$RUNNER_TEMP/jumpgate-public-release-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          } >> "$GITHUB_ENV"
+          echo "$build_tools_root" >> "$GITHUB_PATH"
+
+      - name: Download current-run arm64-v8a signed APK
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: jumpgate-android-release-signed-arm64-v8a-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/jumpgate-signed-inputs-${{ github.run_id }}-${{ github.run_attempt }}/arm64-v8a
+
+      - name: Download current-run armeabi-v7a signed APK
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: jumpgate-android-release-signed-armeabi-v7a-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/jumpgate-signed-inputs-${{ github.run_id }}-${{ github.run_attempt }}/armeabi-v7a
+
+      - name: Generate SPDX SBOMs and release metadata
+        env:
+          EXPECTED_PACKAGE: ${{ needs.validate_release_inputs.outputs.package }}
+          EXPECTED_CORE_LIBRARY: ${{ needs.validate_release_inputs.outputs.core_library }}
+          EXPECTED_VERSION_NAME: ${{ needs.validate_release_inputs.outputs.version_name }}
+          EXPECTED_VERSION_CODE: ${{ needs.validate_release_inputs.outputs.version_code }}
+          REVIEWED_REF: ${{ needs.validate_release_inputs.outputs.reviewed_ref }}
+          RELEASE_TAG: ${{ needs.validate_release_inputs.outputs.release_tag }}
+          SOURCE_SHA: ${{ needs.validate_release_inputs.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          fail() {
+            echo "::error file=.github/workflows/jumpgate-android-release.yml::$*" >&2
+            exit 1
+          }
+          mkdir -p "$RELEASE_DIR"
+          signer=''
+          for abi in arm64-v8a armeabi-v7a; do
+            input_dir="$SIGNED_INPUT_ROOT/$abi"
+            apk_name="Jumpgate-${EXPECTED_VERSION_NAME}-${abi}.apk"
+            expected_names="$apk_name
+          $apk_name.sha256
+          $apk_name.signer-sha256"
+            actual_names="$(
+              find "$input_dir" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' |
+                LC_ALL=C sort
+            )"
+            [[ "$actual_names" == "$expected_names" ]] ||
+              fail "Signed artifact for $abi has missing or unexpected files"
+            if find "$input_dir" -mindepth 1 -maxdepth 1 ! -type f -print -quit |
+                grep -q .; then
+              fail "Signed artifact for $abi contains a non-regular entry"
+            fi
+            current_signer="$(tr -d '\r\n' < "$input_dir/$apk_name.signer-sha256")"
+            [[ "$current_signer" =~ ^[0-9a-f]{64}$ ]] ||
+              fail "Signed artifact signer digest for $abi is malformed"
+            if [[ -z "$signer" ]]; then
+              signer="$current_signer"
+            else
+              [[ "$current_signer" == "$signer" ]] ||
+                fail 'Both release ABIs must use the same signer certificate'
+            fi
+            install -m 0644 "$input_dir/$apk_name" "$RELEASE_DIR/$apk_name"
+            install -m 0644 "$input_dir/$apk_name.sha256" "$RELEASE_DIR/$apk_name.sha256"
+          done
+
+          arm64_apk="$RELEASE_DIR/Jumpgate-${EXPECTED_VERSION_NAME}-arm64-v8a.apk"
+          armv7_apk="$RELEASE_DIR/Jumpgate-${EXPECTED_VERSION_NAME}-armeabi-v7a.apk"
+          arm64_sbom="$RELEASE_DIR/Jumpgate-${EXPECTED_VERSION_NAME}-arm64-v8a.spdx.json"
+          armv7_sbom="$RELEASE_DIR/Jumpgate-${EXPECTED_VERSION_NAME}-armeabi-v7a.spdx.json"
+          "$SYFT_BIN" scan "$arm64_apk" \
+            --source-name "$(basename "$arm64_apk")" \
+            --source-version "$EXPECTED_VERSION_NAME" \
+            --output "spdx-json=$arm64_sbom"
+          "$SYFT_BIN" scan "$armv7_apk" \
+            --source-name "$(basename "$armv7_apk")" \
+            --source-version "$EXPECTED_VERSION_NAME" \
+            --output "spdx-json=$armv7_sbom"
+
+          python3 - \
+            "$arm64_apk" "$arm64_sbom" arm64-v8a \
+            "$armv7_apk" "$armv7_sbom" armeabi-v7a \
+            "$EXPECTED_VERSION_NAME" <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import re
+          import sys
+
+
+          arguments = sys.argv[1:]
+          version_name = arguments[-1]
+          artifact_arguments = arguments[:-1]
+          if len(artifact_arguments) != 6:
+              raise SystemExit("Expected exactly two APK/SBOM/ABI groups")
+
+          for offset in range(0, len(artifact_arguments), 3):
+              apk = pathlib.Path(artifact_arguments[offset])
+              sbom = pathlib.Path(artifact_arguments[offset + 1])
+              abi = artifact_arguments[offset + 2]
+              try:
+                  document = json.loads(sbom.read_text(encoding="utf-8"))
+                  digest = hashlib.sha256()
+                  with apk.open("rb") as apk_stream:
+                      for chunk in iter(lambda: apk_stream.read(1024 * 1024), b""):
+                          digest.update(chunk)
+                  apk_hash = digest.hexdigest()
+              except (OSError, UnicodeError, json.JSONDecodeError) as error:
+                  raise SystemExit(f"Unable to read Syft output for {abi}: {error}") from error
+              if not isinstance(document, dict):
+                  raise SystemExit(f"Syft output for {abi} is not an SPDX object")
+              if document.get("SPDXID") != "SPDXRef-DOCUMENT":
+                  raise SystemExit(f"Syft output for {abi} has no SPDX document root")
+              if document.get("spdxVersion") != "SPDX-2.3":
+                  raise SystemExit(f"Syft output for {abi} must use SPDX-2.3")
+              if document.get("name") != apk.name:
+                  raise SystemExit(f"Syft output for {abi} does not name the exact APK")
+
+              packages = document.get("packages")
+              if not isinstance(packages, list) or not packages:
+                  raise SystemExit(f"Syft found no package inventory in the {abi} APK")
+              package_ids: set[str] = set()
+              for package in packages:
+                  if not isinstance(package, dict):
+                      raise SystemExit(f"Syft package inventory for {abi} is malformed")
+                  package_id = package.get("SPDXID")
+                  package_name = package.get("name")
+                  if (
+                      not isinstance(package_id, str)
+                      or re.fullmatch(r"SPDXRef-[A-Za-z0-9.-]+", package_id) is None
+                      or not isinstance(package_name, str)
+                      or not package_name.strip()
+                      or package_id in package_ids
+                  ):
+                      raise SystemExit(f"Syft package inventory for {abi} has invalid identities")
+                  package_ids.add(package_id)
+
+              relationships = document.get("relationships", [])
+              if not isinstance(relationships, list) or not all(
+                  isinstance(relationship, dict) for relationship in relationships
+              ):
+                  raise SystemExit(f"Syft relationships for {abi} are malformed")
+
+              root_id = f"SPDXRef-Package-Jumpgate-APK-{abi}"
+              if root_id in package_ids:
+                  raise SystemExit(f"Syft output for {abi} collides with the APK root identity")
+              root_package = {
+                  "SPDXID": root_id,
+                  "checksums": [
+                      {"algorithm": "SHA256", "checksumValue": apk_hash},
+                  ],
+                  "copyrightText": "NOASSERTION",
+                  "downloadLocation": "NOASSERTION",
+                  "filesAnalyzed": False,
+                  "licenseConcluded": "GPL-2.0-or-later",
+                  "licenseDeclared": "GPL-2.0-or-later",
+                  "name": apk.name,
+                  "packageFileName": apk.name,
+                  "primaryPackagePurpose": "APPLICATION",
+                  "versionInfo": version_name,
+              }
+              packages.append(root_package)
+              relationships = [
+                  relationship
+                  for relationship in relationships
+                  if not (
+                      relationship.get("spdxElementId") == "SPDXRef-DOCUMENT"
+                      and relationship.get("relationshipType") == "DESCRIBES"
+                  )
+              ]
+              relationships.append(
+                  {
+                      "spdxElementId": "SPDXRef-DOCUMENT",
+                      "relationshipType": "DESCRIBES",
+                      "relatedSpdxElement": root_id,
+                  }
+              )
+              relationships.extend(
+                  {
+                      "spdxElementId": root_id,
+                      "relationshipType": "CONTAINS",
+                      "relatedSpdxElement": package_id,
+                  }
+                  for package_id in sorted(package_ids)
+              )
+              document["documentDescribes"] = [root_id]
+              document["packages"] = packages
+              document["relationships"] = relationships
+
+              temporary = sbom.with_name(f".{sbom.name}.tmp")
+              try:
+                  temporary.write_text(
+                      json.dumps(document, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
+                      encoding="utf-8",
+                  )
+                  os.replace(temporary, sbom)
+              finally:
+                  temporary.unlink(missing_ok=True)
+          PY
+
+          bash tools/ci/jumpgate/verify-android-release.sh \
+            "$arm64_apk" \
+            "$arm64_sbom" \
+            "$armv7_apk" \
+            "$armv7_sbom" \
+            "$EXPECTED_PACKAGE" \
+            "$ANDROID_MIN_SDK_VERSION" \
+            "$ANDROID_PLATFORM_VERSION" \
+            "$EXPECTED_VERSION_NAME" \
+            "$EXPECTED_VERSION_CODE" \
+            "$EXPECTED_CORE_LIBRARY" \
+            "$signer" \
+            "$SOURCE_SHA" \
+            "$REVIEWED_REF" \
+            "$RELEASE_TAG" \
+            "$GITHUB_RUN_ID" \
+            "$GITHUB_RUN_ATTEMPT" \
+            "$RELEASE_DIR"
+          rm -f -- "$RELEASE_DIR"/*.apk.sha256
+
+      - name: Attest current release payload
+        id: provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: |
+            ${{ env.RELEASE_DIR }}/Jumpgate-${{ needs.validate_release_inputs.outputs.version_name }}-arm64-v8a.apk
+            ${{ env.RELEASE_DIR }}/Jumpgate-${{ needs.validate_release_inputs.outputs.version_name }}-armeabi-v7a.apk
+            ${{ env.RELEASE_DIR }}/Jumpgate-${{ needs.validate_release_inputs.outputs.version_name }}-arm64-v8a.spdx.json
+            ${{ env.RELEASE_DIR }}/Jumpgate-${{ needs.validate_release_inputs.outputs.version_name }}-armeabi-v7a.spdx.json
+            ${{ env.RELEASE_DIR }}/Jumpgate-${{ needs.validate_release_inputs.outputs.version_name }}-metadata.json
+            ${{ env.RELEASE_DIR }}/SHA256SUMS
+          show-summary: true
+
+      - name: Stage immutable provenance bundle
+        env:
+          EXPECTED_VERSION_NAME: ${{ needs.validate_release_inputs.outputs.version_name }}
+          PROVENANCE_BUNDLE: ${{ steps.provenance.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          test -f "$PROVENANCE_BUNDLE"
+          test -s "$PROVENANCE_BUNDLE"
+          python3 -m json.tool "$PROVENANCE_BUNDLE" >/dev/null
+          provenance_name="Jumpgate-${EXPECTED_VERSION_NAME}-provenance.json"
+          test ! -e "$RELEASE_DIR/$provenance_name"
+          install -m 0644 "$PROVENANCE_BUNDLE" "$RELEASE_DIR/$provenance_name"
+          mapfile -t release_files < <(
+            find "$RELEASE_DIR" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' |
+              LC_ALL=C sort
+          )
+          [[ "${#release_files[@]}" -eq 7 ]]
+          if find "$RELEASE_DIR" -mindepth 1 -maxdepth 1 ! -type f -print -quit |
+              grep -q .; then
+            echo 'Release payload contains a non-regular entry' >&2
+            exit 1
+          fi
+
+      - name: Upload attested current-run release payload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: jumpgate-android-release-payload-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.RELEASE_DIR }}/*
+          if-no-files-found: error
+          compression-level: 0
+          include-hidden-files: false
+          retention-days: 90
+
+  publish_draft_release:
+    name: Create non-overwriting draft release
+    needs:
+      - validate_release_inputs
+      - assemble_release
+    if: ${{ github.event_name == 'workflow_dispatch' && github.repository == 'ruizkinio/Jumpgate-kodi' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment:
+      name: android-release
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Download exact current-run release payload
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: jumpgate-android-release-payload-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/jumpgate-release-publish-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Verify publish payload scope and checksums
+        env:
+          EXPECTED_VERSION_NAME: ${{ needs.validate_release_inputs.outputs.version_name }}
+          RELEASE_DIR: ${{ runner.temp }}/jumpgate-release-publish-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/expected-release-files.txt" <<EOF
+          Jumpgate-${EXPECTED_VERSION_NAME}-arm64-v8a.apk
+          Jumpgate-${EXPECTED_VERSION_NAME}-arm64-v8a.spdx.json
+          Jumpgate-${EXPECTED_VERSION_NAME}-armeabi-v7a.apk
+          Jumpgate-${EXPECTED_VERSION_NAME}-armeabi-v7a.spdx.json
+          Jumpgate-${EXPECTED_VERSION_NAME}-metadata.json
+          Jumpgate-${EXPECTED_VERSION_NAME}-provenance.json
+          SHA256SUMS
+          EOF
+          LC_ALL=C sort -o "$RUNNER_TEMP/expected-release-files.txt" \
+            "$RUNNER_TEMP/expected-release-files.txt"
+          find "$RELEASE_DIR" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' |
+            LC_ALL=C sort > "$RUNNER_TEMP/actual-release-files.txt"
+          diff -u "$RUNNER_TEMP/expected-release-files.txt" \
+            "$RUNNER_TEMP/actual-release-files.txt"
+          if find "$RELEASE_DIR" -mindepth 1 -maxdepth 1 ! -type f -print -quit |
+              grep -q .; then
+            echo 'Publish payload contains a non-regular entry' >&2
+            exit 1
+          fi
+          (
+            cd "$RELEASE_DIR"
+            sha256sum --check --strict SHA256SUMS
+          )
+          python3 -m json.tool \
+            "$RELEASE_DIR/Jumpgate-${EXPECTED_VERSION_NAME}-metadata.json" >/dev/null
+          python3 -m json.tool \
+            "$RELEASE_DIR/Jumpgate-${EXPECTED_VERSION_NAME}-provenance.json" >/dev/null
+
+      - name: Mint repository-scoped dedicated release App token
+        id: release_app_token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.JUMPGATE_ANDROID_RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.JUMPGATE_ANDROID_RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          # GitHub redacts bypass_actors unless the caller has ruleset write access.
+          permission-administration: write
+          permission-contents: write
+          permission-metadata: read
+
+      - name: Create new tag and draft release without overwrite APIs
+        id: publish
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        env:
+          ATTESTATION_URL: ${{ needs.assemble_release.outputs.attestation_url }}
+          EXPECTED_VERSION_NAME: ${{ needs.validate_release_inputs.outputs.version_name }}
+          EXPECTED_HISTORY_FINGERPRINT: ${{ needs.validate_release_inputs.outputs.history_fingerprint }}
+          EXPECTED_RELEASE_APP_ID: ${{ secrets.JUMPGATE_ANDROID_RELEASE_APP_ID }}
+          RELEASE_DIR: ${{ runner.temp }}/jumpgate-release-publish-${{ github.run_id }}-${{ github.run_attempt }}
+          RELEASE_TAG: ${{ needs.validate_release_inputs.outputs.release_tag }}
+          REVIEWED_REF: ${{ needs.validate_release_inputs.outputs.reviewed_ref }}
+          REVIEWED_REF_KIND: ${{ needs.validate_release_inputs.outputs.reviewed_ref_kind }}
+          REVIEWED_REF_OBJECT_SHA: ${{ needs.validate_release_inputs.outputs.reviewed_ref_object_sha }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUN_ID: ${{ github.run_id }}
+          SOURCE_SHA: ${{ needs.validate_release_inputs.outputs.source_sha }}
+          VALIDATED_DEFAULT_BRANCH: ${{ needs.validate_release_inputs.outputs.default_branch }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        with:
+          github-token: ${{ steps.release_app_token.outputs.token }}
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const crypto = require('crypto');
+
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const tag = process.env.RELEASE_TAG;
+            const sourceSha = process.env.SOURCE_SHA;
+            const versionName = process.env.EXPECTED_VERSION_NAME;
+            const releaseDir = process.env.RELEASE_DIR;
+            const reviewedRef = process.env.REVIEWED_REF;
+            const reviewedRefKind = process.env.REVIEWED_REF_KIND;
+            const reviewedRefObjectSha = process.env.REVIEWED_REF_OBJECT_SHA;
+            const attestationUrl = process.env.ATTESTATION_URL;
+            const workflowSha = process.env.WORKFLOW_SHA.toLowerCase();
+            const expectedHistoryFingerprint = process.env.EXPECTED_HISTORY_FINGERPRINT;
+            const expectedReleaseAppIdText = process.env.EXPECTED_RELEASE_APP_ID;
+            const expectedReleaseAppId = Number(expectedReleaseAppIdText);
+            const validatedDefaultBranch = process.env.VALIDATED_DEFAULT_BRANCH;
+            const runId = process.env.RUN_ID;
+            const runAttempt = process.env.RUN_ATTEMPT;
+            const fullReleaseRef = 'refs/tags/' + tag;
+            const shortReleaseRef = 'tags/' + tag;
+            const releaseName = 'Jumpgate ' + versionName;
+            const assetContentType = 'application/octet-stream';
+            const canonicalTagPattern = /^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/;
+            const shaPattern = /^[0-9a-f]{40}$/;
+            const ownershipMarker = [
+              'jumpgate-android-release-owner-v1',
+              owner + '/' + repo,
+              runId,
+              runAttempt,
+              tag,
+              sourceSha,
+            ].join(':');
+            const annotatedTagMessage = [
+              'Jumpgate Android release tag',
+              '',
+              'Ownership: ' + ownershipMarker,
+              'Reviewed source: ' + reviewedRef,
+            ].join('\n');
+            const assetNames = [
+              'Jumpgate-' + versionName + '-arm64-v8a.apk',
+              'Jumpgate-' + versionName + '-armeabi-v7a.apk',
+              'Jumpgate-' + versionName + '-arm64-v8a.spdx.json',
+              'Jumpgate-' + versionName + '-armeabi-v7a.spdx.json',
+              'Jumpgate-' + versionName + '-metadata.json',
+              'Jumpgate-' + versionName + '-provenance.json',
+              'SHA256SUMS',
+            ].sort();
+
+            if (!shaPattern.test(sourceSha)) {
+              throw new Error('Resolved source SHA is malformed');
+            }
+            if (!shaPattern.test(workflowSha) || sourceSha !== workflowSha) {
+              throw new Error('Published source must exactly match github.workflow_sha');
+            }
+            if (!validatedDefaultBranch || /[\r\n]/.test(validatedDefaultBranch)) {
+              throw new Error('Validated default branch is malformed');
+            }
+            if (!shaPattern.test(reviewedRefObjectSha)) {
+              throw new Error('Reviewed ref object SHA is malformed');
+            }
+            if (!/^[1-9][0-9]*$/.test(runId) || !/^[1-9][0-9]*$/.test(runAttempt)) {
+              throw new Error('Release ownership run identity is malformed');
+            }
+            if (reviewedRefKind === 'tag') {
+              if (!reviewedRef.startsWith('refs/tags/')) {
+                throw new Error('Reviewed tag binding kind does not match its ref');
+              }
+            } else if (
+              reviewedRefKind !== 'commit'
+              || !/^[0-9a-fA-F]{40}$/.test(reviewedRef)
+              || reviewedRef.toLowerCase() !== sourceSha
+              || reviewedRefObjectSha !== sourceSha
+            ) {
+              throw new Error('Reviewed commit binding is malformed');
+            }
+            if (!/^[0-9a-f]{64}$/.test(expectedHistoryFingerprint)) {
+              throw new Error('Validated release-history fingerprint is malformed');
+            }
+            if (
+              !/^[1-9][0-9]*$/.test(expectedReleaseAppIdText || '')
+              || !Number.isSafeInteger(expectedReleaseAppId)
+              || expectedReleaseAppId <= 0
+            ) {
+              throw new Error('Configured release App Integration actor ID is malformed');
+            }
+            if (!canonicalTagPattern.test(tag)) {
+              throw new Error('Release tag is outside the canonical v<semver> namespace');
+            }
+
+            function sameStrings(left, right) {
+              return JSON.stringify(left) === JSON.stringify(right);
+            }
+
+            function historyFingerprint(releaseTags, tagRefs) {
+              const releaseLines = releaseTags.map((item) => 'release	' + item + '\n');
+              const tagLines = [...tagRefs.keys()]
+                .sort()
+                .map((item) => 'tag	' + item + '	' + tagRefs.get(item).sha + '\n');
+              return crypto
+                .createHash('sha256')
+                .update(releaseLines.concat(tagLines).join(''), 'utf8')
+                .digest('hex');
+            }
+
+            async function loadCanonicalHistory() {
+              const releases = await github.paginate(github.rest.repos.listReleases, {
+                owner,
+                repo,
+                per_page: 100,
+              });
+              const refs = await github.paginate(github.rest.git.listMatchingRefs, {
+                owner,
+                repo,
+                ref: 'tags/v',
+                per_page: 100,
+              });
+              const releaseTags = new Set();
+              for (const item of releases) {
+                if (typeof item.tag_name !== 'string' || !canonicalTagPattern.test(item.tag_name)) {
+                  throw new Error('Release is outside the canonical v<semver> namespace: ' + item.tag_name);
+                }
+                if (releaseTags.has(item.tag_name)) {
+                  throw new Error('Duplicate canonical GitHub release: ' + item.tag_name);
+                }
+                releaseTags.add(item.tag_name);
+              }
+              const tagRefs = new Map();
+              for (const item of refs) {
+                const prefix = 'refs/tags/';
+                const objectSha = item.object && item.object.sha;
+                const objectType = item.object && item.object.type;
+                if (typeof item.ref !== 'string' || !item.ref.startsWith(prefix)) {
+                  throw new Error('Canonical tag API returned a malformed ref');
+                }
+                const refTag = item.ref.slice(prefix.length);
+                if (
+                  !canonicalTagPattern.test(refTag)
+                  || !shaPattern.test(objectSha || '')
+                  || !['commit', 'tag'].includes(objectType)
+                ) {
+                  throw new Error('Non-canonical or malformed tag occupies the v namespace: ' + refTag);
+                }
+                if (tagRefs.has(refTag)) {
+                  throw new Error('Duplicate canonical tag returned by GitHub: ' + refTag);
+                }
+                tagRefs.set(refTag, {sha: objectSha, type: objectType});
+              }
+              return {releaseTags: [...releaseTags].sort(), tagRefs};
+            }
+
+            async function getReleaseByTagOrNull() {
+              try {
+                const response = await github.rest.repos.getReleaseByTag({owner, repo, tag});
+                return response.data;
+              } catch (error) {
+                if (error.status === 404) return null;
+                throw error;
+              }
+            }
+
+            function assertExpectedReleaseIdentity(releaseState) {
+              if (
+                !releaseState
+                || !Number.isSafeInteger(releaseState.id)
+                || releaseState.id <= 0
+                || releaseState.tag_name !== tag
+                || releaseState.name !== releaseName
+                || releaseState.target_commitish !== sourceSha
+                || releaseState.draft !== true
+                || releaseState.prerelease !== false
+                || typeof releaseState.html_url !== 'string'
+                || releaseState.html_url.length === 0
+              ) {
+                throw new Error('GitHub returned an unexpected protected draft release identity or state');
+              }
+            }
+
+            function assertExactReleaseAssets(observedAssets, expectedAssets) {
+              if (!Array.isArray(observedAssets) || observedAssets.length !== expectedAssets.size) {
+                throw new Error('Final release asset set changed after upload');
+              }
+              const seenNames = new Set();
+              const seenIds = new Set();
+              for (const asset of observedAssets) {
+                const expected = asset && expectedAssets.get(asset.name);
+                if (
+                  !expected
+                  || seenNames.has(asset.name)
+                  || seenIds.has(asset.id)
+                  || asset.id !== expected.id
+                  || asset.size !== expected.size
+                  || asset.digest !== expected.digest
+                  || asset.content_type !== assetContentType
+                  || asset.state !== 'uploaded'
+                ) {
+                  throw new Error(
+                    'Final release asset binding changed after upload: '
+                    + (asset && typeof asset.name === 'string' ? asset.name : '<malformed>'),
+                  );
+                }
+                seenNames.add(asset.name);
+                seenIds.add(asset.id);
+              }
+              if (!sameStrings([...seenNames].sort(), [...expectedAssets.keys()].sort())) {
+                throw new Error('Final release asset names changed after upload');
+              }
+            }
+
+            async function assertFinalReleaseState(originalRelease, expectedAssets) {
+              let observed;
+              try {
+                const response = await github.rest.repos.getReleaseByTag({owner, repo, tag});
+                observed = response.data;
+              } catch (error) {
+                throw new Error('Unable to revalidate the original draft release after asset upload');
+              }
+              assertExpectedReleaseIdentity(observed);
+              if (
+                observed.id !== originalRelease.id
+                || observed.html_url !== originalRelease.html_url
+              ) {
+                throw new Error('Original draft release was deleted or replaced after asset upload');
+              }
+              assertExactReleaseAssets(observed.assets, expectedAssets);
+              return observed;
+            }
+
+            async function getReleaseTagRefOrNull() {
+              try {
+                const response = await github.rest.git.getRef({owner, repo, ref: shortReleaseRef});
+                return response.data;
+              } catch (error) {
+                if (error.status === 404) return null;
+                throw error;
+              }
+            }
+
+            async function assertRepositorySource() {
+              const repositoryMetadata = await github.rest.repos.get({owner, repo});
+              if (repositoryMetadata.data.default_branch !== validatedDefaultBranch) {
+                throw new Error('Repository default branch changed after source validation');
+              }
+              const defaultBranchHead = await github.rest.git.getRef({
+                owner,
+                repo,
+                ref: 'heads/' + validatedDefaultBranch,
+              });
+              if (
+                defaultBranchHead.data.ref !== 'refs/heads/' + validatedDefaultBranch
+                || (defaultBranchHead.data.object && defaultBranchHead.data.object.type) !== 'commit'
+                || (defaultBranchHead.data.object && defaultBranchHead.data.object.sha) !== sourceSha
+              ) {
+                throw new Error('Repository default-branch head changed after source validation');
+              }
+            }
+
+            // GitHub has no compare-and-delete ref API. Release tags are never auto-deleted.
+            async function assertRequiredTagRuleset() {
+              let summaries;
+              try {
+                summaries = await github.paginate(github.rest.repos.getRepoRulesets, {
+                  owner,
+                  repo,
+                  includes_parents: true,
+                  per_page: 100,
+                  targets: 'tag',
+                });
+              } catch (error) {
+                throw new Error(
+                  'Unable to enumerate the required dedicated-App refs/tags/v* ruleset',
+                );
+              }
+              const active = summaries.filter((ruleset) => ruleset.enforcement === 'active');
+              if (active.length !== 1 || active[0].target !== 'tag') {
+                throw new Error(
+                  'Publication requires exactly one active tag ruleset for the dedicated release App',
+                );
+              }
+              const summary = active[0];
+              if (!Number.isSafeInteger(summary.id) || summary.id <= 0) {
+                throw new Error('Dedicated release App tag ruleset ID is malformed');
+              }
+              let ruleset;
+              try {
+                const response = await github.rest.repos.getRepoRuleset({
+                  owner,
+                  repo,
+                  ruleset_id: summary.id,
+                  includes_parents: true,
+                });
+                ruleset = response.data;
+              } catch (error) {
+                throw new Error('Unable to inspect the dedicated release App tag ruleset');
+              }
+              const refName = ruleset.conditions && ruleset.conditions.ref_name;
+              const includes = refName && refName.include;
+              const excludes = refName && refName.exclude;
+              const rules = Array.isArray(ruleset.rules) ? ruleset.rules : [];
+              const ruleTypes = rules.map((rule) => rule && rule.type);
+              const requiredRules = ['creation', 'deletion', 'update'];
+              const bypassActors = ruleset.bypass_actors;
+              const actor = Array.isArray(bypassActors) && bypassActors.length === 1
+                ? bypassActors[0]
+                : null;
+              const exactContract = ruleset.id === summary.id
+                && ruleset.target === 'tag'
+                && ruleset.enforcement === 'active'
+                && ruleset.source_type === 'Repository'
+                && ruleset.source === owner + '/' + repo
+                && sameStrings(includes, ['refs/tags/v*'])
+                && Array.isArray(excludes)
+                && excludes.length === 0
+                && sameStrings([...ruleTypes].sort(), requiredRules)
+                && new Set(ruleTypes).size === requiredRules.length
+                && actor
+                && actor.actor_type === 'Integration'
+                && actor.actor_id === expectedReleaseAppId
+                && actor.bypass_mode === 'always'
+                && ruleset.current_user_can_bypass === 'always';
+              if (!exactContract) {
+                throw new Error(
+                  'Dedicated release App ruleset drifted: require exact refs/tags/v* scope, '
+                  + 'creation/update/deletion rules, no exclusions, and only the configured '
+                  + 'Integration actor with always bypass',
+                );
+              }
+            }
+
+            async function peelToCommit(object, label) {
+              const seen = new Set();
+              let current = object;
+              for (let depth = 0; depth < 16; depth += 1) {
+                if (!current || !shaPattern.test(current.sha || '')) {
+                  throw new Error(label + ' contains a malformed Git object');
+                }
+                if (current.type === 'commit') return current.sha;
+                if (current.type !== 'tag' || seen.has(current.sha)) {
+                  throw new Error(label + ' does not resolve through a valid annotated-tag chain');
+                }
+                seen.add(current.sha);
+                const response = await github.rest.git.getTag({owner, repo, tag_sha: current.sha});
+                if (response.data.sha !== current.sha) {
+                  throw new Error(label + ' tag-object lookup returned the wrong object');
+                }
+                current = response.data.object;
+              }
+              throw new Error(label + ' annotated-tag chain exceeds the fail-closed depth limit');
+            }
+
+            async function assertReviewedRefBinding(boundary) {
+              if (reviewedRefKind === 'commit') return;
+              let response;
+              try {
+                response = await github.rest.git.getRef({
+                  owner,
+                  repo,
+                  ref: reviewedRef.slice('refs/'.length),
+                });
+              } catch (error) {
+                if (error.status === 404) throw new Error('Reviewed tag was deleted ' + boundary);
+                throw error;
+              }
+              if (
+                response.data.ref !== reviewedRef
+                || !response.data.object
+                || response.data.object.sha !== reviewedRefObjectSha
+              ) {
+                throw new Error('Reviewed tag moved ' + boundary);
+              }
+              const resolvedCommit = await peelToCommit(response.data.object, 'Reviewed tag ' + reviewedRef);
+              if (resolvedCommit !== sourceSha) {
+                throw new Error('Reviewed tag no longer resolves to the validated source ' + boundary);
+              }
+            }
+
+            async function assertInitialHistory() {
+              const history = await loadCanonicalHistory();
+              const tagNames = [...history.tagRefs.keys()].sort();
+              if (!sameStrings(history.releaseTags, tagNames)) {
+                throw new Error('Canonical GitHub releases and refs/tags/v* changed or disagree');
+              }
+              if (
+                history.releaseTags.includes(tag)
+                || history.tagRefs.has(tag)
+                || await getReleaseByTagOrNull() !== null
+                || await getReleaseTagRefOrNull() !== null
+              ) {
+                throw new Error('Release or tag already exists; refusing to overwrite it');
+              }
+              if (historyFingerprint(history.releaseTags, history.tagRefs) !== expectedHistoryFingerprint) {
+                throw new Error('Canonical release history changed after monotonicity validation');
+              }
+              return history;
+            }
+
+            let ownedTagObjectSha = null;
+
+            async function readOwnedTagState() {
+              const ref = await getReleaseTagRefOrNull();
+              if (ref === null) return {exists: false, owned: false};
+              if (
+                ref.ref !== fullReleaseRef
+                || !ref.object
+                || ref.object.type !== 'tag'
+                || ref.object.sha !== ownedTagObjectSha
+              ) {
+                return {exists: true, owned: false};
+              }
+              const response = await github.rest.git.getTag({owner, repo, tag_sha: ownedTagObjectSha});
+              const object = response.data.object;
+              const owned = response.data.sha === ownedTagObjectSha
+                && response.data.tag === tag
+                && response.data.message === annotatedTagMessage
+                && object
+                && object.type === 'commit'
+                && object.sha === sourceSha;
+              return {exists: true, owned};
+            }
+
+            async function assertOwnedTag() {
+              const state = await readOwnedTagState();
+              if (!state.owned) {
+                throw new Error(
+                  'Release tag is absent or no longer points to the exact owned annotated tag object',
+                );
+              }
+            }
+
+            async function assertPostCreationHistory(initialHistory) {
+              const history = await loadCanonicalHistory();
+              if (!sameStrings(history.releaseTags, initialHistory.releaseTags)) {
+                throw new Error('Canonical release set changed after annotated-tag creation');
+              }
+              const current = history.tagRefs.get(tag);
+              if (!current || current.type !== 'tag' || current.sha !== ownedTagObjectSha) {
+                throw new Error('Owned annotated tag is missing or replaced in canonical history');
+              }
+              const priorRefs = new Map(history.tagRefs);
+              priorRefs.delete(tag);
+              const priorNames = [...priorRefs.keys()].sort();
+              const expectedNames = [...initialHistory.tagRefs.keys()].sort();
+              if (!sameStrings(priorNames, expectedNames)) {
+                throw new Error('Canonical tag set changed after annotated-tag creation');
+              }
+              for (const priorTag of expectedNames) {
+                const before = initialHistory.tagRefs.get(priorTag);
+                const after = priorRefs.get(priorTag);
+                if (!after || before.sha !== after.sha || before.type !== after.type) {
+                  throw new Error('Canonical tag moved after annotated-tag creation: ' + priorTag);
+                }
+              }
+              if (historyFingerprint(history.releaseTags, priorRefs) !== expectedHistoryFingerprint) {
+                throw new Error('Canonical release history changed after annotated-tag creation');
+              }
+            }
+
+            function emitManualReconciliation(reason) {
+              core.error([
+                'JUMPGATE_RELEASE_MANUAL_RECONCILIATION_REQUIRED',
+                'reason=' + reason,
+                'tag=' + tag,
+                'tag_object=' + (ownedTagObjectSha || 'unavailable'),
+                'source=' + sourceSha,
+                'run=' + runId + '/' + runAttempt,
+                'automatic_tag_deletion=disabled',
+                'cause=github_no_compare_and_delete_ref_api',
+                'action=inspect_exact_tag_and_release_before_retry',
+              ].join(' '));
+            }
+
+            const initialHistory = await assertInitialHistory();
+            await assertRequiredTagRuleset();
+            await assertReviewedRefBinding('before publication');
+            await assertRepositorySource();
+
+            const tagObjectResponse = await github.rest.git.createTag({
+              owner,
+              repo,
+              tag,
+              message: annotatedTagMessage,
+              object: sourceSha,
+              type: 'commit',
+            });
+            ownedTagObjectSha = tagObjectResponse.data.sha;
+            if (
+              !shaPattern.test(ownedTagObjectSha || '')
+              || tagObjectResponse.data.tag !== tag
+              || tagObjectResponse.data.message !== annotatedTagMessage
+              || !tagObjectResponse.data.object
+              || tagObjectResponse.data.object.type !== 'commit'
+              || tagObjectResponse.data.object.sha !== sourceSha
+            ) {
+              throw new Error('GitHub returned a malformed annotated release-tag object');
+            }
+
+            let publicationPhase = 'release-ref-creation';
+            let releaseRefMayExist = false;
+            let release;
+            try {
+              releaseRefMayExist = true;
+              try {
+                await github.rest.git.createRef({owner, repo, ref: fullReleaseRef, sha: ownedTagObjectSha});
+              } catch (error) {
+                try {
+                  await assertOwnedTag();
+                  core.warning('Recovered an ambiguous createRef response for the exact owned tag object');
+                } catch (ownershipError) {
+                  throw error;
+                }
+              }
+
+              publicationPhase = 'post-create-revalidation';
+              await assertPostCreationHistory(initialHistory);
+              await assertRepositorySource();
+              await assertRequiredTagRuleset();
+              await assertOwnedTag();
+              await assertReviewedRefBinding('immediately before release creation');
+
+              publicationPhase = 'draft-release-creation';
+              try {
+                const response = await github.rest.repos.createRelease({
+                  owner,
+                  repo,
+                  tag_name: tag,
+                  target_commitish: sourceSha,
+                  name: releaseName,
+                  body: [
+                    'Protected Android release candidate.',
+                    '',
+                    'Reviewed source: ' + reviewedRef,
+                    'Commit: ' + sourceSha,
+                    'Annotated tag object: ' + ownedTagObjectSha,
+                    'Artifact attestation: ' + attestationUrl,
+                    '',
+                    'This draft must complete device UAT before publication.',
+                  ].join('\n'),
+                  draft: true,
+                  prerelease: false,
+                  generate_release_notes: false,
+                  make_latest: 'false',
+                });
+                release = response.data;
+                assertExpectedReleaseIdentity(release);
+              } catch (error) {
+                try {
+                  const observed = await getReleaseByTagOrNull();
+                  if (observed !== null) {
+                    core.error('Release creation was ambiguous and a release now exists; preserving the owned tag');
+                  } else {
+                    core.warning(
+                      'Release creation failed without a visible release; preserving the owned tag '
+                      + 'because absence cannot be made atomic',
+                    );
+                  }
+                } catch (inspectionError) {
+                  core.error('Release creation and follow-up inspection were ambiguous; preserving the owned tag');
+                }
+                throw error;
+              }
+
+              const expectedAssets = new Map();
+              const uploadedAssetIds = new Set();
+              publicationPhase = 'release-asset-or-cleanup-failure';
+              try {
+                for (const name of assetNames) {
+                  const file = path.join(releaseDir, name);
+                  const stat = fs.lstatSync(file);
+                  if (!stat.isFile() || stat.isSymbolicLink() || stat.size <= 0) {
+                    throw new Error('Release asset is not a non-empty regular file: ' + name);
+                  }
+                  if (stat.size > 2 * 1024 * 1024 * 1024) {
+                    throw new Error('Release asset exceeds GitHub size limit: ' + name);
+                  }
+                  const data = fs.readFileSync(file);
+                  const postReadStat = fs.lstatSync(file);
+                  if (
+                    !postReadStat.isFile()
+                    || postReadStat.isSymbolicLink()
+                    || postReadStat.size !== stat.size
+                    || data.length !== stat.size
+                  ) {
+                    throw new Error('Release asset changed while preparing upload: ' + name);
+                  }
+                  const expected = {
+                    name,
+                    size: stat.size,
+                    digest: 'sha256:' + crypto.createHash('sha256').update(data).digest('hex'),
+                  };
+                  const response = await github.rest.repos.uploadReleaseAsset({
+                    owner,
+                    repo,
+                    release_id: release.id,
+                    name,
+                    headers: {
+                      'content-type': assetContentType,
+                      'content-length': stat.size,
+                    },
+                    data,
+                  });
+                  const uploaded = response.data;
+                  if (
+                    !uploaded
+                    || !Number.isSafeInteger(uploaded.id)
+                    || uploaded.id <= 0
+                    || uploadedAssetIds.has(uploaded.id)
+                    || uploaded.name !== name
+                    || uploaded.size !== expected.size
+                    || uploaded.content_type !== assetContentType
+                    || uploaded.state !== 'uploaded'
+                    || (uploaded.digest != null && uploaded.digest !== expected.digest)
+                  ) {
+                    throw new Error('GitHub returned an unexpected immutable asset binding: ' + name);
+                  }
+                  uploadedAssetIds.add(uploaded.id);
+                  expectedAssets.set(name, {...expected, id: uploaded.id});
+                }
+              } catch (error) {
+                try {
+                  await github.rest.repos.deleteRelease({owner, repo, release_id: release.id});
+                  const observed = await getReleaseByTagOrNull();
+                  if (observed === null) {
+                    core.warning('Draft release deletion was confirmed; preserving its owned tag');
+                  } else {
+                    core.error('Draft release cleanup left or recreated a release; preserving its owned tag');
+                  }
+                } catch (cleanupError) {
+                  core.error('Draft release cleanup failed or was ambiguous; preserving its owned tag');
+                }
+                throw error;
+              }
+
+              publicationPhase = 'post-upload-revalidation';
+              await assertRepositorySource();
+              await assertRequiredTagRuleset();
+              await assertOwnedTag();
+              await assertReviewedRefBinding('after final asset upload');
+              const finalRelease = await assertFinalReleaseState(release, expectedAssets);
+
+              publicationPhase = 'release-output';
+              core.setOutput('release-url', finalRelease.html_url);
+            } catch (error) {
+              if (releaseRefMayExist) emitManualReconciliation(publicationPhase);
+              throw error;
+            }

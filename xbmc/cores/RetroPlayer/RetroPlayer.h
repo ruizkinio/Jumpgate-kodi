@@ -137,6 +137,7 @@ private:
 
   // Game parameters
   GAME::GameClientPtr m_gameClient;
+  std::unique_ptr<CFileItem> m_fileItem;
 
   // Synchronization parameters
   CCriticalSection m_mutex;

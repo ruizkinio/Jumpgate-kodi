@@ -435,7 +435,7 @@ std::string CVariant::asString(std::string_view fallback /* = "" */) const&
                                [](int64_t i) { return std::to_string(i); },
                                [](uint64_t u) { return std::to_string(u); },
                                [](double d) { return std::to_string(d); },
-                               [=](const auto& a) { return std::string(fallback); }},
+                               [=](const auto&) { return std::string(fallback); }},
                     m_data);
 }
 
@@ -677,8 +677,7 @@ bool CVariant::empty() const
                                [](const VariantArray& a) { return a.empty(); },
                                [](const std::string& s) { return s.empty(); },
                                [](const std::wstring& w) { return w.empty(); },
-                               [](const Null& n) { return true; },
-                               [](const auto&) { return false; }},
+                               [](const Null&) { return true; }, [](const auto&) { return false; }},
                     m_data);
 }
 
@@ -706,7 +705,7 @@ void CVariant::erase(unsigned int position)
 
 bool CVariant::isMember(const std::string &key) const
 {
-  return std::visit(overloaded{[&](const VariantMap& m) { return m.contains(key); },
+  return std::visit(overloaded{[&](const VariantMap& m) { return m.find(key) != m.end(); },
                                [](const auto&) { return false; }},
                     m_data);
 }

@@ -85,7 +85,7 @@ bool CJSONVariantParserHandler::number_unsigned(number_unsigned_t u)
   return Primitive(u);
 }
 
-bool CJSONVariantParserHandler::number_float(number_float_t d, const string_t& s)
+bool CJSONVariantParserHandler::number_float(number_float_t d, const string_t&)
 {
   return Primitive(d);
 }
@@ -95,12 +95,12 @@ bool CJSONVariantParserHandler::string(std::string& str)
   return Primitive(str);
 }
 
-bool CJSONVariantParserHandler::binary(binary_t& b)
+bool CJSONVariantParserHandler::binary(binary_t&)
 {
   return true;
 }
 
-bool CJSONVariantParserHandler::start_object(std::size_t elements)
+bool CJSONVariantParserHandler::start_object(std::size_t)
 {
   PushObject(CVariant::VariantTypeObject);
 
@@ -121,7 +121,7 @@ bool CJSONVariantParserHandler::end_object()
   return true;
 }
 
-bool CJSONVariantParserHandler::start_array(std::size_t elements)
+bool CJSONVariantParserHandler::start_array(std::size_t)
 {
   PushObject(CVariant::VariantTypeArray);
 
@@ -135,9 +135,9 @@ bool CJSONVariantParserHandler::end_array()
   return true;
 }
 
-bool CJSONVariantParserHandler::parse_error(std::size_t position,
-                                            const std::string& last_token,
-                                            const nlohmann::json::exception& ex)
+bool CJSONVariantParserHandler::parse_error(std::size_t,
+                                            const std::string&,
+                                            const nlohmann::json::exception&)
 {
   return false;
 }

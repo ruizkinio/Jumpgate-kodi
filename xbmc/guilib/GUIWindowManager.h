@@ -197,7 +197,8 @@ public:
   void DispatchThreadMessages();
   // method to removed queued messages with message id in the requested message id list.
   // pMessageIDList: point to first integer of a 0 ends integer array.
-  int RemoveThreadMessageByMessageIds(const int* pMessageIDList);
+  int RemoveThreadMessageByMessageIds(const int* pMessageIDList,
+                                      std::vector<CGUIMessage>* removedMessages = nullptr);
   void AddMsgTarget( IMsgTargetCallback* pMsgTarget );
   void RemoveMsgTarget(IMsgTargetCallback* pMsgTarget);
   int GetActiveWindow() const;

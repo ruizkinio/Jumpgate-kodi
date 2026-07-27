@@ -37,6 +37,10 @@ set(package_files strings.xml
                   build.gradle
                   src/Splash.java
                   src/Main.java
+                  src/ExternalPlayerActivity.java
+                  src/ExternalPlayerResultCoordinator.java
+                  src/ExternalPlayerResultStore.java
+                  src/JumpgateCredentialStore.java
                   src/XBMCBroadcastReceiver.java
                   src/XBMCInputDeviceListener.java
                   src/XBMCJsonRPC.java
@@ -78,7 +82,12 @@ set(package_files strings.xml
                   src/content/XBMCMediaContentProvider.java
                   src/content/XBMCContentProvider.java
                   src/util/Storage.java
+                  test/ExternalPlayerResultCoordinatorTest.java
+                  test-support/Splash.java
+                  test-support/Main.java
                   )
+file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/tools/android/packaging/xbmc/test
+                    ${CMAKE_BINARY_DIR}/tools/android/packaging/xbmc/test-support)
 foreach(file IN LISTS package_files)
   configure_file(${CMAKE_SOURCE_DIR}/tools/android/packaging/xbmc/${file}.in
                  ${CMAKE_BINARY_DIR}/tools/android/packaging/xbmc/${file} @ONLY)
@@ -143,7 +152,12 @@ foreach(library IN LISTS LIBRARY_FILES)
 endforeach()
 
 if(TARGET ${APP_NAME_LC}::Shairplay)
-  add_bundle_file(${APP_NAME_LC}::Shairplay ${libdir} "")
+  get_target_property(shairplay_location ${APP_NAME_LC}::Shairplay IMPORTED_LOCATION)
+  if(shairplay_location MATCHES "\\.so(\\..+)?$")
+    add_bundle_file(${APP_NAME_LC}::Shairplay ${libdir} "")
+  elseif(NOT shairplay_location MATCHES "\\.a$")
+    message(FATAL_ERROR "Unsupported Shairplay library type: ${shairplay_location}")
+  endif()
 endif()
 
 # Main targets from Makefile.in

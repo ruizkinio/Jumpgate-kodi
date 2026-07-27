@@ -3,8 +3,6 @@ include ../../depends/Makefile.include
 BUILD_TYPE:=@CMAKE_BUILD_TYPE@
 BUILD_TYPE_LC:=$(shell echo $(BUILD_TYPE) | tr A-Z a-z)
 
-OBJS = libshairplay.so
-
 EXCLUDED_ADDONS =
 
 CMAKE_SOURCE_DIR = $(shell cd $(CURDIR)/../../..; pwd)
@@ -29,8 +27,6 @@ endif
 # libc++
 STLLIB=$(TOOLCHAIN)/sysroot/usr/lib/$(HOST)/libc++_shared.so
 
-SRCLIBS = $(addprefix $(PREFIX)/lib/,$(OBJS))
-
 all: apk
 
 apk: apk-clean sharedapk package
@@ -54,6 +50,7 @@ sharedapk: shared | xbmc/assets
 python: | xbmc/assets
 	mkdir -p xbmc/assets/python@PYTHON_VERSION@/lib/
 	cp -rfp $(PREFIX)/lib/python@PYTHON_VERSION@ xbmc/assets/python@PYTHON_VERSION@/lib/
+	rm -rf xbmc/assets/python@PYTHON_VERSION@/lib/python@PYTHON_VERSION@/site-packages/Cryptodome/SelfTest
 	cd xbmc/assets/python@PYTHON_VERSION@/lib/python@PYTHON_VERSION@/; rm -rf test config config-@PYTHON_VERSION@ lib-dynload ; find . -name "*.so" -exec rm -f {} \;
 
 res:
@@ -68,7 +65,6 @@ res:
 libs: $(PREFIX)/lib/@APP_NAME_LC@/lib@APP_NAME_LC@.so
 	rm -rf xbmc/lib/$(CPU) xbmc/obj/local/$(CPU)
 	mkdir -p xbmc/lib/$(CPU) xbmc/assets/python@PYTHON_VERSION@/lib/ xbmc/obj/local/$(CPU)
-	cp -fpL $(SRCLIBS) xbmc/obj/local/$(CPU)/
 	cp -fp $(PREFIX)/lib/@APP_NAME_LC@/lib@APP_NAME_LC@.so xbmc/obj/local/$(CPU)/
 	(test -d $(PREFIX)/lib/@APP_NAME_LC@/addons && \
 	  find $(PREFIX)/lib/@APP_NAME_LC@/addons -name "*.so" -exec cp -fp {} xbmc/obj/local/$(CPU)/ \;) || true
@@ -77,7 +73,7 @@ libs: $(PREFIX)/lib/@APP_NAME_LC@/lib@APP_NAME_LC@.so
 	(test -d $(DEPENDS_PATH)/lib/kodi/addons && \
 	  find $(DEPENDS_PATH)/lib/kodi/addons -name "*.so" -exec cp -fp {} xbmc/obj/local/$(CPU)/ \;) || true
 	find $(PREFIX)/lib/@APP_NAME_LC@/system -name "*.so" -exec cp -fp {} xbmc/obj/local/$(CPU)/ \;
-	DIR=${CURDIR}; cd $(PREFIX)/lib/python@PYTHON_VERSION@/site-packages; for i in `find Cryptodome -name \*.so` ; do FN=`echo $$i | cut -c1- | tr "/" "_" | sed -e 's/\.abi[0-9]\\././'` ;cp $$i $$DIR/xbmc/obj/local/$(CPU)/$$FN ; done
+	DIR=${CURDIR}; cd $(PREFIX)/lib/python@PYTHON_VERSION@/site-packages; for i in `find Cryptodome -path Cryptodome/SelfTest -prune -o -name \*.so -print` ; do FN=`echo $$i | cut -c1- | tr "/" "_" | sed -e 's/\.abi[0-9]\\././'` ;cp $$i $$DIR/xbmc/obj/local/$(CPU)/$$FN ; done
 	cd xbmc/obj/local/$(CPU)/; find . -name "*.so" -not -name "lib*.so" | sed "s/\.\///" | xargs -I@ mv @ lib@
 	cp -fp xbmc/obj/local/$(CPU)/*.so xbmc/lib/$(CPU)/
 	$(STRIP) --strip-unneeded xbmc/lib/$(CPU)/*.so
@@ -92,10 +88,8 @@ package: libs python java
 	ANDROID_HOME=$(SDKROOT) ./gradlew assemble$(BUILD_TYPE)
 	@cp xbmc/build/outputs/apk/$(BUILD_TYPE_LC)/xbmc-$(BUILD_TYPE_LC).apk $(CMAKE_SOURCE_DIR)/@APP_NAME_LC@app-$(CPU)-$(BUILD_TYPE_LC).apk
 
-$(PREFIX)/lib/xbmc/lib@APP_NAME_LC@.so: $(SRCLIBS)
+$(PREFIX)/lib/@APP_NAME_LC@/lib@APP_NAME_LC@.so:
 	$(MAKE) -C ../../depends/target/xbmc
-
-$(SRCLIBS):
 
 apk-clean:
 	rm -rf xbmc/java
@@ -109,4 +103,3 @@ apk-clean:
 	rm -rf assets
 
 .PHONY: force libs assets python sharedapk res package
-

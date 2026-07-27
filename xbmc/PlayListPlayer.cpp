@@ -44,6 +44,8 @@
 #include "video/VideoDatabase.h"
 #include "video/VideoFileItemClassify.h"
 
+#include <memory>
+
 using namespace KODI::MESSAGING;
 using namespace KODI::VIDEO;
 
@@ -955,6 +957,10 @@ void PLAYLIST::CPlayListPlayer::OnApplicationMessage(KODI::MESSAGING::ThreadMess
     // first check if we were called from the PlayFile() function
     if (pMsg->lpVoid && pMsg->param2 == 0)
     {
+      std::unique_ptr<CFileItem> item = pMsg->TakeOwnedPayload<CFileItem>();
+      if (!item)
+        return;
+
       // Discard the current playlist, if TMSG_MEDIA_PLAY gets posted with just a single item.
       // Otherwise items may fail to play, when started while a playlist is playing.
       // But a single item in a stack is allowed.
@@ -966,9 +972,10 @@ void PLAYLIST::CPlayListPlayer::OnApplicationMessage(KODI::MESSAGING::ThreadMess
           Reset();
       }
 
-      CFileItem *item = static_cast<CFileItem*>(pMsg->lpVoid);
-      g_application.PlayFile(*item, "", pMsg->param1 != 0);
-      delete item;
+      const bool jumpgateAdmission = item->HasProperty("jumpgate.playback_token");
+      const bool opened = g_application.PlayFile(*item, "", pMsg->param1 != 0);
+      if (jumpgateAdmission)
+        pMsg->SetResult(opened ? 1 : 0);
       return;
     }
 

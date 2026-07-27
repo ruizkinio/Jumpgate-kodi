@@ -1,0 +1,777 @@
+name: Jumpgate Android CI
+
+'on':
+  pull_request:
+    branches:
+      - master
+      - main
+      - feat/source-backed-player
+  push:
+    branches:
+      - master
+      - main
+      - feat/source-backed-player
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jumpgate-android-${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  ANDROID_PLATFORM_VERSION: '36'
+  ANDROID_MIN_SDK_VERSION: '24'
+  ANDROID_BUILD_TOOLS_VERSION: '36.0.0'
+  ANDROID_NDK_VERSION: '28.2.13676358'
+  JAVA_VERSION: '17'
+  CACHE_SCHEMA_VERSION: v3
+  CANONICAL_REPOSITORY: ruizkinio/Jumpgate-kodi
+
+jobs:
+  linux-host-tests:
+    name: Linux / Jumpgate host tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      JUMPGATE_HOST_TEST_FILTER: 'TestJumpgate*:TestAndroidJumpgate*:TestUPnPPlayerOpenPublication*'
+    steps:
+      - name: Check out Kodi
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install documented Ubuntu host build packages
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
+            autoconf \
+            automake \
+            autopoint \
+            autotools-dev \
+            build-essential \
+            ccache \
+            cmake \
+            curl \
+            default-jre \
+            gawk \
+            gettext \
+            gperf \
+            libasound2-dev \
+            libass-dev \
+            libavahi-client-dev \
+            libavahi-common-dev \
+            libbluetooth-dev \
+            libbluray-dev \
+            libbz2-dev \
+            libcdio-dev \
+            libcec-dev \
+            libcrossguid-dev \
+            libcurl4-openssl-dev \
+            libcwiid-dev \
+            libdbus-1-dev \
+            libdrm-dev \
+            libegl1-mesa-dev \
+            libenca-dev \
+            libexiv2-dev \
+            libflatbuffers-dev \
+            libflac-dev \
+            libfmt-dev \
+            libfontconfig-dev \
+            libfreetype6-dev \
+            libfribidi-dev \
+            libfstrcmp-dev \
+            libgcrypt-dev \
+            libgif-dev \
+            libgl1-mesa-dev \
+            libgles2-mesa-dev \
+            libglu1-mesa-dev \
+            libgnutls28-dev \
+            libgpg-error-dev \
+            libgtest-dev \
+            libiso9660-dev \
+            libjpeg-dev \
+            liblcms2-dev \
+            liblirc-dev \
+            libltdl-dev \
+            liblzo2-dev \
+            libmicrohttpd-dev \
+            libmysqlclient-dev \
+            libnfs-dev \
+            libogg-dev \
+            libp8-platform-dev \
+            libpcre2-dev \
+            libplist-dev \
+            libpng-dev \
+            libpulse-dev \
+            libshairplay-dev \
+            libsmbclient-dev \
+            libspdlog-dev \
+            libsqlite3-dev \
+            libssl-dev \
+            libtag1-dev \
+            libtiff-dev \
+            libtinyxml-dev \
+            libtinyxml2-dev \
+            libtool \
+            libudev-dev \
+            libunistring-dev \
+            libva-dev \
+            libvdpau-dev \
+            libvorbis-dev \
+            libxmu-dev \
+            libxrandr-dev \
+            libxslt1-dev \
+            libxt-dev \
+            lsb-release \
+            meson \
+            nasm \
+            ninja-build \
+            nlohmann-json3-dev \
+            python3-dev \
+            python3-pil \
+            swig \
+            unzip \
+            uuid-dev \
+            zip \
+            zlib1g-dev
+
+      - name: Configure host test paths and cache key
+        id: host-cache-key
+        run: |
+          set -euo pipefail
+          app_name_lc="$(
+            awk '$1 == "APP_NAME" { print tolower($2); matches++ }
+                 END { if (matches != 1) exit 1 }' version.txt
+          )"
+          [[ "$app_name_lc" =~ ^[a-z][a-z0-9-]*$ ]]
+          toolchain_hash="$({
+            printf 'image=%s\n' "${ImageOS:-unknown}"
+            printf 'image-version=%s\n' "${ImageVersion:-unknown}"
+            gcc -dumpfullversion -dumpversion
+            g++ -dumpfullversion -dumpversion
+            cmake --version
+            ninja --version
+            ccache --version
+          } | sha256sum | cut -d ' ' -f 1)"
+          {
+            echo "CCACHE_DIR=$HOME/.cache/jumpgate-host-ccache"
+            echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE"
+            echo 'CCACHE_COMPILERCHECK=content'
+            echo "KODI_HOST_BUILD_DIR=$RUNNER_TEMP/kodi-host-build-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+            echo "KODI_HOST_TEST_TARGET=${app_name_lc}-test"
+          } >> "$GITHUB_ENV"
+          echo "toolchain_hash=$toolchain_hash" >> "$GITHUB_OUTPUT"
+
+      - name: Restore host ccache
+        id: restore-host-ccache
+        uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: jumpgate-android-${{ env.CACHE_SCHEMA_VERSION }}-host-ccache-${{ runner.os }}-${{ runner.arch }}-${{ steps.host-cache-key.outputs.toolchain_hash }}-${{ github.sha }}
+          restore-keys: |
+            jumpgate-android-${{ env.CACHE_SCHEMA_VERSION }}-host-ccache-${{ runner.os }}-${{ runner.arch }}-${{ steps.host-cache-key.outputs.toolchain_hash }}-
+
+      - name: Configure Kodi host tests
+        run: |
+          set -euo pipefail
+          mkdir -p "$CCACHE_DIR"
+          ccache --max-size=2G
+          ccache --zero-stats
+          cmake -S . -B "$KODI_HOST_BUILD_DIR" -G Ninja \
+            -DAPP_RENDER_SYSTEM=gl \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCORE_PLATFORM_NAME=x11 \
+            -DENABLE_INTERNAL_FFMPEG=ON \
+            -DENABLE_TESTING=ON
+
+      - name: Build Kodi host test binary
+        run: |
+          set -euo pipefail
+          cmake --build "$KODI_HOST_BUILD_DIR" \
+            --target "$KODI_HOST_TEST_TARGET" \
+            --parallel "$(getconf _NPROCESSORS_ONLN)"
+          test -x "$KODI_HOST_BUILD_DIR/$KODI_HOST_TEST_TARGET"
+          if [[ "$KODI_HOST_TEST_TARGET" != kodi-test ]]; then
+            ln -s "$KODI_HOST_TEST_TARGET" "$KODI_HOST_BUILD_DIR/kodi-test"
+          fi
+          test -x "$KODI_HOST_BUILD_DIR/kodi-test"
+          ccache --show-stats
+
+      - name: Inventory Jumpgate host tests
+        run: |
+          set -euo pipefail
+          inventory_file="$RUNNER_TEMP/jumpgate-host-test-inventory.txt"
+          "$KODI_HOST_BUILD_DIR/kodi-test" \
+            --gtest_list_tests \
+            --gtest_filter="$JUMPGATE_HOST_TEST_FILTER" |
+            tee "$inventory_file"
+
+          python3 tools/ci/jumpgate/test-android-branding.py --verify-gtest-inventory "$inventory_file"
+
+      - name: Run Jumpgate host tests directly
+        run: |
+          set -euo pipefail
+          "$KODI_HOST_BUILD_DIR/kodi-test" \
+            --gtest_filter="$JUMPGATE_HOST_TEST_FILTER"
+
+      - name: Save host ccache
+        if: ${{ github.repository == env.CANONICAL_REPOSITORY && github.event_name != 'pull_request' && steps.restore-host-ccache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: jumpgate-android-${{ env.CACHE_SCHEMA_VERSION }}-host-ccache-${{ runner.os }}-${{ runner.arch }}-${{ steps.host-cache-key.outputs.toolchain_hash }}-${{ github.sha }}
+
+  android-apk:
+    name: Android / ${{ matrix.abi }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - host: aarch64-linux-android
+            abi: arm64-v8a
+            cache_id: arm64
+          - host: arm-linux-androideabi
+            abi: armeabi-v7a
+            cache_id: armv7
+    steps:
+      - name: Check out Kodi
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00 # v4.7.1
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          check-latest: false
+
+      - name: Install documented Ubuntu build packages
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
+            autoconf \
+            bison \
+            build-essential \
+            ccache \
+            curl \
+            flex \
+            gawk \
+            git \
+            gperf \
+            lib32stdc++6 \
+            lib32z1 \
+            lib32z1-dev \
+            libcurl4-openssl-dev \
+            python3 \
+            python3-yaml \
+            unzip \
+            zip \
+            zlib1g-dev
+
+      - name: Install exact Android SDK and NDK components
+        run: |
+          set -euo pipefail
+          : "${ANDROID_SDK_ROOT:?ANDROID_SDK_ROOT is required on the runner}"
+          sdkmanager_bin="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          if [[ ! -x "$sdkmanager_bin" ]]; then
+            sdkmanager_bin="$(
+              find "$ANDROID_SDK_ROOT/cmdline-tools" \
+                -path '*/bin/sdkmanager' -type f -perm -u+x -print 2>/dev/null |
+                LC_ALL=C sort -V |
+                tail -n 1 || true
+            )"
+          fi
+          if [[ -z "$sdkmanager_bin" || ! -x "$sdkmanager_bin" ]]; then
+            echo "Unable to locate sdkmanager below $ANDROID_SDK_ROOT/cmdline-tools" >&2
+            exit 1
+          fi
+
+          set +o pipefail
+          yes | "$sdkmanager_bin" --sdk_root="$ANDROID_SDK_ROOT" --licenses >/dev/null
+          license_status="${PIPESTATUS[1]}"
+          set -o pipefail
+          if [[ "$license_status" -ne 0 ]]; then
+            echo 'Android SDK license acceptance failed' >&2
+            exit 1
+          fi
+
+          "$sdkmanager_bin" --sdk_root="$ANDROID_SDK_ROOT" --install \
+            platform-tools \
+            "platforms;android-${ANDROID_PLATFORM_VERSION}" \
+            "build-tools;${ANDROID_BUILD_TOOLS_VERSION}" \
+            "ndk;${ANDROID_NDK_VERSION}"
+
+          ndk_root="$ANDROID_SDK_ROOT/ndk/$ANDROID_NDK_VERSION"
+          build_tools_root="$ANDROID_SDK_ROOT/build-tools/$ANDROID_BUILD_TOOLS_VERSION"
+          test -x "$build_tools_root/aapt2"
+          test -x "$build_tools_root/apksigner"
+          test -x "$build_tools_root/zipalign"
+          test -f "$build_tools_root/lib/apksigner.jar"
+          test -f "$ndk_root/source.properties"
+          grep -Eq "^Pkg\.Revision[[:space:]]*=[[:space:]]*${ANDROID_NDK_VERSION}$" \
+            "$ndk_root/source.properties"
+          java_major="$(java -XshowSettings:properties -version 2>&1 |
+            sed -n 's/^[[:space:]]*java\.version = \([0-9][0-9]*\).*/\1/p' | head -n 1)"
+          test "$java_major" = "$JAVA_VERSION"
+
+          {
+            echo "ANDROID_HOME=$ANDROID_SDK_ROOT"
+            echo "ANDROID_NDK_ROOT=$ndk_root"
+            echo "ANDROID_BUILD_TOOLS_ROOT=$build_tools_root"
+            echo "TARBALLS_DIR=$HOME/android-tools/xbmc-tarballs"
+            echo "DEPENDS_PREFIX=$HOME/android-tools/xbmc-depends-${{ matrix.cache_id }}"
+            echo "DEPENDS_STATE_DIR=$HOME/android-tools/xbmc-depends-state-${{ matrix.cache_id }}"
+            echo "GRADLE_USER_HOME=$HOME/.cache/jumpgate-gradle-${{ matrix.cache_id }}"
+            echo "CCACHE_DIR=$HOME/.cache/jumpgate-ccache-${{ matrix.cache_id }}"
+            echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE"
+            echo 'CCACHE_COMPILERCHECK=content'
+            echo "KODI_BUILD_DIR=$RUNNER_TEMP/kodi-build-${{ matrix.cache_id }}-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+            echo "ARTIFACT_DIR=$RUNNER_TEMP/jumpgate-artifacts-${{ matrix.cache_id }}"
+          } >> "$GITHUB_ENV"
+          echo "$build_tools_root" >> "$GITHUB_PATH"
+          echo "$ANDROID_SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
+
+      - name: Run static symbol and APK verifier tests
+        if: ${{ matrix.cache_id == 'arm64' }}
+        run: |
+          python3 tools/ci/jumpgate/test-manager-addon.py
+          python3 tools/ci/jumpgate/test-android-branding.py
+          python3 tools/ci/jumpgate/test-jumpgate-android-release-workflow.py
+          bash tools/ci/jumpgate/test-verify-shairplay-crypto-symbols.sh
+          python3 tools/ci/jumpgate/test-verify-android-python-runtime.py
+          bash tools/ci/jumpgate/test-verify-android-apk.sh
+          bash tools/ci/jumpgate/test-verify-android-release.sh
+
+      - name: Derive tracked-source cache keys
+        id: source-keys
+        run: |
+          set -euo pipefail
+          hash_tracked_tree() {
+            local tree="$1"
+            local first_file
+            first_file="$(git ls-files -- "$tree" | sed -n '1p')"
+            if [[ -z "$first_file" ]]; then
+              echo "No tracked files found under $tree" >&2
+              return 1
+            fi
+            git ls-files -z -- "$tree" |
+              LC_ALL=C sort -z |
+              xargs -0 sha256sum |
+              sha256sum |
+              cut -d ' ' -f 1
+          }
+
+          depends_hash="$(hash_tracked_tree tools/depends)"
+          gradle_hash="$(hash_tracked_tree tools/android/packaging)"
+          identity_hash="$(sha256sum version.txt | cut -d ' ' -f 1)"
+          toolchain_hash="$({
+            printf 'image=%s\n' "${ImageOS:-unknown}"
+            printf 'image-version=%s\n' "${ImageVersion:-unknown}"
+            printf 'android-min-sdk=%s\n' "$ANDROID_MIN_SDK_VERSION"
+            printf 'android-target-sdk=%s\n' "$ANDROID_PLATFORM_VERSION"
+            java -version 2>&1
+            gcc -dumpfullversion -dumpversion
+            dpkg-query -W -f='${binary:Package}=${Version}\n' \
+              autoconf bison build-essential ccache curl flex gawk git gperf \
+              lib32stdc++6 lib32z1 lib32z1-dev libcurl4-openssl-dev python3 \
+              python3-yaml \
+              unzip zip zlib1g-dev
+            sha256sum \
+              "$ANDROID_NDK_ROOT/source.properties" \
+              "$ANDROID_BUILD_TOOLS_ROOT/package.xml" \
+              "$ANDROID_SDK_ROOT/platforms/android-${ANDROID_PLATFORM_VERSION}/package.xml"
+          } | sha256sum | cut -d ' ' -f 1)"
+          {
+            echo "depends_hash=$depends_hash"
+            echo "gradle_hash=$gradle_hash"
+            echo "identity_hash=$identity_hash"
+            echo "toolchain_hash=$toolchain_hash"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Restore shared source tarballs
+        id: restore-tarballs
+        uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: ${{ env.TARBALLS_DIR }}
+          key: jumpgate-android-${{ env.CACHE_SCHEMA_VERSION }}-tarballs-${{ steps.source-keys.outputs.depends_hash }}
+
+      - name: Restore ABI dependency state
+        id: restore-depends
+        uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: |
+            ${{ env.DEPENDS_PREFIX }}
+            ${{ env.DEPENDS_STATE_DIR }}
+          key: jumpgate-android-${{ env.CACHE_SCHEMA_VERSION }}-depends-${{ runner.os }}-${{ runner.arch }}-${{ matrix.host }}-${{ steps.source-keys.outputs.toolchain_hash }}-${{ steps.source-keys.outputs.depends_hash }}-${{ steps.source-keys.outputs.identity_hash }}
+
+      - name: Restore ABI ccache
+        id: restore-ccache
+        uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: jumpgate-android-${{ env.CACHE_SCHEMA_VERSION }}-ccache-${{ runner.os }}-${{ matrix.host }}-${{ steps.source-keys.outputs.toolchain_hash }}-${{ github.sha }}
+          restore-keys: |
+            jumpgate-android-${{ env.CACHE_SCHEMA_VERSION }}-ccache-${{ runner.os }}-${{ matrix.host }}-${{ steps.source-keys.outputs.toolchain_hash }}-
+
+      - name: Restore ABI Gradle cache
+        id: restore-gradle
+        uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: |
+            ${{ env.GRADLE_USER_HOME }}/caches
+            ${{ env.GRADLE_USER_HOME }}/wrapper
+          key: jumpgate-android-${{ env.CACHE_SCHEMA_VERSION }}-gradle-${{ runner.os }}-${{ matrix.host }}-${{ steps.source-keys.outputs.toolchain_hash }}-${{ steps.source-keys.outputs.gradle_hash }}-${{ steps.source-keys.outputs.identity_hash }}
+
+      - name: Create ephemeral CI signing key
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/jumpgate-signing"
+          keystore="$RUNNER_TEMP/jumpgate-signing/${{ matrix.cache_id }}.keystore"
+          certificate="$RUNNER_TEMP/jumpgate-signing/${{ matrix.cache_id }}.cer"
+          store_password="$(head -c 48 /dev/urandom | base64 | tr -d '\n' | tr '/+' '_-')"
+          echo "::add-mask::$store_password"
+          keytool -genkeypair \
+            -keystore "$keystore" \
+            -storetype PKCS12 \
+            -alias jumpgate-ci \
+            -dname "CN=Jumpgate Ephemeral CI,O=Jumpgate,C=NL" \
+            -keyalg RSA \
+            -keysize 3072 \
+            -validity 2 \
+            -storepass "$store_password" \
+            -keypass "$store_password" \
+            -noprompt >/dev/null
+          chmod 600 "$keystore"
+          keytool -exportcert \
+            -keystore "$keystore" \
+            -storetype PKCS12 \
+            -alias jumpgate-ci \
+            -storepass "$store_password" \
+            -file "$certificate" >/dev/null
+          chmod 600 "$certificate"
+          signer_sha256="$(sha256sum "$certificate" | cut -d ' ' -f 1)"
+          [[ "$signer_sha256" =~ ^[0-9a-f]{64}$ ]]
+
+          {
+            echo "KODI_ANDROID_STORE_FILE=$keystore"
+            echo "KODI_ANDROID_CERT_FILE=$certificate"
+            echo "KODI_ANDROID_STORE_PASSWORD=$store_password"
+            echo 'KODI_ANDROID_KEY_ALIAS=jumpgate-ci'
+            echo "KODI_ANDROID_KEY_PASSWORD=$store_password"
+            echo "EXPECTED_APK_SIGNER_SHA256=$signer_sha256"
+          } >> "$GITHUB_ENV"
+
+      - name: Configure tools and dependencies
+        run: |
+          set -euo pipefail
+          mkdir -p "$TARBALLS_DIR" "$DEPENDS_PREFIX" "$DEPENDS_STATE_DIR" \
+            "$GRADLE_USER_HOME" "$CCACHE_DIR"
+          ccache --max-size=2G
+          ccache --zero-stats
+
+          pushd tools/depends >/dev/null
+          ./bootstrap
+          ./configure \
+            --with-tarballs="$TARBALLS_DIR" \
+            --host="${{ matrix.host }}" \
+            --with-sdk-path="$ANDROID_SDK_ROOT" \
+            --with-ndk-path="$ANDROID_NDK_ROOT" \
+            --with-ndk-api="$ANDROID_MIN_SDK_VERSION" \
+            --prefix="$DEPENDS_PREFIX" \
+            --disable-debug
+          popd >/dev/null
+
+          native_platform="$(awk -F= '$1 == "NATIVEPLATFORM" { print $2 }' tools/depends/Makefile.include)"
+          target_platform="$(awk -F= '$1 == "PLATFORM" { print $2 }' tools/depends/Makefile.include)"
+          ndk_level="$(awk -F= '$1 == "NDK_LEVEL" { print $2 }' tools/depends/Makefile.include)"
+          test -n "$native_platform"
+          test -n "$target_platform"
+          [[ "$ndk_level" =~ ^[0-9]+$ ]]
+          test "$ndk_level" = "$ANDROID_MIN_SDK_VERSION"
+          expected_target_platform="${{ matrix.host }}-${ndk_level}-release"
+          test "$target_platform" = "$expected_target_platform"
+
+          if [[ -f "$DEPENDS_STATE_DIR/native.complete" &&
+                -f "$DEPENDS_STATE_DIR/target.complete" ]] &&
+              grep -Fxq "native=$native_platform" "$DEPENDS_STATE_DIR/native.complete"; then
+            install -m 0644 "$DEPENDS_STATE_DIR/native.complete" \
+              "tools/depends/native/.installed-$native_platform"
+            install -m 0644 "$DEPENDS_STATE_DIR/target.complete" \
+              "tools/depends/target/.installed-$target_platform"
+          else
+            rm -f tools/depends/native/.installed-* tools/depends/target/.installed-*
+          fi
+
+      - name: Build tools and dependencies
+        run: |
+          set -Eeuo pipefail
+          trap 'status=$?; echo "::error file=.github/workflows/jumpgate-android.yml::Dependency validation failed at line $LINENO: $BASH_COMMAND (exit $status)" >&2; exit "$status"' ERR
+          fail() {
+            echo "::error file=.github/workflows/jumpgate-android.yml::$*" >&2
+            exit 1
+          }
+          require_file() {
+            [[ -f "$1" ]] || {
+              echo "Missing required file: $1" >&2
+              find "$(dirname "$1")" -maxdepth 1 -mindepth 1 -printf '%f\n' 2>/dev/null | LC_ALL=C sort >&2 || true
+              fail "$2"
+            }
+          }
+          require_nonempty() {
+            [[ -s "$1" ]] || fail "$2: $1"
+          }
+          require_executable() {
+            [[ -x "$1" ]] || fail "$2: $1"
+          }
+          require_equal() {
+            [[ "$1" == "$2" ]] || fail "$3 (expected '$2', found '$1')"
+          }
+          make -C tools/depends -j"$(getconf _NPROCESSORS_ONLN)"
+
+          native_platform="$(awk -F= '$1 == "NATIVEPLATFORM" { print $2 }' tools/depends/Makefile.include)"
+          target_platform="$(awk -F= '$1 == "PLATFORM" { print $2 }' tools/depends/Makefile.include)"
+          ndk_level="$(awk -F= '$1 == "NDK_LEVEL" { print $2 }' tools/depends/Makefile.include)"
+          [[ "$ndk_level" =~ ^[0-9]+$ ]] || fail "Invalid configured NDK level: '$ndk_level'"
+          require_equal "$ndk_level" "$ANDROID_MIN_SDK_VERSION" 'Configured NDK level mismatch'
+          require_equal \
+            "$target_platform" \
+            "${{ matrix.host }}-${ndk_level}-release" \
+            'Configured target platform mismatch'
+          echo "Validated dependency platforms: native=$native_platform target=$target_platform"
+          shairplay_archive="$DEPENDS_PREFIX/$target_platform/lib/libshairplay.a"
+          crypto_archive="$DEPENDS_PREFIX/$target_platform/lib/libcrypto.a"
+          shairplay_lib_dir="$(dirname "$shairplay_archive")"
+          llvm_ar="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
+          llvm_nm="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
+          require_nonempty "$shairplay_archive" 'Static Shairplay archive is missing or empty'
+          require_nonempty "$crypto_archive" 'Static OpenSSL crypto archive is missing or empty'
+          require_executable "$llvm_ar" 'NDK llvm-ar is unavailable'
+          require_executable "$llvm_nm" 'NDK llvm-nm is unavailable'
+
+          "$llvm_ar" t "$shairplay_archive" > "$RUNNER_TEMP/shairplay-archive-members.txt"
+          require_nonempty \
+            "$RUNNER_TEMP/shairplay-archive-members.txt" \
+            'Static Shairplay archive has no members'
+          if find "$shairplay_lib_dir" -maxdepth 1 \( -type f -o -type l \) \
+              -name 'libshairplay.so*' -print -quit | grep -q .; then
+            echo 'Unexpected installed libshairplay shared library:' >&2
+            find "$shairplay_lib_dir" -maxdepth 1 \( -type f -o -type l \) \
+              -name 'libshairplay.so*' -print >&2
+            exit 1
+          fi
+
+          bash tools/ci/jumpgate/verify-shairplay-crypto-symbols.sh \
+            "$llvm_nm" \
+            "$shairplay_archive" \
+            "$crypto_archive"
+
+          cat > "$RUNNER_TEMP/shairplay-expected-symbol-owners.txt" <<'EOF'
+          dnssd_destroy libshairplay_la-dnssd.o
+          dnssd_init libshairplay_la-dnssd.o
+          dnssd_register_airplay libshairplay_la-dnssd.o
+          dnssd_register_raop libshairplay_la-dnssd.o
+          dnssd_unregister_airplay libshairplay_la-dnssd.o
+          dnssd_unregister_raop libshairplay_la-dnssd.o
+          raop_destroy libshairplay_la-raop.o
+          raop_init libshairplay_la-raop.o
+          raop_init_from_keyfile libshairplay_la-raop.o
+          raop_is_running libshairplay_la-raop.o
+          raop_set_log_callback libshairplay_la-raop.o
+          raop_set_log_level libshairplay_la-raop.o
+          raop_start libshairplay_la-raop.o
+          raop_stop libshairplay_la-raop.o
+          EOF
+          "$llvm_nm" \
+            --format=posix \
+            --print-file-name \
+            --defined-only \
+            --extern-only \
+            "$shairplay_archive" > "$RUNNER_TEMP/shairplay-nm.txt"
+          require_nonempty "$RUNNER_TEMP/shairplay-nm.txt" 'Static Shairplay symbol table is empty'
+          awk '
+            NR == FNR { required[$1] = 1; next }
+            $1 ~ /\[[^][]+\]:$/ && ($2 in required) && $3 ~ /^[[:alpha:]]$/ {
+              owner = $1
+              sub(/^.*\[/, "", owner)
+              sub(/\]:$/, "", owner)
+              print $2 " " owner
+            }
+          ' \
+            "$RUNNER_TEMP/shairplay-expected-symbol-owners.txt" \
+            "$RUNNER_TEMP/shairplay-nm.txt" |
+            LC_ALL=C sort -u > "$RUNNER_TEMP/shairplay-actual-symbol-owners.txt"
+          if ! diff -u \
+              "$RUNNER_TEMP/shairplay-expected-symbol-owners.txt" \
+              "$RUNNER_TEMP/shairplay-actual-symbol-owners.txt"; then
+            fail 'Static Shairplay public symbol ownership is incomplete or unexpected'
+          fi
+          target_stamp="tools/depends/target/.installed-$target_platform"
+          require_file "$target_stamp" 'Kodi target dependency aggregate stamp is missing'
+          native_sentinel="$DEPENDS_STATE_DIR/native.complete.tmp"
+          printf 'native=%s\n' "$native_platform" > "$native_sentinel"
+          install -m 0644 "$native_sentinel" "$DEPENDS_STATE_DIR/native.complete"
+          rm -f "$native_sentinel"
+          install -m 0644 "tools/depends/target/.installed-$target_platform" \
+            "$DEPENDS_STATE_DIR/target.complete"
+          echo 'Static Shairplay and dependency cache sentinels validated.'
+
+      - name: Configure and build Kodi Release APK
+        run: |
+          set -euo pipefail
+          rm -rf "$KODI_BUILD_DIR"
+          mkdir -p "$KODI_BUILD_DIR"
+          target_platform="$(awk -F= '$1 == "PLATFORM" { print $2 }' tools/depends/Makefile.include)"
+          shairplay_archive="$DEPENDS_PREFIX/$target_platform/lib/libshairplay.a"
+          cmake_cache="$KODI_BUILD_DIR/CMakeCache.txt"
+          read_cmake_cache_value() {
+            local key="$1"
+            awk -v key="$key" '
+              index($0, key ":") == 1 && index($0, "=") != 0 {
+                print substr($0, index($0, "=") + 1)
+                matches++
+              }
+              END { if (matches != 1) exit 1 }
+            ' "$cmake_cache"
+          }
+          make -C tools/depends/target/cmakebuildsys BUILD_DIR="$KODI_BUILD_DIR"
+          test -s "$cmake_cache"
+          cached_shairplay_library="$(read_cmake_cache_value SHAIRPLAY_LIBRARY)"
+          test "$cached_shairplay_library" = "$shairplay_archive"
+          have_shairplay_callback_cls="$(read_cmake_cache_value HAVE_SHAIRPLAY_CALLBACK_CLS)"
+          case "${have_shairplay_callback_cls^^}" in
+            ''|0|OFF|NO|FALSE|N|IGNORE|NOTFOUND|*-NOTFOUND)
+              echo "HAVE_SHAIRPLAY_CALLBACK_CLS is not truthy: $have_shairplay_callback_cls" >&2
+              exit 1
+              ;;
+          esac
+          make -C "$KODI_BUILD_DIR" -j"$(getconf _NPROCESSORS_ONLN)"
+          make -C "$KODI_BUILD_DIR" apk
+          ccache --show-stats
+
+      - name: Verify and stage APK
+        run: |
+          set -euo pipefail
+          read_version_field() {
+            local key="$1"
+            awk -v key="$key" '
+              $1 == key {
+                $1 = ""
+                sub(/^[[:space:]]+/, "")
+                print
+                matches++
+              }
+              END { if (matches != 1) exit 1 }
+            ' version.txt
+          }
+
+          expected_package="$(read_version_field APP_PACKAGE)"
+          app_name_lc="$(read_version_field APP_NAME | LC_ALL=C tr '[:upper:]' '[:lower:]')"
+          expected_core_library="lib${app_name_lc}.so"
+          version_major="$(read_version_field VERSION_MAJOR)"
+          version_minor="$(read_version_field VERSION_MINOR)"
+          version_tag="$(read_version_field VERSION_TAG)"
+          version_code_source="$(read_version_field VERSION_CODE)"
+          [[ "$version_major" =~ ^[0-9]+$ ]]
+          [[ "$version_minor" =~ ^[0-9]+$ ]]
+          [[ "$version_tag" =~ ^[A-Za-z0-9._-]+$ ]]
+          [[ "$version_code_source" =~ ^[0-9]+\.[0-9]{1,2}\.[0-9]{1,3}$ ]]
+          IFS=. read -r code_major code_minor code_patch <<< "$version_code_source"
+          expected_version_code="$(((10#$code_major * 100 + 10#$code_minor) * 1000 + 10#$code_patch))"
+          expected_version_name="${version_major}.${version_minor}-${version_tag}"
+          target_platform="$(awk -F= '$1 == "PLATFORM" { print $2 }' tools/depends/Makefile.include)"
+          target_prefix="$DEPENDS_PREFIX/$target_platform"
+          source_apk="${app_name_lc}app-${{ matrix.abi }}-release.apk"
+          artifact_apk="$ARTIFACT_DIR/jumpgate-android-ci-ephemeral-signed-${{ matrix.abi }}-${GITHUB_SHA}.apk"
+          test -n "$expected_package"
+          [[ "$app_name_lc" =~ ^[a-z][a-z0-9]*$ ]]
+          [[ "$expected_core_library" =~ ^lib[a-z][a-z0-9]*\.so$ ]]
+          test -n "$target_platform"
+          test -d "$target_prefix"
+          [[ "${EXPECTED_APK_SIGNER_SHA256:-}" =~ ^[0-9a-f]{64}$ ]]
+          test -f "$source_apk"
+          mkdir -p "$ARTIFACT_DIR"
+          install -m 0644 "$source_apk" "$artifact_apk"
+          bash tools/ci/jumpgate/verify-android-apk.sh \
+            "$artifact_apk" \
+            "${{ matrix.abi }}" \
+            "$expected_package" \
+            "$ANDROID_MIN_SDK_VERSION" \
+            "$ANDROID_PLATFORM_VERSION" \
+            "$expected_version_name" \
+            "$expected_version_code" \
+            "$EXPECTED_APK_SIGNER_SHA256" \
+            "$expected_core_library"
+          python3 tools/ci/jumpgate/verify-android-python-runtime.py \
+            "$artifact_apk" \
+            "${{ matrix.abi }}" \
+            "$target_prefix"
+
+      - name: Save shared source tarballs
+        if: ${{ github.repository == env.CANONICAL_REPOSITORY && github.event_name != 'pull_request' && matrix.cache_id == 'arm64' && steps.restore-tarballs.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: ${{ env.TARBALLS_DIR }}
+          key: jumpgate-android-${{ env.CACHE_SCHEMA_VERSION }}-tarballs-${{ steps.source-keys.outputs.depends_hash }}
+
+      - name: Save ABI dependency state
+        if: ${{ github.repository == env.CANONICAL_REPOSITORY && github.event_name != 'pull_request' && steps.restore-depends.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: |
+            ${{ env.DEPENDS_PREFIX }}
+            ${{ env.DEPENDS_STATE_DIR }}
+          key: jumpgate-android-${{ env.CACHE_SCHEMA_VERSION }}-depends-${{ runner.os }}-${{ runner.arch }}-${{ matrix.host }}-${{ steps.source-keys.outputs.toolchain_hash }}-${{ steps.source-keys.outputs.depends_hash }}-${{ steps.source-keys.outputs.identity_hash }}
+
+      - name: Save ABI ccache
+        if: ${{ github.repository == env.CANONICAL_REPOSITORY && github.event_name != 'pull_request' && steps.restore-ccache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: jumpgate-android-${{ env.CACHE_SCHEMA_VERSION }}-ccache-${{ runner.os }}-${{ matrix.host }}-${{ steps.source-keys.outputs.toolchain_hash }}-${{ github.sha }}
+
+      - name: Save ABI Gradle cache
+        if: ${{ github.repository == env.CANONICAL_REPOSITORY && github.event_name != 'pull_request' && steps.restore-gradle.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: |
+            ${{ env.GRADLE_USER_HOME }}/caches
+            ${{ env.GRADLE_USER_HOME }}/wrapper
+          key: jumpgate-android-${{ env.CACHE_SCHEMA_VERSION }}-gradle-${{ runner.os }}-${{ matrix.host }}-${{ steps.source-keys.outputs.toolchain_hash }}-${{ steps.source-keys.outputs.gradle_hash }}-${{ steps.source-keys.outputs.identity_hash }}
+
+      - name: Remove ephemeral signing material
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${KODI_ANDROID_STORE_FILE:-}" ]]; then
+            rm -f -- "$KODI_ANDROID_STORE_FILE"
+          fi
+          if [[ -n "${KODI_ANDROID_CERT_FILE:-}" ]]; then
+            rm -f -- "$KODI_ANDROID_CERT_FILE"
+          fi
+
+      - name: Upload verified CI APK
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: jumpgate-android-ci-ephemeral-signed-${{ matrix.abi }}-${{ github.sha }}
+          path: ${{ env.ARTIFACT_DIR }}/*
+          if-no-files-found: error
+          compression-level: 0
+          include-hidden-files: false
+          retention-days: 14
+
+      # Public release signing is intentionally not implemented here. A future job must use
+      # one protected-environment certificate for both ABIs and must never run for pull requests.
