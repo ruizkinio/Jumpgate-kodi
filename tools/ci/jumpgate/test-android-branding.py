@@ -1714,6 +1714,266 @@ def require_in_order(source, *contracts):
         offset = index + len(contract)
 
 
+def verify_warm_task_handoff_contract(main_activity, external_activity, app_source):
+    normal_exit = extract_braced_block(
+        main_activity, "public synchronized void exitExternalPlayerMode("
+    )
+    post_commit_exit = normal_exit[normal_exit.find("reservation.commit()") :]
+    warm_exit = extract_braced_block(post_commit_exit, "if (wasStandalone)")
+    require_in_order(
+        warm_exit,
+        "mExternalPlayerMode = false",
+        "mExternalResultProducer.clear(generation, requestId)",
+        "prepareWarmTaskHandoff(generation, requestId)",
+        "mWasStandalone = false",
+        "hideLoadingOverlay()",
+    )
+    if "handler.post(" in warm_exit or "moveTaskToBack(" in warm_exit:
+        raise AssertionError("Java terminal delivery must not schedule the warm task handoff")
+    if "finish()" in warm_exit or "scheduleExternalPlayerProcessExit(" in warm_exit:
+        raise AssertionError("warm external exit must retain Main and its native engine")
+
+    warm_exit_end = post_commit_exit.find(warm_exit) + len(warm_exit)
+    cold_exit = extract_braced_block(post_commit_exit[warm_exit_end:], "else")
+    require_in_order(cold_exit, "mExternalPlayerMode = false", "finish()")
+    if "moveTaskToBack(" in cold_exit or "handoffWarmExternalPlayerTask(" in cold_exit:
+        raise AssertionError("cold external exit must finish Main instead of retaining its task")
+
+    native_exit = extract_braced_block(app_source, "bool CXBMCApp::ExitExternalPlayerMode(")
+    native_warm_exit = extract_braced_block(native_exit, "if (wasStandalone)")
+    require_in_order(
+        native_warm_exit,
+        'call_method<void>(m_context, "exitExternalPlayerMode"',
+        "ReturnToStandaloneMode()",
+    )
+    if "HandoffWarmExternalPlayerTask(" in native_warm_exit:
+        raise AssertionError("native warm exit signals readiness before result-state reset")
+    native_warm_end = native_exit.find(native_warm_exit) + len(native_warm_exit)
+    native_cold_exit = extract_braced_block(native_exit[native_warm_end:], "else")
+    if "handoffWarmExternalPlayerTask" in native_cold_exit:
+        raise AssertionError("native cold exit must not schedule a warm task handoff")
+    pending_delivery = extract_braced_block(
+        app_source, "void CXBMCApp::DeliverPendingExternalPlayerResult(\n"
+    )
+    require_in_order(
+        pending_delivery,
+        "const bool wasStandalone",
+        "ExitExternalPlayerMode(*result, lifecycleOperation)",
+        "m_playbackResultState.Reset(lifecycleOperation, result->generation)",
+        "if (exited && reset && wasStandalone)",
+        "HandoffWarmExternalPlayerTask(result->generation, result->requestId)",
+    )
+
+    rejected_exit = extract_braced_block(
+        app_source, "void CXBMCApp::DeliverRejectedExternalPlaybackResult("
+    )
+    require_in_order(
+        rejected_exit,
+        'call_method<void>(m_context, "exitExternalPlayerMode"',
+        "const bool reset = m_playbackResultState.Reset(lifecycleOperation, generation)",
+        "if (reset && returnToStandalone)",
+        "HandoffWarmExternalPlayerTask(generation, owner->requestId)",
+    )
+
+    queued_execute = extract_braced_block(
+        app_source, "void CXBMCApp::ExecuteQueuedExternalPlayerResult("
+    )
+    queued_cancel = extract_braced_block(
+        app_source, "void CXBMCApp::CancelQueuedExternalPlayerResult("
+    )
+    for body in (queued_execute, queued_cancel):
+        if "PostExternalPlayerResultConvergence(" not in body:
+            raise AssertionError("queued terminal fallback bypasses native convergence")
+        if "postExternalPlayerCancellationResult" in body:
+            raise AssertionError("queued terminal fallback can clear Java without native cleanup")
+
+    post_convergence = extract_braced_block(
+        app_source, "void CXBMCApp::PostExternalPlayerResultConvergence("
+    )
+    require_in_order(
+        post_convergence,
+        '(*payload)["lifecycleToken"]',
+        '(*payload)["generation"]',
+        '(*payload)["requestId"]',
+        '(*payload)["wasStandalone"]',
+        '"postExternalPlayerResultConvergence", "(JJ)Z"',
+        "ConvergeExternalPlayerResultCallback",
+        "payload.release()",
+    )
+    java_convergence = extract_braced_block(
+        main_activity, "public boolean postExternalPlayerResultConvergence("
+    )
+    require_in_order(java_convergence, "handler.post(", "_callNative(callbackAddress, payloadAddress)")
+    convergence_callback = extract_braced_block(
+        app_source, "void CXBMCApp::ConvergeExternalPlayerResultCallback("
+    )
+    if "ConvergeExternalPlayerResultCallback(CVariant* rawPayload)" not in app_source:
+        raise AssertionError("native convergence callback does not match _callNative's exact type")
+    require_in_order(
+        convergence_callback,
+        "AcquireAppInstance(lifecycleToken)",
+        "ConvergeExternalPlayerResult(generation, requestId, wasStandalone)",
+    )
+    convergence = extract_braced_block(
+        app_source, "void CXBMCApp::ConvergeExternalPlayerResult("
+    )
+    require_in_order(
+        convergence,
+        "BeginLifecycleOperation()",
+        "owner->generation != generation",
+        "owner->requestId != requestId",
+        "m_wasStandalone.load(std::memory_order_relaxed) != wasStandalone",
+        "DeliverPendingExternalPlayerResult(lifecycleOperation)",
+    )
+
+    activity_delivery = extract_braced_block(
+        external_activity, "synchronized boolean deliver("
+    )
+    require_in_order(
+        activity_delivery,
+        "mHost.setTerminalResult(terminal)",
+        "mHost.finishOwner()",
+        "if (terminal.exitProcess)",
+        "mHost.confirmWarmTaskHandoff(terminal.generation, terminal.requestId)",
+        "mHost.clearExact(terminal.requestId, terminal.generation)",
+    )
+    caller_cancellation = extract_braced_block(
+        external_activity, "synchronized boolean cancelForCaller()"
+    )
+    require_in_order(
+        caller_cancellation,
+        "mHost.setCanceledResult()",
+        "mHost.finishOwner()",
+        "mHost.confirmWarmTaskHandoff(generation, requestId)",
+        "finishCancellation(requestId, generation)",
+    )
+    teardown_cancellation = extract_braced_block(
+        external_activity, "synchronized boolean cancelForTeardown("
+    )
+    require_in_order(
+        teardown_cancellation,
+        "mHost.setCanceledResult()",
+        "mHost.finishOwner()",
+        "mHost.confirmWarmTaskHandoff(generation, requestId)",
+        "mHost.clearExact(requestId, generation)",
+    )
+    confirmation = extract_braced_block(
+        external_activity, "public void confirmWarmTaskHandoff("
+    )
+    if "Main.confirmWarmExternalPlayerResult(generation, requestId)" not in confirmation:
+        raise AssertionError("warm result owner does not confirm exact caller delivery")
+
+    cancel_handoff = extract_braced_block(
+        main_activity, "private synchronized void cancelPendingWarmTaskHandoff()"
+    )
+    require_in_order(
+        cancel_handoff,
+        "mWarmTaskHandoffRunnable = null",
+        "handler.removeCallbacks(pendingHandoff)",
+        "mWarmTaskHandoffGeneration = 0",
+        'mWarmTaskHandoffRequestId = ""',
+        "mWarmTaskHandoffNativeReady = false",
+        "mWarmTaskHandoffResultDelivered = false",
+    )
+    prepare_handoff = extract_braced_block(
+        main_activity, "private synchronized void prepareWarmTaskHandoff("
+    )
+    require_in_order(
+        prepare_handoff,
+        "boolean resultAlreadyDelivered",
+        "ownsWarmTaskHandoff(generation, requestId)",
+        "cancelPendingWarmTaskHandoff()",
+        "mWarmTaskHandoffGeneration = generation",
+        "mWarmTaskHandoffRequestId = requestId",
+        "mWarmTaskHandoffResultDelivered = resultAlreadyDelivered",
+    )
+
+    schedule_handoff = extract_braced_block(
+        main_activity, "private synchronized void scheduleWarmTaskHandoffIfReady("
+    )
+    require_in_order(
+        schedule_handoff,
+        "mWarmTaskHandoffNativeReady",
+        "mWarmTaskHandoffResultDelivered",
+        "final Main activity = this",
+        "final long exactLifecycleToken = lifecycleToken",
+        "final long exactGeneration = mWarmTaskHandoffGeneration",
+        "final String exactRequestId = mWarmTaskHandoffRequestId",
+        "mWarmTaskHandoffRunnable = handoff",
+        "handler.post(handoff)",
+    )
+    callback = extract_braced_block(schedule_handoff, "synchronized (activity)")
+    for guard in (
+        "activity.mWarmTaskHandoffRunnable != this",
+        "MainActivity != activity",
+        "exactLifecycleToken == 0",
+        "exactLifecycleToken != activity.mBackLifecycleToken",
+        "activity.ownsWarmTaskHandoff(exactGeneration, exactRequestId)",
+        "activity.mWarmTaskHandoffNativeReady",
+        "activity.mWarmTaskHandoffResultDelivered",
+        "activity.isFinishing()",
+        "activity.isDestroyed()",
+        "activity.mExternalPlayerMode",
+        "activity.mExternalResultProducer.activeGeneration() != 0",
+        "activity.mExternalResultProducer.preparedRequestId()",
+    ):
+        if guard not in callback:
+            raise AssertionError(f"warm task handoff callback is missing guard {guard!r}")
+    if callback.find("activity.moveTaskToBack(true)") < callback.find("preparedRequestId()"):
+        raise AssertionError("warm task handoff can run before its lifecycle/admission guards")
+
+    native_ready = extract_braced_block(
+        main_activity, "public synchronized void handoffWarmExternalPlayerTask("
+    )
+    require_in_order(
+        native_ready,
+        "ownsWarmTaskHandoff(generation, requestId)",
+        "mWarmTaskHandoffNativeReady = true",
+        "scheduleWarmTaskHandoffIfReady(lifecycleToken)",
+    )
+    result_delivered = extract_braced_block(
+        main_activity, "private synchronized boolean confirmWarmExternalPlayerResultInternal("
+    )
+    require_in_order(
+        result_delivered,
+        "ExternalPlayerResultCoordinator.isValidRequestId(requestId)",
+        "ownsWarmTaskHandoff(generation, requestId)",
+        "mWasStandalone",
+        "mExternalResultProducer.activeGeneration()",
+        "mExternalResultProducer.activeRequestId()",
+        "mWarmTaskHandoffResultDelivered = true",
+        "scheduleWarmTaskHandoffIfReady(mBackLifecycleToken)",
+    )
+
+    creation = extract_braced_block(main_activity, "public void onCreate(")
+    require_in_order(
+        creation,
+        "mExternalResultProducer.prepare(initialRequestId)",
+        "cancelPendingWarmTaskHandoff()",
+    )
+    new_intent = extract_braced_block(main_activity, "protected void onNewIntent(")
+    require_in_order(
+        new_intent,
+        "mExternalResultProducer.prepare(externalRequestId)",
+        "cancelPendingWarmTaskHandoff()",
+    )
+    active_admission = extract_braced_block(
+        main_activity, "public synchronized boolean beginExternalPlayerMode("
+    )
+    require_in_order(
+        active_admission,
+        "mExternalResultProducer.admitPrepared(generation, requestId)",
+        "cancelPendingWarmTaskHandoff()",
+    )
+    destruction = extract_braced_block(main_activity, "public void onDestroy()")
+    require_in_order(
+        destruction,
+        "cancelPendingWarmTaskHandoff()",
+        "mBackLifecycleToken = 0",
+        "MainActivity = null",
+    )
+
+
 def verify_native_back_wiring():
     manifest = ANDROID_MANIFEST.read_text(encoding="utf-8")
     if (
@@ -2545,32 +2805,7 @@ def verify_back_lifecycle_rejection_contract():
         "reservation.commit()",
         "mExternalPlayerMode = false",
     )
-    post_commit_exit = normal_exit[normal_exit.find("reservation.commit()") :]
-    warm_exit = extract_braced_block(post_commit_exit, "if (wasStandalone)")
-    require_in_order(
-        warm_exit,
-        "mExternalPlayerMode = false",
-        "mExternalResultProducer.clear(generation, requestId)",
-        "mWasStandalone = false",
-        "hideLoadingOverlay()",
-        "handler.post(",
-    )
-    warm_handoff = extract_braced_block(warm_exit, "synchronized (Main.this)")
-    require_in_order(
-        warm_handoff,
-        "mExternalPlayerMode",
-        "mExternalResultProducer.activeGeneration() != 0",
-        "mExternalResultProducer.preparedRequestId()",
-        ")) return",
-        "moveTaskToBack(true)",
-    )
-    if "finish()" in warm_exit or "scheduleExternalPlayerProcessExit(" in warm_exit:
-        raise AssertionError("warm external exit must retain Main and its native engine")
-    warm_exit_end = post_commit_exit.find(warm_exit) + len(warm_exit)
-    cold_exit = extract_braced_block(post_commit_exit[warm_exit_end:], "else")
-    require_in_order(cold_exit, "mExternalPlayerMode = false", "finish()")
-    if "moveTaskToBack(" in cold_exit:
-        raise AssertionError("cold external exit must finish Main instead of retaining its task")
+    verify_warm_task_handoff_contract(main_activity, external_activity, app_source)
 
     for contract in (
         "class TerminalReservation",

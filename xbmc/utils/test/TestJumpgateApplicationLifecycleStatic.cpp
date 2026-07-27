@@ -387,7 +387,7 @@ TEST(TestJumpgateApplicationLifecycleStatic, AuthorityLocksDoNotSpanAnnouncerRec
   const std::string intent = FunctionBody(app, "void CXBMCApp::onNewIntent(");
   const std::string delivery =
       FunctionSection(app, "void CXBMCApp::DeliverPendingExternalPlayerResult(\n",
-                      "void CXBMCApp::ExitExternalPlayerMode");
+                      "bool CXBMCApp::ExitExternalPlayerMode");
   ASSERT_FALSE(begin.empty());
   ASSERT_FALSE(prepare.empty());
   ASSERT_FALSE(finish.empty());
@@ -411,6 +411,10 @@ TEST(TestJumpgateApplicationLifecycleStatic, AuthorityLocksDoNotSpanAnnouncerRec
   EXPECT_EQ(delivery.find("BeginLifecycleOperation()"), std::string::npos);
   EXPECT_LT(delivery.find("TakeFinished(lifecycleOperation)"),
             delivery.find("ExitExternalPlayerMode(*result, lifecycleOperation)"));
+  EXPECT_LT(delivery.find("ExitExternalPlayerMode(*result, lifecycleOperation)"),
+            delivery.find("m_playbackResultState.Reset(lifecycleOperation, result->generation)"));
+  EXPECT_LT(delivery.find("m_playbackResultState.Reset(lifecycleOperation, result->generation)"),
+            delivery.find("HandoffWarmExternalPlayerTask(result->generation, result->requestId)"));
   EXPECT_NE(app.find("m_playbackResultState.CloseAdmissions();"), std::string::npos);
   EXPECT_NE(admission.find("m_playbackResultState.AdmissionsClosed()"), std::string::npos);
 }

@@ -368,7 +368,7 @@ private:
   void LoadAndApplyPairedPlaybackResume(uint64_t generation, bool allowPlayerSeek = true);
   bool ReleasePlaybackSourceClaim(bool completed = false);
   void StopPlaybackClaimCoordinator(bool drainRelease);
-  void ExitExternalPlayerMode(
+  bool ExitExternalPlayerMode(
       const KODI::JUMPGATE::JumpgatePlaybackResult& result,
       KODI::JUMPGATE::CJumpgatePlaybackResultState::LifecycleOperation& lifecycleOperation);
   std::optional<KODI::JUMPGATE::CJumpgatePlaybackAuthority::Token>
@@ -422,9 +422,14 @@ private:
                                  bool wasStandalone);
   void ExecuteQueuedExternalPlayerResult(const QueuedExternalPlayerResult& result);
   void CancelQueuedExternalPlayerResult(const QueuedExternalPlayerResult& result) noexcept;
-  void PostJavaExternalPlayerCancellation(uint64_t generation,
-                                          const std::string& requestId,
-                                          bool wasStandalone) noexcept;
+  void PostExternalPlayerResultConvergence(uint64_t generation,
+                                           const std::string& requestId,
+                                           bool wasStandalone) noexcept;
+  static void ConvergeExternalPlayerResultCallback(CVariant* payload);
+  void ConvergeExternalPlayerResult(uint64_t generation,
+                                    const std::string& requestId,
+                                    bool wasStandalone);
+  void HandoffWarmExternalPlayerTask(uint64_t generation, const std::string& requestId);
   bool CancelPendingExternalPlaybackFromBack();
   bool ExecuteExternalBackCommand();
   bool ExecuteKodiBackCommand(bool longPress);

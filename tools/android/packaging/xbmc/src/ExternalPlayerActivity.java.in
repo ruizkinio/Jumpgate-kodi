@@ -37,6 +37,8 @@ public class ExternalPlayerActivity extends Splash {
     void cancelNative(String requestId, long generation);
 
     boolean acknowledge(ExternalPlayerResultCoordinator.Terminal terminal);
+
+    void confirmWarmTaskHandoff(long generation, String requestId);
   }
 
   static final class Controller {
@@ -76,8 +78,13 @@ public class ExternalPlayerActivity extends Splash {
       mOwner = completedOwner;
       mHost.setTerminalResult(terminal);
       mHost.finishOwner();
-      if (!terminal.exitProcess || !mHost.acknowledge(terminal))
+      if (terminal.exitProcess) {
+        if (!mHost.acknowledge(terminal))
+          mHost.clearExact(terminal.requestId, terminal.generation);
+      } else {
+        mHost.confirmWarmTaskHandoff(terminal.generation, terminal.requestId);
         mHost.clearExact(terminal.requestId, terminal.generation);
+      }
       return true;
     }
 
@@ -90,6 +97,7 @@ public class ExternalPlayerActivity extends Splash {
       String requestId = canceledOwner.requestId();
       mHost.setCanceledResult();
       mHost.finishOwner();
+      mHost.confirmWarmTaskHandoff(generation, requestId);
       finishCancellation(requestId, generation);
       return true;
     }
@@ -114,6 +122,7 @@ public class ExternalPlayerActivity extends Splash {
       mOwner = canceledOwner;
       mHost.setCanceledResult();
       mHost.finishOwner();
+      mHost.confirmWarmTaskHandoff(generation, requestId);
       if (generation > 0) mHost.clearExact(requestId, generation);
       else mHost.clearUnbound(requestId);
       return true;
@@ -446,6 +455,11 @@ public class ExternalPlayerActivity extends Splash {
       Main.acknowledgeExternalPlayerResult(terminal.generation, terminal.requestId);
       scheduleProcessExitFallback(terminal.requestId, terminal.generation);
       return true;
+    }
+
+    @Override
+    public void confirmWarmTaskHandoff(long generation, String requestId) {
+      Main.confirmWarmExternalPlayerResult(generation, requestId);
     }
   }
 }

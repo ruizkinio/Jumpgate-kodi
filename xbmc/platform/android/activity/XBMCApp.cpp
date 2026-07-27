@@ -1678,11 +1678,14 @@ void CXBMCApp::DeliverPendingExternalPlayerResult(
   if (!result)
     return;
 
-  ExitExternalPlayerMode(*result, lifecycleOperation);
-  m_playbackResultState.Reset(lifecycleOperation, result->generation);
+  const bool wasStandalone = m_wasStandalone.load(std::memory_order_relaxed);
+  const bool exited = ExitExternalPlayerMode(*result, lifecycleOperation);
+  const bool reset = m_playbackResultState.Reset(lifecycleOperation, result->generation);
+  if (exited && reset && wasStandalone)
+    HandoffWarmExternalPlayerTask(result->generation, result->requestId);
 }
 
-void CXBMCApp::ExitExternalPlayerMode(
+bool CXBMCApp::ExitExternalPlayerMode(
     const KODI::JUMPGATE::JumpgatePlaybackResult& result,
     KODI::JUMPGATE::CJumpgatePlaybackResultState::LifecycleOperation& lifecycleOperation)
 {
@@ -1692,7 +1695,7 @@ void CXBMCApp::ExitExternalPlayerMode(
   if (!lifecycleOperation.OwnsGeneration(result.generation) ||
       !m_playbackResultState.IsCurrent(result.generation) ||
       !m_externalPlayerMode.load(std::memory_order_relaxed))
-    return;
+    return false;
 
   const int64_t posMs = result.positionMs;
   const int64_t durMs = result.durationMs;
@@ -1720,6 +1723,7 @@ void CXBMCApp::ExitExternalPlayerMode(
 
     // Clean up C++ side external player state
     ReturnToStandaloneMode();
+
   }
   else
   {
@@ -1735,6 +1739,7 @@ void CXBMCApp::ExitExternalPlayerMode(
                       static_cast<jlong>(posMs), static_cast<jlong>(durMs),
                       static_cast<jboolean>(result.completed), static_cast<jboolean>(false));
   }
+  return true;
 }
 
 void CXBMCApp::SetExternalPlayerMode(bool mode)
@@ -1777,6 +1782,14 @@ void CXBMCApp::ReturnToStandaloneMode()
   CLog::Log(
       LOGINFO,
       "CXBMCApp: Returned to standalone mode, TraktScrobbler and SubtitleDownloader deinitialized");
+}
+
+void CXBMCApp::HandoffWarmExternalPlayerTask(uint64_t generation,
+                                             const std::string& requestId)
+{
+  call_method<void>(m_context, "handoffWarmExternalPlayerTask", "(JJLjava/lang/String;)V",
+                    static_cast<jlong>(m_jumpgateBackLifecycleToken),
+                    static_cast<jlong>(generation), jcast<jhstring>(requestId));
 }
 
 bool CXBMCApp::SavePairedPlaybackHistory(bool explicitEnd, uint64_t generation)
@@ -2349,7 +2362,9 @@ void CXBMCApp::DeliverRejectedExternalPlaybackResult(
                     static_cast<jlong>(generation), jcast<jhstring>(owner->requestId),
                     static_cast<jlong>(0), static_cast<jlong>(0), static_cast<jboolean>(false),
                     static_cast<jboolean>(returnToStandalone));
-  m_playbackResultState.Reset(lifecycleOperation, generation);
+  const bool reset = m_playbackResultState.Reset(lifecycleOperation, generation);
+  if (reset && returnToStandalone)
+    HandoffWarmExternalPlayerTask(generation, owner->requestId);
 }
 
 void CXBMCApp::ProcessPlaybackSourceClaim()
@@ -5001,8 +5016,8 @@ void CXBMCApp::ExecuteQueuedExternalPlayerResult(const QueuedExternalPlayerResul
   auto lifecycleOperation = m_playbackResultState.TryBeginLifecycleOperation();
   if (!lifecycleOperation)
   {
-    PostJavaExternalPlayerCancellation(payload.generation, payload.requestId,
-                                       payload.wasStandalone);
+    PostExternalPlayerResultConvergence(payload.generation, payload.requestId,
+                                        payload.wasStandalone);
     return;
   }
 
@@ -5019,23 +5034,72 @@ void CXBMCApp::CancelQueuedExternalPlayerResult(const QueuedExternalPlayerResult
   {
     return;
   }
-  PostJavaExternalPlayerCancellation(payload.generation, payload.requestId, payload.wasStandalone);
+  PostExternalPlayerResultConvergence(payload.generation, payload.requestId,
+                                      payload.wasStandalone);
 }
 
-void CXBMCApp::PostJavaExternalPlayerCancellation(uint64_t generation,
-                                                  const std::string& requestId,
-                                                  bool wasStandalone) noexcept
+void CXBMCApp::PostExternalPlayerResultConvergence(uint64_t generation,
+                                                    const std::string& requestId,
+                                                    bool wasStandalone) noexcept
 {
   try
   {
-    call_method<void>(m_context, "postExternalPlayerCancellationResult", "(JLjava/lang/String;Z)V",
-                      static_cast<jlong>(generation), jcast<jhstring>(requestId),
-                      static_cast<jboolean>(wasStandalone));
+    auto payload = std::make_unique<CVariant>(CVariant::VariantTypeObject);
+    (*payload)["lifecycleToken"] = static_cast<uint64_t>(m_jumpgateBackLifecycleToken);
+    (*payload)["generation"] = generation;
+    (*payload)["requestId"] = requestId;
+    (*payload)["wasStandalone"] = wasStandalone;
+
+    const jboolean posted = call_method<jboolean>(
+        m_context, "postExternalPlayerResultConvergence", "(JJ)Z",
+        reinterpret_cast<jlong>(&CXBMCApp::ConvergeExternalPlayerResultCallback),
+        reinterpret_cast<jlong>(payload.get()));
+    if (posted == JNI_TRUE)
+      payload.release();
   }
   catch (...)
   {
-    CLog::Log(LOGERROR, "CXBMCApp: Failed to post exact external-player cancellation result");
+    CLog::Log(LOGERROR, "CXBMCApp: Failed to post exact external-player result convergence");
   }
+}
+
+void CXBMCApp::ConvergeExternalPlayerResultCallback(CVariant* rawPayload)
+{
+  std::unique_ptr<CVariant> payload(rawPayload);
+  if (!payload || !payload->isObject())
+    return;
+
+  const uint64_t lifecycleToken = (*payload)["lifecycleToken"].asUnsignedInteger();
+  const uint64_t generation = (*payload)["generation"].asUnsignedInteger();
+  const std::string requestId = (*payload)["requestId"].asString();
+  const bool wasStandalone = (*payload)["wasStandalone"].asBoolean();
+  const auto appTarget = CJNIMainActivity::AcquireAppInstance(lifecycleToken);
+  if (!appTarget)
+    return;
+
+  auto* app = static_cast<CXBMCApp*>(appTarget.get());
+  try
+  {
+    app->ConvergeExternalPlayerResult(generation, requestId, wasStandalone);
+  }
+  catch (...)
+  {
+    CLog::Log(LOGERROR, "CXBMCApp: Exact external-player result convergence failed");
+  }
+}
+
+void CXBMCApp::ConvergeExternalPlayerResult(uint64_t generation,
+                                            const std::string& requestId,
+                                            bool wasStandalone)
+{
+  auto lifecycleOperation = m_playbackResultState.BeginLifecycleOperation();
+  const auto owner = m_playbackResultState.CurrentOwner(lifecycleOperation);
+  if (!owner || owner->generation != generation || owner->requestId != requestId ||
+      m_wasStandalone.load(std::memory_order_relaxed) != wasStandalone)
+  {
+    return;
+  }
+  DeliverPendingExternalPlayerResult(lifecycleOperation);
 }
 
 bool CXBMCApp::CancelPendingExternalPlaybackFromBack()

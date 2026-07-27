@@ -91,6 +91,11 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
   private boolean mExternalPlayerMode = false;
   private final ExternalPlayerResultCoordinator.MainState mExternalResultProducer =
       new ExternalPlayerResultCoordinator.MainState();
+  private Runnable mWarmTaskHandoffRunnable = null;
+  private long mWarmTaskHandoffGeneration = 0;
+  private String mWarmTaskHandoffRequestId = "";
+  private boolean mWarmTaskHandoffNativeReady = false;
+  private boolean mWarmTaskHandoffResultDelivered = false;
   private long mLastPlaybackPosition = 0;  // ms
   private long mLastPlaybackDuration = 0;  // ms
   private static final long BACK_LONG_PRESS_THRESHOLD_MS = 700L;
@@ -251,6 +256,7 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
     if (mExternalPlayerMode) {
       if (!mExternalResultProducer.prepare(initialRequestId))
         throw new IllegalStateException("External result request ownership preparation failed");
+      cancelPendingWarmTaskHandoff();
     }
 
     System.loadLibrary("@APP_NAME_LC@");
@@ -379,9 +385,12 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
       return;
     }
     if (isActionView) {
-      if (!mExternalResultProducer.prepare(externalRequestId)) {
-        Log.e(TAG, "Main: Rejecting unowned external playback request " + externalRequestId);
-        return;
+      synchronized (this) {
+        if (!mExternalResultProducer.prepare(externalRequestId)) {
+          Log.e(TAG, "Main: Rejecting unowned external playback request " + externalRequestId);
+          return;
+        }
+        cancelPendingWarmTaskHandoff();
       }
     }
     boolean wasAlreadyExternal = mExternalPlayerMode;
@@ -594,6 +603,7 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
   @Override
   public void onDestroy()
   {
+    cancelPendingWarmTaskHandoff();
     handler.removeCallbacks(mBackLongPressRunnable);
     unregisterApi36BackCallback();
     terminalizeExternalPlayerResultForTeardown();
@@ -723,6 +733,7 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
       Log.e(TAG, "Main: External playback lacked exact prepared request ownership");
       return true;
     }
+    cancelPendingWarmTaskHandoff();
 
     boolean cancellationRequested = admission.wasCancellationRequested();
     ExternalPlayerResultCoordinator.Owner owner =
@@ -751,10 +762,9 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
     return mExternalResultProducer.cancelEarlyBack();
   }
 
-  public void postExternalPlayerCancellationResult(
-      long generation, String requestId, boolean wasStandalone) {
-    handler.post(
-        () -> exitExternalPlayerMode(generation, requestId, 0, 0, false, wasStandalone));
+  public boolean postExternalPlayerResultConvergence(long callbackAddress, long payloadAddress) {
+    if (callbackAddress == 0 || payloadAddress == 0) return false;
+    return handler.post(() -> _callNative(callbackAddress, payloadAddress));
   }
 
   private boolean publishExternalPlayerTerminalOrClearCanceledOwner(
@@ -952,20 +962,10 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
       // Do NOT kill the process (native engine keeps running).
       mExternalPlayerMode = false;
       mExternalResultProducer.clear(generation, requestId);
+      prepareWarmTaskHandoff(generation, requestId);
       mWasStandalone = false;
       // Hide loading overlay so Kodi home screen is visible again
       hideLoadingOverlay();
-      handler.post(
-          () -> {
-            synchronized (Main.this) {
-              if (mExternalPlayerMode
-                  || mExternalResultProducer.activeGeneration() != 0
-                  || ExternalPlayerResultCoordinator.isValidRequestId(
-                      mExternalResultProducer.preparedRequestId())) return;
-
-              moveTaskToBack(true);
-            }
-          });
       Log.d(TAG, "Main: Returning to standalone mode after external player");
     } else {
       // The result-owner activity acknowledges only after it has set its caller result and
@@ -976,6 +976,114 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
       if (callerAlreadyCanceled && canceledExitAcknowledged)
         scheduleExternalPlayerProcessExit(generation, requestId);
     }
+  }
+
+  private synchronized void cancelPendingWarmTaskHandoff() {
+    Runnable pendingHandoff = mWarmTaskHandoffRunnable;
+    mWarmTaskHandoffRunnable = null;
+    if (pendingHandoff != null) handler.removeCallbacks(pendingHandoff);
+    mWarmTaskHandoffGeneration = 0;
+    mWarmTaskHandoffRequestId = "";
+    mWarmTaskHandoffNativeReady = false;
+    mWarmTaskHandoffResultDelivered = false;
+  }
+
+  private synchronized void prepareWarmTaskHandoff(long generation, String requestId) {
+    boolean resultAlreadyDelivered =
+        ownsWarmTaskHandoff(generation, requestId) && mWarmTaskHandoffResultDelivered;
+    cancelPendingWarmTaskHandoff();
+    if (generation <= 0 || !ExternalPlayerResultCoordinator.isValidRequestId(requestId)) return;
+    mWarmTaskHandoffGeneration = generation;
+    mWarmTaskHandoffRequestId = requestId;
+    mWarmTaskHandoffResultDelivered = resultAlreadyDelivered;
+  }
+
+  private synchronized boolean ownsWarmTaskHandoff(long generation, String requestId) {
+    return generation > 0
+        && generation == mWarmTaskHandoffGeneration
+        && ExternalPlayerResultCoordinator.isValidRequestId(requestId)
+        && requestId.equals(mWarmTaskHandoffRequestId);
+  }
+
+  private synchronized void scheduleWarmTaskHandoffIfReady(long lifecycleToken) {
+    if (!mWarmTaskHandoffNativeReady
+        || !mWarmTaskHandoffResultDelivered
+        || mWarmTaskHandoffRunnable != null
+        || lifecycleToken == 0
+        || lifecycleToken != mBackLifecycleToken
+        || MainActivity != this) return;
+
+    final Main activity = this;
+    final long exactLifecycleToken = lifecycleToken;
+    final long exactGeneration = mWarmTaskHandoffGeneration;
+    final String exactRequestId = mWarmTaskHandoffRequestId;
+    Runnable handoff =
+        new Runnable() {
+          @Override
+          public void run() {
+            synchronized (activity) {
+              if (activity.mWarmTaskHandoffRunnable != this) return;
+              activity.mWarmTaskHandoffRunnable = null;
+              if (MainActivity != activity
+                  || exactLifecycleToken == 0
+                  || exactLifecycleToken != activity.mBackLifecycleToken
+                  || !activity.ownsWarmTaskHandoff(exactGeneration, exactRequestId)
+                  || !activity.mWarmTaskHandoffNativeReady
+                  || !activity.mWarmTaskHandoffResultDelivered
+                  || activity.isFinishing()
+                  || activity.isDestroyed()
+                  || activity.mExternalPlayerMode
+                  || activity.mExternalResultProducer.activeGeneration() != 0
+                  || ExternalPlayerResultCoordinator.isValidRequestId(
+                      activity.mExternalResultProducer.preparedRequestId())) {
+                return;
+              }
+
+              activity.mWarmTaskHandoffGeneration = 0;
+              activity.mWarmTaskHandoffRequestId = "";
+              activity.mWarmTaskHandoffNativeReady = false;
+              activity.mWarmTaskHandoffResultDelivered = false;
+              activity.moveTaskToBack(true);
+            }
+          }
+        };
+    mWarmTaskHandoffRunnable = handoff;
+    if (!handler.post(handoff)) cancelPendingWarmTaskHandoff();
+  }
+
+  /** Called from native only after the exact warm return to standalone has fully completed. */
+  public synchronized void handoffWarmExternalPlayerTask(
+      long lifecycleToken, long generation, String requestId) {
+    if (lifecycleToken == 0
+        || lifecycleToken != mBackLifecycleToken
+        || MainActivity != this
+        || !ownsWarmTaskHandoff(generation, requestId)) return;
+
+    mWarmTaskHandoffNativeReady = true;
+    scheduleWarmTaskHandoffIfReady(lifecycleToken);
+  }
+
+  public static boolean confirmWarmExternalPlayerResult(long generation, String requestId) {
+    Main activity = MainActivity;
+    return activity != null
+        && activity.confirmWarmExternalPlayerResultInternal(generation, requestId);
+  }
+
+  private synchronized boolean confirmWarmExternalPlayerResultInternal(
+      long generation, String requestId) {
+    if (generation <= 0 || !ExternalPlayerResultCoordinator.isValidRequestId(requestId)) return false;
+    if (!ownsWarmTaskHandoff(generation, requestId)) {
+      if (!mExternalPlayerMode
+          || !mWasStandalone
+          || generation != mExternalResultProducer.activeGeneration()
+          || !requestId.equals(mExternalResultProducer.activeRequestId())) return false;
+      cancelPendingWarmTaskHandoff();
+      mWarmTaskHandoffGeneration = generation;
+      mWarmTaskHandoffRequestId = requestId;
+    }
+    mWarmTaskHandoffResultDelivered = true;
+    scheduleWarmTaskHandoffIfReady(mBackLifecycleToken);
+    return true;
   }
 
   public static boolean acknowledgeExternalPlayerResult(long generation, String requestId) {

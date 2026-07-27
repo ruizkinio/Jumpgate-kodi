@@ -14,4 +14,8 @@ public final class Main {
   public static boolean acknowledgeExternalPlayerResult(long generation, String requestId) {
     return false;
   }
+
+  public static boolean confirmWarmExternalPlayerResult(long generation, String requestId) {
+    return false;
+  }
 }

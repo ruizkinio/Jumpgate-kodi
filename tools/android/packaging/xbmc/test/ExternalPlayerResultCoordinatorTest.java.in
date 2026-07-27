@@ -52,7 +52,9 @@ public final class ExternalPlayerResultCoordinatorTest {
     int clearUnboundCalls;
     int cancelNativeCalls;
     int acknowledgeCalls;
+    int confirmWarmTaskHandoffCalls;
     int processExitCalls;
+    final StringBuilder deliveryOrder = new StringBuilder();
     boolean mainCallbackAvailable = true;
     ExternalPlayerResultCoordinator.ProcessExitState processExitState;
     DeterministicQueue processExitQueue;
@@ -76,6 +78,7 @@ public final class ExternalPlayerResultCoordinatorTest {
     public synchronized void setTerminalResult(ExternalPlayerResultCoordinator.Terminal terminal) {
       ++setTerminalResultCalls;
       deliveredTerminal = terminal;
+      deliveryOrder.append("result;");
     }
 
     @Override
@@ -86,6 +89,7 @@ public final class ExternalPlayerResultCoordinatorTest {
     @Override
     public synchronized void finishOwner() {
       ++finishCalls;
+      deliveryOrder.append("finish;");
     }
 
     @Override
@@ -93,6 +97,7 @@ public final class ExternalPlayerResultCoordinatorTest {
       ++clearExactCalls;
       clearedRequestId = requestId;
       clearedGeneration = generation;
+      deliveryOrder.append("clear;");
       if (processExitState != null) processExitState.clear(generation, requestId);
     }
 
@@ -112,12 +117,19 @@ public final class ExternalPlayerResultCoordinatorTest {
     @Override
     public synchronized boolean acknowledge(ExternalPlayerResultCoordinator.Terminal terminal) {
       ++acknowledgeCalls;
+      deliveryOrder.append("acknowledge;");
       if (processExitState == null) return true;
       if (!processExitState.acknowledge(terminal.generation, terminal.requestId)) return false;
 
       if (mainCallbackAvailable) postProcessExit(terminal);
       postProcessExit(terminal);
       return true;
+    }
+
+    @Override
+    public synchronized void confirmWarmTaskHandoff(long generation, String requestId) {
+      ++confirmWarmTaskHandoffCalls;
+      deliveryOrder.append("confirm;");
     }
 
     private void postProcessExit(ExternalPlayerResultCoordinator.Terminal terminal) {
@@ -261,6 +273,10 @@ public final class ExternalPlayerResultCoordinatorTest {
     require(!controller.deliver(terminal), "durable retry still delivers only once");
     require(host.setTerminalResultCalls == 1, "retry exposes one caller result");
     require(host.finishCalls == 1, "retry finishes the owner once");
+    require(host.confirmWarmTaskHandoffCalls == 1, "warm delivery confirms one task handoff");
+    require(
+        "result;finish;confirm;clear;".contentEquals(host.deliveryOrder),
+        "warm handoff follows caller result and finish before exact cleanup");
     require(host.clearExactCalls == 1, "retry clears the exact terminal once");
   }
 
@@ -281,6 +297,10 @@ public final class ExternalPlayerResultCoordinatorTest {
     require(retry.cancelForCaller(), "durable caller cancellation retries");
     require(retryHost.setCanceledResultCalls == 1, "retry exposes one canceled result");
     require(retryHost.finishCalls == 1, "retry finishes owner once");
+    require(retryHost.confirmWarmTaskHandoffCalls == 1, "canceled owner confirms caller delivery");
+    require(
+        "finish;confirm;".contentEquals(retryHost.deliveryOrder),
+        "canceled-owner confirmation follows caller finish");
     require(retryHost.cancelNativeCalls == 1, "retry cancels exact native owner once");
 
     FakeHost unforwardedHost = new FakeHost();
@@ -476,6 +496,7 @@ public final class ExternalPlayerResultCoordinatorTest {
         "exact normal teardown canceled caller");
     require(host.setCanceledResultCalls == 1, "teardown sets canceled result once");
     require(host.finishCalls == 1, "teardown finishes owner once");
+    require(host.confirmWarmTaskHandoffCalls == 1, "teardown confirms canceled caller delivery");
     require(host.clearExactCalls == 1, "teardown clears exact durable owner");
     require(host.cancelNativeCalls == 0, "normal teardown does not call retired native app");
     require(
