@@ -4,6 +4,7 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 verifier="$script_dir/verify-android-apk.sh"
+repo_root="$(cd "$script_dir/../../.." && pwd)"
 work_dir="$(mktemp -d)"
 trap 'rm -rf "$work_dir"' EXIT
 
@@ -789,6 +790,12 @@ compile_shared "$base_armv7/lib/armeabi-v7a/libhelper.so" armeabi-v7a
 append_allowed_rsa_key "$base_arm64/lib/arm64-v8a/$expected_core_library"
 append_allowed_rsa_key "$base_armv7/lib/armeabi-v7a/$expected_core_library"
 mkdir -p "$base_arm64/assets" "$base_armv7/assets"
+pairing_asset_root="$base_arm64/assets/addons/script.jumpgate.manager/resources"
+mkdir -p "$pairing_asset_root/media" "$pairing_asset_root/skins/default/1080i"
+cp "$repo_root/addons/script.jumpgate.manager/resources/media/pixel.png" \
+  "$pairing_asset_root/media/pixel.png"
+cp "$repo_root/addons/script.jumpgate.manager/resources/skins/default/1080i/DialogJumpgatePairing.xml" \
+  "$pairing_asset_root/skins/default/1080i/DialogJumpgatePairing.xml"
 cat > "$base_arm64/assets/placeholders.json" <<'JSON'
 {"auth":{"accessToken":"${JUMPGATE_ACCESS_TOKEN}"},"api_key":"YOUR_API_KEY","client_secret":"REDACTED","password":"","oauth_metadata":{"token_type":"Bearer","token_endpoint":"https://example.com/oauth/token","token_expiry":3600}}
 JSON
@@ -856,6 +863,41 @@ grep -Fxq 'libhelper.so' "$readelf_log"
 grep -Fxq "$expected_core_library" "$readelf_log"
 test -s "$armv7_apk.sha256"
 
+missing_pairing_asset="$work_dir/missing-pairing-asset"
+copy_fixture "$base_arm64" "$missing_pairing_asset"
+rm "$missing_pairing_asset/assets/addons/script.jumpgate.manager/resources/skins/default/1080i/DialogJumpgatePairing.xml"
+missing_pairing_asset_apk="$work_dir/missing-pairing-asset.apk"
+make_apk "$missing_pairing_asset" "$missing_pairing_asset_apk"
+expect_failure_reason \
+  missing-pairing-asset \
+  "$missing_pairing_asset_apk" \
+  arm64-v8a \
+  'APK is missing required Jumpgate pairing asset'
+
+malformed_pairing_asset="$work_dir/malformed-pairing-asset"
+copy_fixture "$base_arm64" "$malformed_pairing_asset"
+printf '<window type="dialog"><controls /></window>\n' > \
+  "$malformed_pairing_asset/assets/addons/script.jumpgate.manager/resources/skins/default/1080i/DialogJumpgatePairing.xml"
+malformed_pairing_asset_apk="$work_dir/malformed-pairing-asset.apk"
+make_apk "$malformed_pairing_asset" "$malformed_pairing_asset_apk"
+expect_failure_reason \
+  malformed-pairing-asset \
+  "$malformed_pairing_asset_apk" \
+  arm64-v8a \
+  'APK contains malformed Jumpgate pairing assets'
+
+malformed_pairing_png="$work_dir/malformed-pairing-png"
+copy_fixture "$base_arm64" "$malformed_pairing_png"
+printf '\211PNG\r\n\032\ntruncated-png' > \
+  "$malformed_pairing_png/assets/addons/script.jumpgate.manager/resources/media/pixel.png"
+malformed_pairing_png_apk="$work_dir/malformed-pairing-png.apk"
+make_apk "$malformed_pairing_png" "$malformed_pairing_png_apk"
+expect_failure_reason \
+  malformed-pairing-png \
+  "$malformed_pairing_png_apk" \
+  arm64-v8a \
+  'APK contains malformed Jumpgate pairing assets'
+
 verify_apk "$arm64_apk" arm64-v8a \
   JUMPGATE_TEST_OPENPGP_WORK=500000 >/dev/null
 expect_failure_phase_diagnostic \
@@ -901,6 +943,10 @@ expect_failure_reason \
   arm64-v8a \
   'private signing, deployment, or runtime secret material'
 
+# The current valid fixture contains one benign OpenPGP-shaped candidate in
+# packaged assets. Workload probes add their parser operations to that baseline.
+base_openpgp_operations=1
+
 openpgp_prefilter_spam="$work_dir/openpgp-prefilter-spam"
 copy_fixture "$base_arm64" "$openpgp_prefilter_spam"
 python3 - "$openpgp_prefilter_spam/assets/nonsemantic-candidates.pgp" <<'PY'
@@ -913,7 +959,7 @@ PY
 openpgp_prefilter_spam_apk="$work_dir/openpgp-prefilter-spam.apk"
 make_apk "$openpgp_prefilter_spam" "$openpgp_prefilter_spam_apk"
 verify_apk "$openpgp_prefilter_spam_apk" arm64-v8a \
-  JUMPGATE_TEST_OPENPGP_EXPECT_OPERATIONS=0 \
+  JUMPGATE_TEST_OPENPGP_EXPECT_OPERATIONS="$base_openpgp_operations" \
   JUMPGATE_TEST_OPENPGP_EXPECT_COPIED_BYTES=0 >/dev/null
 
 openpgp_fixed_overlap="$work_dir/openpgp-fixed-overlap"
@@ -941,7 +987,7 @@ PY
 openpgp_fixed_overlap_apk="$work_dir/openpgp-fixed-overlap.apk"
 make_apk "$openpgp_fixed_overlap" "$openpgp_fixed_overlap_apk"
 verify_apk "$openpgp_fixed_overlap_apk" arm64-v8a \
-  JUMPGATE_TEST_OPENPGP_EXPECT_OPERATIONS=10000 \
+  JUMPGATE_TEST_OPENPGP_EXPECT_OPERATIONS="$((base_openpgp_operations + 10000))" \
   JUMPGATE_TEST_OPENPGP_EXPECT_COPIED_BYTES=0 >/dev/null
 
 openpgp_partial_overlap="$work_dir/openpgp-partial-overlap"
@@ -967,7 +1013,7 @@ PY
 openpgp_partial_overlap_apk="$work_dir/openpgp-partial-overlap.apk"
 make_apk "$openpgp_partial_overlap" "$openpgp_partial_overlap_apk"
 verify_apk "$openpgp_partial_overlap_apk" arm64-v8a \
-  JUMPGATE_TEST_OPENPGP_EXPECT_OPERATIONS=20000 \
+  JUMPGATE_TEST_OPENPGP_EXPECT_OPERATIONS="$((base_openpgp_operations + 20000))" \
   JUMPGATE_TEST_OPENPGP_EXPECT_COPIED_BYTES=40000 >/dev/null
 
 set +e
@@ -2981,7 +3027,8 @@ openpgp_max_fragmentation_apk="$work_dir/openpgp-max-fragmentation.apk"
 make_apk "$openpgp_max_fragmentation_fixture" "$openpgp_max_fragmentation_apk"
 # One candidate operation plus 131071 one-byte partial chunks reaches the cap.
 verify_apk "$openpgp_max_fragmentation_apk" arm64-v8a \
-  JUMPGATE_TEST_OPENPGP_EXPECT_OPERATIONS=131072 >/dev/null
+  JUMPGATE_TEST_OPENPGP_EXPECT_OPERATIONS="$((base_openpgp_operations + 131072))" \
+  >/dev/null
 
 openpgp_byte_cap_reject="$work_dir/openpgp-byte-cap-reject"
 copy_fixture "$base_arm64" "$openpgp_byte_cap_reject"

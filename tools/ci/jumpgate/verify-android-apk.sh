@@ -211,6 +211,103 @@ fi
 
 [[ -s "$entry_list" ]] || fail 'APK contains no entries'
 
+required_pairing_assets=(
+  'assets/addons/script.jumpgate.manager/resources/media/pixel.png'
+  'assets/addons/script.jumpgate.manager/resources/skins/default/1080i/DialogJumpgatePairing.xml'
+)
+for required_pairing_asset in "${required_pairing_assets[@]}"; do
+  if ! grep -Fqx -- "$required_pairing_asset" "$entry_list"; then
+    fail "APK is missing required Jumpgate pairing asset: $required_pairing_asset"
+  fi
+done
+if ! python3 - \
+  "$extract_dir/${required_pairing_assets[0]}" \
+  "$extract_dir/${required_pairing_assets[1]}" <<'PY'
+import pathlib
+import struct
+import sys
+import xml.etree.ElementTree as ET
+import zlib
+
+png = pathlib.Path(sys.argv[1]).read_bytes()
+if len(png) < 57 or png[:8] != b'\x89PNG\r\n\x1a\n':
+    raise SystemExit(1)
+
+offset = 8
+chunks = []
+while offset < len(png):
+    if len(png) - offset < 12:
+        raise SystemExit(1)
+    length = struct.unpack('>I', png[offset:offset + 4])[0]
+    chunk_end = offset + 12 + length
+    if chunk_end > len(png):
+        raise SystemExit(1)
+    chunk_type = png[offset + 4:offset + 8]
+    chunk_data = png[offset + 8:offset + 8 + length]
+    expected_crc = struct.unpack('>I', png[offset + 8 + length:chunk_end])[0]
+    if zlib.crc32(chunk_type + chunk_data) & 0xFFFFFFFF != expected_crc:
+        raise SystemExit(1)
+    if chunk_type not in {b'IHDR', b'IDAT', b'IEND'}:
+        raise SystemExit(1)
+    chunks.append((chunk_type, chunk_data))
+    offset = chunk_end
+    if chunk_type == b'IEND':
+        break
+if offset != len(png) or not chunks or chunks[0][0] != b'IHDR' or chunks[-1] != (b'IEND', b''):
+    raise SystemExit(1)
+if len(chunks[0][1]) != 13 or sum(kind == b'IHDR' for kind, _ in chunks) != 1:
+    raise SystemExit(1)
+
+width, height, bit_depth, color_type, compression, filter_method, interlace = struct.unpack(
+    '>IIBBBBB', chunks[0][1]
+)
+channels = {0: 1, 2: 3, 4: 2, 6: 4}.get(color_type)
+if (
+    not (0 < width <= 4096 and 0 < height <= 4096)
+    or bit_depth != 8
+    or channels is None
+    or compression != 0
+    or filter_method != 0
+    or interlace != 0
+):
+    raise SystemExit(1)
+idat = b''.join(data for kind, data in chunks if kind == b'IDAT')
+if not idat:
+    raise SystemExit(1)
+expected_size = height * (1 + width * channels)
+try:
+    decoder = zlib.decompressobj()
+    pixels = decoder.decompress(idat, expected_size + 1)
+    if decoder.unconsumed_tail or len(pixels) > expected_size:
+        raise ValueError
+    pixels += decoder.flush(expected_size + 1 - len(pixels))
+except (ValueError, zlib.error):
+    raise SystemExit(1)
+if not decoder.eof or decoder.unused_data or len(pixels) != expected_size:
+    raise SystemExit(1)
+row_size = 1 + width * channels
+if any(pixels[row * row_size] > 4 for row in range(height)):
+    raise SystemExit(1)
+
+try:
+    dialog = ET.parse(sys.argv[2]).getroot()
+    control_ids = [int(control.get('id')) for control in dialog.findall('.//control[@id]')]
+except (ET.ParseError, OSError, TypeError, ValueError):
+    raise SystemExit(1)
+required_ids = {10, 11, 12, 13, 14, 15, 16, 17, 20, 21}
+if (
+    dialog.tag != 'window'
+    or dialog.get('type') != 'dialog'
+    or dialog.findtext('./defaultcontrol') != '20'
+    or not required_ids.issubset(control_ids)
+    or len(control_ids) != len(set(control_ids))
+):
+    raise SystemExit(1)
+PY
+then
+  fail 'APK contains malformed Jumpgate pairing assets'
+fi
+
 while IFS= read -r entry; do
   if [[ "$entry" =~ [[:cntrl:]] ]]; then
     fail 'APK contains an unsafe entry name'

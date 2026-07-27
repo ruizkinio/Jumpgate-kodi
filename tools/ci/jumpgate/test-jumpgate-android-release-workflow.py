@@ -104,10 +104,12 @@ root = pathlib.Path(__file__).resolve().parents[3]
 workflow_path = root / ".github" / "workflows" / "jumpgate-android-release.yml"
 validator_path = root / "tools" / "ci" / "jumpgate" / "verify-android-release.sh"
 apk_verifier_path = root / "tools" / "ci" / "jumpgate" / "verify-android-apk.sh"
+apk_verifier_test_path = root / "tools" / "ci" / "jumpgate" / "test-verify-android-apk.sh"
 validator_test_path = root / "tools" / "ci" / "jumpgate" / "test-verify-android-release.sh"
 workflow_text = workflow_path.read_text(encoding="utf-8")
 validator_text = validator_path.read_text(encoding="utf-8")
 apk_verifier_text = apk_verifier_path.read_text(encoding="utf-8")
+apk_verifier_test_text = apk_verifier_test_path.read_text(encoding="utf-8")
 validator_test_text = validator_test_path.read_text(encoding="utf-8")
 workflow = yaml.load(workflow_text, Loader=UniqueKeyLoader)
 
@@ -1772,6 +1774,19 @@ require("libkodi.so" not in validator_text, "release validator hard-codes Kodi's
 require("<expected-core-library>" in apk_verifier_text, "APK verifier core-library contract is missing")
 require("allowed_path" in apk_verifier_text and "expected_core_library" in apk_verifier_text,
         "embedded-key exception is not scoped to the expected core library")
+for pairing_asset in (
+    "assets/addons/script.jumpgate.manager/resources/media/pixel.png",
+    "assets/addons/script.jumpgate.manager/resources/skins/default/1080i/DialogJumpgatePairing.xml",
+):
+    require(pairing_asset in apk_verifier_text,
+            f"APK verifier omits required pairing asset: {pairing_asset}")
+for pairing_fixture in (
+    "missing-pairing-asset",
+    "malformed-pairing-asset",
+    "malformed-pairing-png",
+):
+    require(pairing_fixture in apk_verifier_test_text,
+            f"APK verifier tests omit the {pairing_fixture} fixture")
 for adversarial_fixture in (
     "wrong-hash",
     "wrong-name",

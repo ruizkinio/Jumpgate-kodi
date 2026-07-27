@@ -9,6 +9,7 @@ set(SOURCES GUIDialogBoxBase.cpp
             GUIDialogFileBrowser.cpp
             GUIDialogGamepad.cpp
             GUIDialogKaiToast.cpp
+            GUIDialogJumpgatePairing.cpp
             GUIDialogKeyboardGeneric.cpp
             GUIDialogKeyboardTouch.cpp
             GUIDialogMediaFilter.cpp
@@ -40,6 +41,7 @@ set(HEADERS GUIDialogBoxBase.h
             GUIDialogFileBrowser.h
             GUIDialogGamepad.h
             GUIDialogKaiToast.h
+            GUIDialogJumpgatePairing.h
             GUIDialogKeyboardGeneric.h
             GUIDialogKeyboardTouch.h
             GUIDialogMediaFilter.h

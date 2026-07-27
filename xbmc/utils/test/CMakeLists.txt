@@ -34,6 +34,8 @@ set(SOURCES TestAlarmClock.cpp
             TestJumpgatePlaybackHistoryState.cpp
             TestJumpgatePlaybackResultState.cpp
             TestJumpgatePlaybackRetry.cpp
+            TestJumpgatePairingCoordinator.cpp
+            TestJumpgatePairingPresenter.cpp
             TestJumpgatePlaybackClaimClient.cpp
             TestJumpgatePlaybackClaimCoordinator.cpp
             TestJumpgateSubtitleClient.cpp
@@ -49,6 +51,7 @@ set(SOURCES TestAlarmClock.cpp
             TestJumpgateProfileHistoryPolicy.cpp
             TestUPnPPlayerOpenPublication.cpp
             TestJumpgateProfileStore.cpp
+            TestJumpgateQrCode.cpp
             TestJumpgateSourceFingerprint.cpp
             TestLabelFormatter.cpp
             TestLangCodeExpander.cpp
