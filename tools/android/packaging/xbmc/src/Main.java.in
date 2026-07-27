@@ -955,6 +955,17 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
       mWasStandalone = false;
       // Hide loading overlay so Kodi home screen is visible again
       hideLoadingOverlay();
+      handler.post(
+          () -> {
+            synchronized (Main.this) {
+              if (mExternalPlayerMode
+                  || mExternalResultProducer.activeGeneration() != 0
+                  || ExternalPlayerResultCoordinator.isValidRequestId(
+                      mExternalResultProducer.preparedRequestId())) return;
+
+              moveTaskToBack(true);
+            }
+          });
       Log.d(TAG, "Main: Returning to standalone mode after external player");
     } else {
       // The result-owner activity acknowledges only after it has set its caller result and

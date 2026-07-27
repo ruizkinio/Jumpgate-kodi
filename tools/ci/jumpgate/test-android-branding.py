@@ -2545,6 +2545,32 @@ def verify_back_lifecycle_rejection_contract():
         "reservation.commit()",
         "mExternalPlayerMode = false",
     )
+    post_commit_exit = normal_exit[normal_exit.find("reservation.commit()") :]
+    warm_exit = extract_braced_block(post_commit_exit, "if (wasStandalone)")
+    require_in_order(
+        warm_exit,
+        "mExternalPlayerMode = false",
+        "mExternalResultProducer.clear(generation, requestId)",
+        "mWasStandalone = false",
+        "hideLoadingOverlay()",
+        "handler.post(",
+    )
+    warm_handoff = extract_braced_block(warm_exit, "synchronized (Main.this)")
+    require_in_order(
+        warm_handoff,
+        "mExternalPlayerMode",
+        "mExternalResultProducer.activeGeneration() != 0",
+        "mExternalResultProducer.preparedRequestId()",
+        ")) return",
+        "moveTaskToBack(true)",
+    )
+    if "finish()" in warm_exit or "scheduleExternalPlayerProcessExit(" in warm_exit:
+        raise AssertionError("warm external exit must retain Main and its native engine")
+    warm_exit_end = post_commit_exit.find(warm_exit) + len(warm_exit)
+    cold_exit = extract_braced_block(post_commit_exit[warm_exit_end:], "else")
+    require_in_order(cold_exit, "mExternalPlayerMode = false", "finish()")
+    if "moveTaskToBack(" in cold_exit:
+        raise AssertionError("cold external exit must finish Main instead of retaining its task")
 
     for contract in (
         "class TerminalReservation",
