@@ -647,7 +647,7 @@ for job_name, step in artifact_steps:
     require("run-id" not in settings, f"{job_name} can download a foreign workflow run")
     require("repository" not in settings, f"{job_name} can download a foreign repository artifact")
 
-require("actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be" in workflow_text,
+require("actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f" in workflow_text,
         "build provenance action is absent or unpinned")
 require("SYFT_VERSION: 1.46.0" in workflow_text, "Syft version must be immutable")
 require(

@@ -64,7 +64,7 @@ jobs:
       history_fingerprint: ${{ steps.release_history.outputs.history_fingerprint }}
     steps:
       - name: Check out reviewed source
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ github.workflow_sha }}
           fetch-depth: 1
@@ -461,14 +461,14 @@ jobs:
             cache_id: armv7
     steps:
       - name: Check out Kodi
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ needs.validate_release_inputs.outputs.source_sha }}
           fetch-depth: 1
           persist-credentials: false
 
       - name: Set up JDK 17
-        uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00 # v4.7.1
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
         with:
           distribution: temurin
           java-version: ${{ env.JAVA_VERSION }}
@@ -620,14 +620,14 @@ jobs:
 
       - name: Restore shared source tarballs
         id: restore-tarballs
-        uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: ${{ env.TARBALLS_DIR }}
           key: jumpgate-android-release-${{ env.CACHE_SCHEMA_VERSION }}-tarballs-${{ needs.validate_release_inputs.outputs.source_sha }}-${{ steps.source-keys.outputs.depends_hash }}
 
       - name: Restore ABI dependency state
         id: restore-depends
-        uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: |
             ${{ env.DEPENDS_PREFIX }}
@@ -636,14 +636,14 @@ jobs:
 
       - name: Restore ABI ccache
         id: restore-ccache
-        uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: ${{ env.CCACHE_DIR }}
           key: jumpgate-android-release-${{ env.CACHE_SCHEMA_VERSION }}-ccache-${{ needs.validate_release_inputs.outputs.source_sha }}-${{ runner.os }}-${{ matrix.host }}-${{ steps.source-keys.outputs.toolchain_hash }}
 
       - name: Restore ABI Gradle cache
         id: restore-gradle
-        uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: |
             ${{ env.GRADLE_USER_HOME }}/caches
@@ -952,14 +952,14 @@ jobs:
 
       - name: Save shared source tarballs
         if: ${{ github.repository == env.CANONICAL_REPOSITORY && matrix.cache_id == 'arm64' && steps.restore-tarballs.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: ${{ env.TARBALLS_DIR }}
           key: jumpgate-android-release-${{ env.CACHE_SCHEMA_VERSION }}-tarballs-${{ needs.validate_release_inputs.outputs.source_sha }}-${{ steps.source-keys.outputs.depends_hash }}
 
       - name: Save ABI dependency state
         if: ${{ github.repository == env.CANONICAL_REPOSITORY && steps.restore-depends.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: |
             ${{ env.DEPENDS_PREFIX }}
@@ -968,14 +968,14 @@ jobs:
 
       - name: Save ABI ccache
         if: ${{ github.repository == env.CANONICAL_REPOSITORY && steps.restore-ccache.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: ${{ env.CCACHE_DIR }}
           key: jumpgate-android-release-${{ env.CACHE_SCHEMA_VERSION }}-ccache-${{ needs.validate_release_inputs.outputs.source_sha }}-${{ runner.os }}-${{ matrix.host }}-${{ steps.source-keys.outputs.toolchain_hash }}
 
       - name: Save ABI Gradle cache
         if: ${{ github.repository == env.CANONICAL_REPOSITORY && steps.restore-gradle.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: |
             ${{ env.GRADLE_USER_HOME }}/caches
@@ -994,7 +994,7 @@ jobs:
           fi
 
       - name: Upload verified release candidate
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: jumpgate-android-release-candidate-${{ matrix.abi }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
@@ -1021,14 +1021,14 @@ jobs:
       contents: read
     steps:
       - name: Check out trusted release tooling
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ github.workflow_sha }}
           fetch-depth: 1
           persist-credentials: false
 
       - name: Set up JDK 17
-        uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00 # v4.7.1
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
         with:
           distribution: temurin
           java-version: ${{ env.JAVA_VERSION }}
@@ -1072,13 +1072,13 @@ jobs:
           echo "$build_tools_root" >> "$GITHUB_PATH"
 
       - name: Download current-run arm64-v8a candidate
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: jumpgate-android-release-candidate-arm64-v8a-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/jumpgate-release-candidates-${{ github.run_id }}-${{ github.run_attempt }}/arm64-v8a
 
       - name: Download current-run armeabi-v7a candidate
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: jumpgate-android-release-candidate-armeabi-v7a-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/jumpgate-release-candidates-${{ github.run_id }}-${{ github.run_attempt }}/armeabi-v7a
@@ -1311,7 +1311,7 @@ jobs:
           rm -f -- "$SIGNED_ROOT/expected-release-signer.sha256"
 
       - name: Upload current-run arm64-v8a release APK
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: jumpgate-android-release-signed-arm64-v8a-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
@@ -1324,7 +1324,7 @@ jobs:
           retention-days: 30
 
       - name: Upload current-run armeabi-v7a release APK
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: jumpgate-android-release-signed-armeabi-v7a-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
@@ -1353,14 +1353,14 @@ jobs:
       attestation_url: ${{ steps.provenance.outputs.attestation-url }}
     steps:
       - name: Check out trusted release tooling
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ github.workflow_sha }}
           fetch-depth: 1
           persist-credentials: false
 
       - name: Set up JDK 17
-        uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00 # v4.7.1
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
         with:
           distribution: temurin
           java-version: ${{ env.JAVA_VERSION }}
@@ -1417,13 +1417,13 @@ jobs:
           echo "$build_tools_root" >> "$GITHUB_PATH"
 
       - name: Download current-run arm64-v8a signed APK
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: jumpgate-android-release-signed-arm64-v8a-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/jumpgate-signed-inputs-${{ github.run_id }}-${{ github.run_attempt }}/arm64-v8a
 
       - name: Download current-run armeabi-v7a signed APK
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: jumpgate-android-release-signed-armeabi-v7a-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/jumpgate-signed-inputs-${{ github.run_id }}-${{ github.run_attempt }}/armeabi-v7a
@@ -1631,7 +1631,7 @@ jobs:
 
       - name: Attest current release payload
         id: provenance
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
         with:
           subject-path: |
             ${{ env.RELEASE_DIR }}/Jumpgate-${{ needs.validate_release_inputs.outputs.version_name }}-arm64-v8a.apk
@@ -1666,7 +1666,7 @@ jobs:
           fi
 
       - name: Upload attested current-run release payload
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: jumpgate-android-release-payload-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.RELEASE_DIR }}/*
@@ -1690,7 +1690,7 @@ jobs:
       contents: read
     steps:
       - name: Download exact current-run release payload
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: jumpgate-android-release-payload-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/jumpgate-release-publish-${{ github.run_id }}-${{ github.run_attempt }}
@@ -1745,7 +1745,7 @@ jobs:
 
       - name: Create new tag and draft release without overwrite APIs
         id: publish
-        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         env:
           ATTESTATION_URL: ${{ needs.assemble_release.outputs.attestation_url }}
           EXPECTED_VERSION_NAME: ${{ needs.validate_release_inputs.outputs.version_name }}
