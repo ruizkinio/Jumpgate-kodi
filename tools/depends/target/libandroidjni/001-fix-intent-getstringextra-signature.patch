@@ -1,11 +1,9 @@
 --- a/src/Intent.cpp
 +++ b/src/Intent.cpp
-@@ -137,7 +137,7 @@ int CJNIIntent::getIntExtra(const std::string &name, int defaultValue) const
- std::string CJNIIntent::getStringExtra(const std::string &name) const
+@@ -138,5 +138,5 @@ std::string CJNIIntent::getStringExtra(const std::string &name) const
  {
    return jcast<std::string>(call_method<jhstring>(m_object,
 -    "getStringExtra", "(Ljava/lang/String;I)Ljava/lang/String;",
 +    "getStringExtra", "(Ljava/lang/String;)Ljava/lang/String;",
      jcast<jhstring>(name)));
  }
- 
