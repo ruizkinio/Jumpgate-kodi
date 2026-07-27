@@ -15,6 +15,14 @@ from tempfile import TemporaryDirectory
 ROOT = Path(__file__).resolve().parents[3]
 ROOT_GITATTRIBUTES = ROOT / ".gitattributes"
 VERSION_FILE = ROOT / "version.txt"
+ROOT_CMAKE = ROOT / "CMakeLists.txt"
+COMPILE_INFO_GENERATOR = (
+    ROOT / "cmake" / "scripts" / "common" / "GenerateCompileInfo.cmake"
+)
+COMPILE_INFO_GENERATOR_ARGUMENT = (
+    "${CMAKE_SOURCE_DIR}/cmake/scripts/common/GenerateCompileInfo.cmake"
+)
+COMPILE_INFO_PACKAGE_ARGUMENT = "-DAPP_PACKAGE=${APP_PACKAGE}"
 APP_HEADER = ROOT / "xbmc" / "platform" / "android" / "activity" / "XBMCApp.h"
 APP_SOURCE = ROOT / "xbmc" / "platform" / "android" / "activity" / "XBMCApp.cpp"
 PACKAGING_MAKEFILE = ROOT / "tools" / "android" / "packaging" / "Makefile.in"
@@ -579,6 +587,182 @@ def cmake_commands(source):
             continue
         arguments, index = parse_cmake_arguments(source, opening + 1)
         yield name.casefold(), arguments
+
+
+def verify_compile_info_package_command(source):
+    generator_commands = [
+        arguments
+        for command, arguments in cmake_commands(source)
+        if command == "add_custom_command"
+        and COMPILE_INFO_GENERATOR_ARGUMENT in arguments
+    ]
+    if len(generator_commands) != 1:
+        raise AssertionError(
+            "root CMakeLists.txt must invoke GenerateCompileInfo.cmake exactly once"
+        )
+
+    arguments = generator_commands[0]
+    if arguments.count(COMPILE_INFO_PACKAGE_ARGUMENT) != 1:
+        raise AssertionError(
+            "CompileInfo generation must propagate APP_PACKAGE exactly once"
+        )
+    if arguments.count("-P") != 1:
+        raise AssertionError("CompileInfo generation must use exactly one -P argument")
+    script_index = arguments.index("-P")
+    if (
+        script_index + 1 >= len(arguments)
+        or arguments[script_index + 1] != COMPILE_INFO_GENERATOR_ARGUMENT
+    ):
+        raise AssertionError(
+            "GenerateCompileInfo.cmake must immediately follow the -P argument"
+        )
+
+    package_index = arguments.index(COMPILE_INFO_PACKAGE_ARGUMENT)
+    command_indices = [
+        index
+        for index, argument in enumerate(arguments[:script_index])
+        if argument == "COMMAND"
+    ]
+    if not command_indices:
+        raise AssertionError("CompileInfo generation lacks an applicable COMMAND")
+    command_index = command_indices[-1]
+    cmake_command_index = command_index + 1
+    if (
+        cmake_command_index >= script_index
+        or arguments[cmake_command_index] != "${CMAKE_COMMAND}"
+    ):
+        raise AssertionError(
+            "CompileInfo generation must run from COMMAND ${CMAKE_COMMAND}"
+        )
+    if "COMMAND" in arguments[package_index + 1 : script_index]:
+        raise AssertionError(
+            "CompileInfo APP_PACKAGE must not have an intervening COMMAND before -P"
+        )
+    if not command_index < cmake_command_index < package_index < script_index:
+        raise AssertionError(
+            "CompileInfo APP_PACKAGE must occur after COMMAND ${CMAKE_COMMAND} "
+            "and before -P"
+        )
+
+
+def verify_compile_info_package_command_regressions():
+    source = ROOT_CMAKE.read_text(encoding="utf-8")
+    if source.count(COMPILE_INFO_PACKAGE_ARGUMENT) != 1:
+        raise AssertionError(
+            "CompileInfo mutation fixture requires one APP_PACKAGE argument"
+        )
+    if source.count(COMPILE_INFO_GENERATOR_ARGUMENT) != 1:
+        raise AssertionError(
+            "CompileInfo mutation fixture requires one generator argument"
+        )
+
+    missing = source.replace(COMPILE_INFO_PACKAGE_ARGUMENT, "", 1)
+    generator_index = missing.index(COMPILE_INFO_GENERATOR_ARGUMENT)
+    command_token = "COMMAND ${CMAKE_COMMAND}"
+    command_index = missing.rfind(command_token, 0, generator_index)
+    if command_index < 0:
+        raise AssertionError(
+            "CompileInfo mutation fixture cannot find COMMAND ${CMAKE_COMMAND}"
+        )
+    command_line_start = missing.rfind("\n", 0, command_index) + 1
+    command_indent = missing[command_line_start:command_index]
+    before_command = (
+        missing[:command_index]
+        + COMPILE_INFO_PACKAGE_ARGUMENT
+        + "\n"
+        + command_indent
+        + missing[command_index:]
+    )
+
+    generator_line_start = missing.rfind("\n", 0, generator_index) + 1
+    generator_indent = re.match(
+        r"[ \t]*", missing[generator_line_start:generator_index]
+    ).group(0)
+    generator_end = generator_index + len(COMPILE_INFO_GENERATOR_ARGUMENT)
+    post_script = (
+        missing[:generator_end]
+        + "\n"
+        + generator_indent
+        + COMPILE_INFO_PACKAGE_ARGUMENT
+        + missing[generator_end:]
+    )
+    duplicate = source.replace(
+        COMPILE_INFO_PACKAGE_ARGUMENT,
+        f"{COMPILE_INFO_PACKAGE_ARGUMENT}\n{COMPILE_INFO_PACKAGE_ARGUMENT}",
+        1,
+    )
+    mutations = (
+        ("missing", missing, "propagate APP_PACKAGE exactly once"),
+        ("duplicate", duplicate, "propagate APP_PACKAGE exactly once"),
+        (
+            "post-P",
+            post_script,
+            "must occur after COMMAND ${CMAKE_COMMAND} and before -P",
+        ),
+        (
+            "before-COMMAND",
+            before_command,
+            "must not have an intervening COMMAND before -P",
+        ),
+    )
+    for label, mutated_source, expected_error in mutations:
+        try:
+            verify_compile_info_package_command(mutated_source)
+        except AssertionError as error:
+            if expected_error not in str(error):
+                raise AssertionError(
+                    f"CompileInfo {label} mutation failed for the wrong reason: {error}"
+                ) from error
+        else:
+            raise AssertionError(
+                f"CompileInfo {label} mutation unexpectedly passed"
+            )
+
+
+def verify_compile_info_package_override():
+    verify_compile_info_package_command(ROOT_CMAKE.read_text(encoding="utf-8"))
+
+    cmake_executable = shutil.which("cmake")
+    if cmake_executable is None:
+        raise AssertionError("cmake is required to verify CompileInfo generation")
+
+    override_package = "io.github.ruizkinio.jumpgate.x86diag.contract"
+    with TemporaryDirectory(prefix="jumpgate-compile-info-") as temporary:
+        build_root = Path(temporary)
+        core_build_dir = Path("generated")
+        output = build_root / core_build_dir / "xbmc" / "CompileInfo.cpp"
+        output.parent.mkdir(parents=True)
+        completed = subprocess.run(
+            [
+                cmake_executable,
+                f"-DCORE_SOURCE_DIR={ROOT}",
+                f"-DCORE_BUILD_DIR={core_build_dir.as_posix()}",
+                f"-DCMAKE_BINARY_DIR={build_root}",
+                f"-DAPP_PACKAGE={override_package}",
+                "-P",
+                str(COMPILE_INFO_GENERATOR),
+            ],
+            cwd=build_root,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if completed.returncode != 0:
+            details = "\n".join(
+                part.strip()
+                for part in (completed.stdout, completed.stderr)
+                if part.strip()
+            )
+            raise AssertionError(
+                "GenerateCompileInfo.cmake rejected APP_PACKAGE override: "
+                f"{details or 'cmake returned no output'}"
+            )
+        generated = output.read_text(encoding="utf-8")
+        expected = f'return "{override_package}";'
+        if generated.count(expected) != 1:
+            raise AssertionError(
+                "generated CompileInfo.cpp did not preserve the APP_PACKAGE override"
+            )
 
 
 def cmake_constant_condition(arguments):
@@ -2465,6 +2649,8 @@ def main(arguments):
     verify_package_derivation()
     verify_libandroidjni_intent_patch_contract()
     verify_cmake_parser_regressions()
+    verify_compile_info_package_command_regressions()
+    verify_compile_info_package_override()
     verify_cmake_inventory_regressions()
     verify_gtest_inventory_regressions()
     verify_host_policy_regressions()
