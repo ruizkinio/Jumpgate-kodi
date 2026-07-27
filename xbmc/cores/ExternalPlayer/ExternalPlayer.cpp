@@ -395,9 +395,9 @@ void CExternalPlayer::Process()
   appPower->WakeUpScreenSaverAndDPMS();
 
   if (!ret || (m_playOneStackItem && g_application.CurrentFileItem().IsStack()))
-    m_callback.OnPlayBackStopped();
+    m_callback.OnPlayBackStoppedWithItem(m_file);
   else
-    m_callback.OnPlayBackEnded();
+    m_callback.OnPlayBackEndedWithItem(m_file);
 }
 
 #if defined(TARGET_WINDOWS_DESKTOP)

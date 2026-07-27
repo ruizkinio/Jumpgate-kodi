@@ -1,0 +1,57 @@
+# Kodi Media Center language file
+# Addon Name: Jumpgate Manager
+# Addon id: script.jumpgate.manager
+# Addon Provider: Jumpgate
+msgid ""
+msgstr ""
+"Project-Id-Version: XBMC Addons\n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: YEAR-MO-DA HO:MI+ZONE\n"
+"PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
+"Last-Translator: \n"
+"Language-Team: English\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Language: en_US\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\n"
+
+msgctxt "Addon Summary"
+msgid "Pair and manage Jumpgate bridge profiles"
+msgstr "Pair and manage Jumpgate bridge profiles"
+
+msgctxt "Addon Description"
+msgid "Open the native Jumpgate manager from Kodi standalone mode to pair, switch, and forget isolated profiles for external-player mode."
+msgstr "Open the native Jumpgate manager from Kodi standalone mode to pair, switch, and forget isolated profiles for external-player mode."
+
+msgctxt "#30000"
+msgid "Jumpgate Manager"
+msgstr "Jumpgate Manager"
+
+msgctxt "#30001"
+msgid "Pair New Profile"
+msgstr "Pair New Profile"
+
+msgctxt "#30002"
+msgid "Switch Active Profile"
+msgstr "Switch Active Profile"
+
+msgctxt "#30003"
+msgid "Remove Profile"
+msgstr "Remove Profile"
+
+msgctxt "#30004"
+msgid "Clear Active Profile (Default Mode)"
+msgstr "Clear Active Profile (Default Mode)"
+
+msgctxt "#30005"
+msgid "Show Saved Profiles"
+msgstr "Show Saved Profiles"
+
+msgctxt "#30006"
+msgid "Help"
+msgstr "Help"
+
+msgctxt "#30007"
+msgid "Open Native Manager"
+msgstr "Open Native Manager"

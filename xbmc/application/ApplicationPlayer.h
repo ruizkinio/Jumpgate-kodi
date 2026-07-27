@@ -16,6 +16,7 @@
 #include "threads/CriticalSection.h"
 #include "threads/SystemClock.h"
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -33,6 +34,13 @@ struct TextCacheStruct_t;
 class CApplicationPlayer : public IApplicationComponent
 {
 public:
+  enum class OpenNextResult : uint8_t
+  {
+    NoItem,
+    Opened,
+    Failed,
+  };
+
   CApplicationPlayer() = default;
 
   // player management
@@ -45,7 +53,7 @@ public:
   bool OpenFile(const CFileItem& item, const CPlayerOptions& options,
                 const CPlayerCoreFactory &factory,
                 const std::string &playerName, IPlayerCallback& callback);
-  void OpenNext(const CPlayerCoreFactory &factory);
+  [[nodiscard]] OpenNextResult OpenNext(const CPlayerCoreFactory& factory);
   void SetPlaySpeed(float speed);
   void SetTempo(float tempo);
   void FrameAdvance(int frames);
@@ -188,7 +196,14 @@ public:
 private:
   std::shared_ptr<const IPlayer> GetInternal() const;
   std::shared_ptr<IPlayer> GetInternal();
+  bool OpenFileInternal(const CFileItem& item,
+                        const CPlayerOptions& options,
+                        const CPlayerCoreFactory& factory,
+                        const std::string& playerName,
+                        IPlayerCallback& callback,
+                        bool notifyOpening);
   void CreatePlayer(const CPlayerCoreFactory &factory, const std::string &player, IPlayerCallback& callback);
+  void CancelNextItem();
   void CloseFile(bool reopen = false);
 
   std::shared_ptr<IPlayer> m_pPlayer;

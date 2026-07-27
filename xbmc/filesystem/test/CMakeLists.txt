@@ -1,5 +1,6 @@
 set(SOURCES TestDirectory.cpp
             TestDirectoryCache.cpp
+            TestCurlFile.cpp
             TestFile.cpp
             TestFileFactory.cpp
             TestZipFile.cpp

@@ -34,10 +34,15 @@
 #include "utils/SaveFileStateJob.h"
 #include "utils/StringUtils.h"
 #include "utils/URIUtils.h"
+#include "utils/Variant.h"
 #include "utils/log.h"
 #include "video/VideoDatabase.h"
 #include "video/VideoFileItemClassify.h"
 #include "video/VideoInfoTag.h"
+
+#ifdef TARGET_ANDROID
+#include "platform/android/activity/XBMCApp.h"
+#endif
 
 #include <chrono>
 #include <memory>
@@ -45,11 +50,101 @@
 using namespace KODI;
 using namespace std::chrono_literals;
 
+#ifdef TARGET_ANDROID
+namespace
+{
+uint64_t GetJumpgateLifecycleToken(const CFileItem& file)
+{
+  const CVariant& property = file.GetProperty("jumpgate.lifecycle_token");
+  if (property.isUnsignedInteger())
+    return property.asUnsignedInteger();
+  if (property.isSignedInteger() && property.asInteger() > 0)
+    return static_cast<uint64_t>(property.asInteger());
+  return 0;
+}
+} // namespace
+#endif
+
+uint64_t CApplicationPlayerCallback::GetPlaybackToken(const CFileItem& file)
+{
+  uint64_t token = 0;
+  const CVariant& property = file.GetProperty("jumpgate.playback_token");
+  if (property.isUnsignedInteger())
+    token = property.asUnsignedInteger();
+  else if (property.isSignedInteger() && property.asInteger() > 0)
+    token = static_cast<uint64_t>(property.asInteger());
+  return token;
+}
+
+void CApplicationPlayerCallback::OnPlayBackOpening(const CFileItem& file, bool deferred)
+{
+  m_playbackAttempts.Bind(GetPlaybackToken(file),
+                          deferred ? KODI::JUMPGATE::JumpgatePlaybackOpenMode::Deferred
+                                   : KODI::JUMPGATE::JumpgatePlaybackOpenMode::Immediate);
+}
+
+void CApplicationPlayerCallback::OnPlayBackOpenNext(const CFileItem& file)
+{
+  m_playbackAttempts.BeginOpenNext(GetPlaybackToken(file));
+}
+
+void CApplicationPlayerCallback::OnPlayBackOpenFailed(const CFileItem& file)
+{
+  const uint64_t token = GetPlaybackToken(file);
+  if (!m_playbackAttempts.CancelOpen(token))
+    return;
+#ifdef TARGET_ANDROID
+  const auto appTarget =
+      jni::CJNIMainActivity::AcquireAppInstance(GetJumpgateLifecycleToken(file));
+  if (auto* app = dynamic_cast<CXBMCApp*>(appTarget.get()))
+    app->CommitExternalPlaybackOpenFailure(token);
+#endif
+}
+
+std::optional<KODI::JUMPGATE::JumpgatePlaybackTerminal> CApplicationPlayerCallback::
+    AcknowledgePlaybackTerminal(uint64_t token, bool completed)
+{
+  return m_playbackAttempts.AcknowledgeTerminal(token, completed);
+}
+
+bool CApplicationPlayerCallback::IsPlaybackAttemptSuperseded(uint64_t token) const
+{
+  return m_playbackAttempts.IsSuperseded(token);
+}
+
 void CApplicationPlayerCallback::OnPlayBackEnded()
+{
+  if (const auto terminal = CreatePlaybackTerminal(true, nullptr); terminal)
+    SendPlaybackTerminal(*terminal);
+}
+
+void CApplicationPlayerCallback::OnPlayBackEndedWithItem(const CFileItem& file)
+{
+  if (const auto terminal = CreatePlaybackTerminal(true, &file); terminal)
+    SendPlaybackTerminal(*terminal);
+}
+
+std::optional<KODI::JUMPGATE::JumpgatePlaybackTerminal> CApplicationPlayerCallback::
+    CreatePlaybackTerminal(bool completed, const CFileItem* file)
 {
   CLog::LogF(LOGDEBUG, "call");
 
-  CGUIMessage msg(GUI_MSG_PLAYBACK_ENDED, 0, 0);
+  if (!file)
+    return KODI::JUMPGATE::JumpgatePlaybackTerminal{0, completed, false};
+
+  const uint64_t token = GetPlaybackToken(*file);
+  if (token == 0)
+    return KODI::JUMPGATE::JumpgatePlaybackTerminal{0, completed, false};
+
+  return m_playbackAttempts.EmitTerminal(token, completed);
+}
+
+void CApplicationPlayerCallback::SendPlaybackTerminal(
+    const KODI::JUMPGATE::JumpgatePlaybackTerminal& terminal)
+{
+  CGUIMessage msg(terminal.completed ? GUI_MSG_PLAYBACK_ENDED : GUI_MSG_PLAYBACK_STOPPED, 0, 0);
+  msg.SetParam1(static_cast<int64_t>(terminal.token));
+  msg.SetParam2(terminal.started ? 1 : 0);
   CServiceBroker::GetGUI()->GetWindowManager().SendThreadMessage(msg);
 }
 
@@ -73,6 +168,12 @@ bool ShouldUpdateStreamDetails(const CFileItem& file)
 void CApplicationPlayerCallback::OnPlayBackStarted(const CFileItem& file)
 {
   CLog::LogF(LOGDEBUG, "call");
+  const uint64_t token = GetPlaybackToken(file);
+  if (token != 0 && !m_playbackAttempts.MarkStarted(token))
+  {
+    CLog::LogF(LOGDEBUG, "Ignored stale playback-start callback for attempt {}", token);
+    return;
+  }
   std::shared_ptr<CFileItem> itemCurrentFile;
 
   // check if VideoPlayer should set file item stream details from its current streams
@@ -110,7 +211,9 @@ void CApplicationPlayerCallback::OnPlayBackStarted(const CFileItem& file)
 
   stackHelper->OnPlayBackStarted();
 
-  CGUIMessage msg(GUI_MSG_PLAYBACK_STARTED, 0, 0, 0, 0, itemCurrentFile);
+  if (token != 0)
+    itemCurrentFile->SetProperty("jumpgate.playback_token", CVariant{token});
+  CGUIMessage msg(GUI_MSG_PLAYBACK_STARTED, 0, 0, static_cast<int64_t>(token), 0, itemCurrentFile);
   CServiceBroker::GetGUI()->GetWindowManager().SendThreadMessage(msg);
 }
 
@@ -415,19 +518,38 @@ void CApplicationPlayerCallback::OnPlayBackResumed()
 
 void CApplicationPlayerCallback::OnPlayBackStopped()
 {
-  CLog::LogF(LOGDEBUG, "call");
+  if (const auto terminal = CreatePlaybackTerminal(false, nullptr); terminal)
+    SendPlaybackTerminal(*terminal);
+}
 
-  CGUIMessage msg(GUI_MSG_PLAYBACK_STOPPED, 0, 0);
-  CServiceBroker::GetGUI()->GetWindowManager().SendThreadMessage(msg);
+void CApplicationPlayerCallback::OnPlayBackStoppedWithItem(const CFileItem& file)
+{
+  if (const auto terminal = CreatePlaybackTerminal(false, &file); terminal)
+    SendPlaybackTerminal(*terminal);
 }
 
 void CApplicationPlayerCallback::OnPlayBackError()
 {
+  SendPlaybackError(nullptr);
+}
+
+void CApplicationPlayerCallback::OnPlayBackErrorWithItem(const CFileItem& file)
+{
+  SendPlaybackError(&file);
+}
+
+void CApplicationPlayerCallback::SendPlaybackError(const CFileItem* file)
+{
+  const auto terminal = CreatePlaybackTerminal(false, file);
+  if (!terminal)
+    return;
+
   //@todo Playlists can be continued by calling OnPlaybackEnded instead
   // open error dialog
   CGUIMessage msg(GUI_MSG_PLAYBACK_ERROR, 0, 0);
+  msg.SetParam1(static_cast<int64_t>(terminal->token));
   CServiceBroker::GetGUI()->GetWindowManager().SendThreadMessage(msg);
-  OnPlayBackStopped();
+  SendPlaybackTerminal(*terminal);
 }
 
 void CApplicationPlayerCallback::OnQueueNextItem()
@@ -486,7 +608,12 @@ void CApplicationPlayerCallback::OnAVStarted(const CFileItem& file)
 {
   CLog::LogF(LOGDEBUG, "call");
 
-  CGUIMessage msg(GUI_MSG_PLAYBACK_AVSTARTED, 0, 0);
+  const uint64_t token = GetPlaybackToken(file);
+  if (token != 0 &&
+      (!m_playbackAttempts.IsStarted(token) || m_playbackAttempts.IsSuperseded(token)))
+    return;
+
+  CGUIMessage msg(GUI_MSG_PLAYBACK_AVSTARTED, 0, 0, static_cast<int64_t>(token));
   CServiceBroker::GetGUI()->GetWindowManager().SendThreadMessage(msg);
 }
 

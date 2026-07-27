@@ -4,31 +4,79 @@ import @APP_PACKAGE@.channels.util.TvUtil;
 
 import static android.content.pm.PackageManager.FEATURE_LEANBACK;
 
+import android.annotation.TargetApi;
+import android.animation.ObjectAnimator;
+import android.animation.ValueAnimator;
 import android.app.NativeActivity;
 import android.content.Intent;
 import android.content.pm.ResolveInfo;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Rect;
+import android.graphics.drawable.GradientDrawable;
 import android.hardware.input.InputManager;
 import android.media.AudioManager;
+import android.net.Uri;
 import android.os.Build;
 import android.os.Build.VERSION_CODES;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.text.TextUtils;
 import android.util.Log;
+import android.util.LruCache;
+import android.util.TypedValue;
+import android.graphics.Color;
+import android.graphics.PixelFormat;
 import android.view.Choreographer;
+import android.view.Gravity;
 import android.view.View;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
+import android.view.WindowManager;
+import android.window.BackEvent;
+import android.window.OnBackAnimationCallback;
+import android.window.OnBackInvokedDispatcher;
+import android.widget.FrameLayout;
+import android.widget.ImageView;
+import android.widget.LinearLayout;
 import android.widget.RelativeLayout;
+import android.widget.TextView;
+import android.view.animation.LinearInterpolator;
 
+import java.io.InputStream;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.security.MessageDigest;
+import java.util.Arrays;
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.Locale;
 import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public class Main extends NativeActivity implements Choreographer.FrameCallback
 {
   private static final String TAG = "@APP_NAME@";
+  private static final int OVERLAY_LOGO_CACHE_KB = 6 * 1024;
+  private static final long OVERLAY_LOGO_DISK_MAX_BYTES = 20L * 1024L * 1024L;
+  private static final int OVERLAY_LOGO_DISK_MAX_FILES = 96;
+  private static final long OVERLAY_LOGO_DISK_MAX_AGE_MS = 14L * 24L * 60L * 60L * 1000L;
+  private static final LruCache<String, Bitmap> sOverlayLogoCache = new LruCache<String, Bitmap>(OVERLAY_LOGO_CACHE_KB) {
+    @Override
+    protected int sizeOf(String key, Bitmap value) {
+      if (value == null) {
+        return 1;
+      }
+      int bytes = value.getByteCount();
+      int kb = bytes / 1024;
+      return kb > 0 ? kb : 1;
+    }
+  };
 
   public static Main MainActivity = null;
   public XBMCMainView mMainView = null;
@@ -39,14 +87,70 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
   private View mDecorView = null;
   private Handler handler = new Handler(Looper.myLooper());
 
+  // External player mode: when launched via ACTION_VIEW from another app
+  private boolean mExternalPlayerMode = false;
+  private final ExternalPlayerResultCoordinator.MainState mExternalResultProducer =
+      new ExternalPlayerResultCoordinator.MainState();
+  private long mLastPlaybackPosition = 0;  // ms
+  private long mLastPlaybackDuration = 0;  // ms
+  private static final long BACK_LONG_PRESS_THRESHOLD_MS = 700L;
+  private static final int BACK_SOURCE_GESTURE_LEFT = 0;
+  private static final int BACK_SOURCE_GESTURE_RIGHT = 1;
+  private static final int BACK_SOURCE_BUTTON = 2;
+  private static final String NATIVE_INTENT_RETRY = "jumpgate_native_intent_retry";
+  private static final int MAX_NATIVE_INTENT_RETRIES = 1;
+  private long mBackLifecycleToken = 0;
+  private Object mOnBackAnimationCallback = null;
+  private final Runnable mBackLongPressRunnable = new Runnable()
+  {
+    @Override
+    public void run()
+    {
+      final long lifecycleToken = mBackLifecycleToken;
+      if (lifecycleToken != 0)
+        _onBackLongPress(lifecycleToken);
+    }
+  };
+
+  // Tracks whether we entered external player mode from an already-running standalone Kodi.
+  // When true, exitExternalPlayerMode returns to standalone instead of killing the process.
+  private boolean mWasStandalone = false;
+  // Pending flag for delayed intents: set to true so when delayed intent fires, mWasStandalone is set.
+  private boolean mPendingWasStandalone = false;
+
+  // Loading overlay: WindowManager overlay (separate window layer above SurfaceView)
+  private View mLoadingOverlay = null;
+  private WindowManager mWindowManager = null;
+  private View mOverlayGateRing = null;
+  private View mOverlayGatePulse = null;
+  private View mOverlayProgressFill = null;
+  private TextView mOverlayStatusText = null;
+  private TextView mOverlayPercentText = null;
+  private TextView mOverlayTitleText = null;
+  private TextView mOverlayMetaText = null;
+  private ImageView mOverlayLogoView = null;
+  private String mOverlayLogoUrl = "";
+  private int mOverlayLogoRequestId = 0;
+  private Runnable mOverlayProgressRunnable = null;
+  private ObjectAnimator mOverlayRotationAnimator = null;
+  private ValueAnimator mOverlayPulseAnimator = null;
+  private long mOverlayShownAtMs = 0L;
+  private int mOverlayProgress = 0;
+  private long mDeferredRejectionGeneration = 1L << 62;
+
   private class DelayedIntent
   {
-    public Intent mIntent;
-    public int mDelay;
+    public final Intent mIntent;
+    public final int mDelay;
+    public final long mLifecycleToken;
+    public final String mPreparedRequestId;
 
-    public DelayedIntent(Intent intent, int delay) {
+    public DelayedIntent(
+        Intent intent, int delay, long lifecycleToken, String preparedRequestId) {
       mIntent = intent;
       mDelay = delay;
+      mLifecycleToken = lifecycleToken;
+      mPreparedRequestId = preparedRequestId == null ? "" : preparedRequestId;
     }
   }
   private ArrayList<DelayedIntent> mDelayedIntents = new ArrayList<>();
@@ -59,30 +163,43 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
     add("com.spocky.projengmenu"); // Projectivy Launcher
   }};
 
-  native void _onNewIntent(Intent intent);
+  native void _onNewIntent(long lifecycleToken, Intent intent, String preparedRequestId);
 
-  native void _onActivityResult(int requestCode, int resultCode, Intent resultData);
+  native void _onActivityResult(
+      long lifecycleToken, int requestCode, int resultCode, Intent resultData);
 
-  native void _doFrame(long frameTimeNanos);
+  native long _onBackCreated(boolean externalPlayerMode);
+  native void _onBackStarted(long lifecycleToken, int swipeEdge);
+  native void _onBackLongPress(long lifecycleToken);
+  native void _onBackCancelled(long lifecycleToken);
+  native void _onBackInvoked(long lifecycleToken);
+  native void _onBackDestroyed(long lifecycleToken);
 
-  native void _onVisibleBehindCanceled();
+  native void _doFrame(long lifecycleToken, long frameTimeNanos);
 
-  private Runnable leanbackUpdateRunnable = new Runnable()
-  {
-    @Override
-    public void run()
-    {
-      Log.d(TAG, "Main: Updating recommendations");
-      new Thread()
-      {
-        public void run()
-        {
-          mJsonRPC.updateLeanback(Main.this);
+  native void _onVisibleBehindCanceled(long lifecycleToken);
+
+  @SuppressWarnings("deprecation")
+  private static void normalizeLongExtraAsString(Intent intent, String name) {
+    if (intent == null || !intent.hasExtra(name) || intent.getExtras() == null) return;
+    Object value = intent.getExtras().get(name);
+    if (value instanceof Long) intent.putExtra(name, Long.toString((Long) value));
+  }
+
+  private Runnable leanbackUpdateRunnable =
+      new Runnable() {
+        @Override
+        public void run() {
+          Log.d(TAG, "Main: Updating recommendations");
+          new Thread() {
+            public void run() {
+              mJsonRPC.updateLeanback(Main.this);
+            }
+          }.start();
+          handler.postDelayed(
+              this, XBMCProperties.getIntProperty("xbmc.leanbackrefresh", 60 * 60) * 1000L);
         }
-      }.start();
-      handler.postDelayed(this, XBMCProperties.getIntProperty("xbmc.leanbackrefresh", 60 * 60) * 1000L);
-    }
-  };
+      };
 
   public Main()
   {
@@ -114,20 +231,57 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
   @Override
   public void onCreate(Bundle savedInstanceState)
   {
+    normalizeLongExtraAsString(getIntent(), "extra_position");
+    normalizeLongExtraAsString(getIntent(), "position");
+    normalizeLongExtraAsString(getIntent(), "startfrom");
+    if (getIntent().getData() != null && Intent.ACTION_VIEW.equals(getIntent().getAction()))
+      getIntent().putExtra("jumpgate_launched_at_ms", Long.toString(System.currentTimeMillis()));
+
+    // Detect external player mode BEFORE native engine starts so we can
+    // show the loading overlay before Kodi's native init renders anything
+    mExternalPlayerMode = getIntent().getBooleanExtra("external_player_mode", false);
+    if (mExternalPlayerMode) {
+      Log.d(TAG, "Main: External player mode activated");
+    }
+
+    String initialRequestId =
+        getIntent().getStringExtra(ExternalPlayerResultCoordinator.EXTRA_REQUEST_ID);
+    if (mExternalPlayerMode && !ExternalPlayerResultCoordinator.isValidRequestId(initialRequestId))
+      throw new IllegalStateException("External player launch has no valid result owner");
+    if (mExternalPlayerMode) {
+      if (!mExternalResultProducer.prepare(initialRequestId))
+        throw new IllegalStateException("External result request ownership preparation failed");
+    }
+
     System.loadLibrary("@APP_NAME_LC@");
 
+    mBackLifecycleToken = _onBackCreated(mExternalPlayerMode);
+    if (mBackLifecycleToken == 0)
+      throw new IllegalStateException("Native Back lifecycle creation failed");
     super.onCreate(savedInstanceState);
+    registerApi36BackCallback();
+
+    // Show loading overlay immediately — before any views or native rendering.
+    // Must be after super.onCreate() (window token needed) but before SurfaceView setup.
+    if (mExternalPlayerMode) {
+      showLoadingOverlay(getIntent());
+    }
 
     setContentView(R.layout.activity_main);
     setVolumeControlStream(AudioManager.STREAM_MUSIC);
 
-    mSettingsContentObserver = new XBMCSettingsContentObserver(this, handler);
+    mSettingsContentObserver =
+        new XBMCSettingsContentObserver(this, handler, mBackLifecycleToken);
     getApplicationContext().getContentResolver().registerContentObserver(android.provider.Settings.System.CONTENT_URI, true, mSettingsContentObserver);
 
-    // Delayed Intent
+    // Delayed Intent — wait for native engine to initialize before dispatching media URL
+    // External player mode skips addon migration/library scan, so it initializes faster
     if (getIntent().getData() != null)
     {
-      mDelayedIntents.add(new DelayedIntent(new Intent(getIntent()), 5000));
+      int delay = mExternalPlayerMode ? 2000 : 5000;
+      mDelayedIntents.add(
+          new DelayedIntent(
+              new Intent(getIntent()), delay, mBackLifecycleToken, initialRequestId));
       getIntent().setData(null);
     }
 
@@ -149,12 +303,16 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
     }
 
     // register the InputDeviceListener implementation
-    mInputDeviceListener = new XBMCInputDeviceListener();
+    mInputDeviceListener = new XBMCInputDeviceListener(mBackLifecycleToken);
     InputManager manager = (InputManager) getSystemService(INPUT_SERVICE);
     manager.registerInputDeviceListener(mInputDeviceListener, handler);
 
     mDecorView = getWindow().getDecorView();
-    mDecorView.setBackground(null);
+    // In external player mode, keep black background so native init isn't visible
+    // behind the loading overlay. Normal mode clears background for Kodi's own rendering.
+    if (!mExternalPlayerMode) {
+      mDecorView.setBackground(null);
+    }
     getWindow().takeSurface(null);
     setContentView(R.layout.activity_main);
     RelativeLayout videoLayout = findViewById(R.id.VideoLayout);
@@ -164,49 +322,106 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
     mMainView.setElevation(1);  // Always on Top
     videoLayout.addView(mMainView, layoutParams);
 
-    if (Build.VERSION.SDK_INT < 30)
+    registerLegacySystemUiVisibilityListener();
+  }
+
+  @SuppressWarnings("deprecation")
+  private void registerLegacySystemUiVisibilityListener()
+  {
+    if (Build.VERSION.SDK_INT >= 30)
+      return;
+
+    mDecorView.setOnSystemUiVisibilityChangeListener(new View.OnSystemUiVisibilityChangeListener()
     {
-      mDecorView.setOnSystemUiVisibilityChangeListener(new View.OnSystemUiVisibilityChangeListener()
+      @Override
+      public void onSystemUiVisibilityChange(int visibility)
       {
-        @Override
-        public void onSystemUiVisibilityChange(int visibility)
+        if ((visibility & View.SYSTEM_UI_FLAG_HIDE_NAVIGATION) == 0)
         {
-          if ((visibility & View.SYSTEM_UI_FLAG_HIDE_NAVIGATION) == 0)
+          handler.post(new Runnable()
           {
-            handler.post(new Runnable()
+            public void run()
             {
-              public void run()
-              {
-                // Immersive mode
-                mDecorView.setSystemUiVisibility(
-                        View.SYSTEM_UI_FLAG_LAYOUT_STABLE
-                                | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
-                                | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
-                                | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
-                                | View.SYSTEM_UI_FLAG_FULLSCREEN
-                                | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY);
-              }
-            });
-          }
+              mDecorView.setSystemUiVisibility(
+                  View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                      | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                      | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                      | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                      | View.SYSTEM_UI_FLAG_FULLSCREEN
+                      | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY);
+            }
+          });
         }
-      });
-    }
+      }
+    });
   }
 
   @Override
   protected void onNewIntent(Intent intent)
   {
     super.onNewIntent(intent);
+
+    normalizeLongExtraAsString(intent, "extra_position");
+    normalizeLongExtraAsString(intent, "position");
+    normalizeLongExtraAsString(intent, "startfrom");
+
+    if (intent.getData() != null && Intent.ACTION_VIEW.equals(intent.getAction()))
+      intent.putExtra("jumpgate_launched_at_ms", Long.toString(System.currentTimeMillis()));
+
+    // If we receive an ACTION_VIEW while already running, we're transitioning from
+    // standalone to external player mode. Track this so we return to standalone after playback.
+    boolean isActionView = intent.getData() != null
+            && Intent.ACTION_VIEW.equals(intent.getAction());
+    String externalRequestId =
+        intent.getStringExtra(ExternalPlayerResultCoordinator.EXTRA_REQUEST_ID);
+    if (isActionView && mExternalResultProducer.ownsRequest(externalRequestId)) {
+      Log.w(TAG, "Main: Ignoring duplicate external playback request " + externalRequestId);
+      return;
+    }
+    if (isActionView) {
+      if (!mExternalResultProducer.prepare(externalRequestId)) {
+        Log.e(TAG, "Main: Rejecting unowned external playback request " + externalRequestId);
+        return;
+      }
+    }
+    boolean wasAlreadyExternal = mExternalPlayerMode;
+
+    // Show loading overlay for external player transitions
+    if (isActionView)
+    {
+      showLoadingOverlay(intent);
+      Log.d(TAG, "Main: Loading overlay shown (warm transition)");
+    }
+
     // Delay until after Resume
     if (mPaused)
     {
       Log.d(TAG, "Main: onNewIntent (delayed)");
-      mDelayedIntents.add(new DelayedIntent(new Intent(intent), 500));
+      if (isActionView && !wasAlreadyExternal)
+      {
+        mPendingWasStandalone = true;
+      }
+      mDelayedIntents.add(
+          new DelayedIntent(
+              new Intent(intent),
+              500,
+              mBackLifecycleToken,
+              isActionView ? externalRequestId : ""));
     }
     else
     {
       Log.d(TAG, "Main: onNewIntent (immediate)");
-      _onNewIntent(intent);
+      if (isActionView)
+      {
+        if (!wasAlreadyExternal)
+        {
+          mWasStandalone = true;
+          Log.d(TAG, "Main: Warm transition to external player mode (standalone was running)");
+        }
+        mExternalPlayerMode = true;
+      }
+      _onNewIntent(
+          mBackLifecycleToken, intent, isActionView ? externalRequestId : "");
     }
   }
 
@@ -221,6 +436,7 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
   }
 
   @Override
+  @SuppressWarnings("deprecation")
   public void onResume()
   {
     super.onResume();
@@ -248,6 +464,14 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
     }
 
     // New intent ?
+    // If we had a pending warm-transition flag from onNewIntent, apply it now
+    if (mPendingWasStandalone)
+    {
+      mWasStandalone = true;
+      mExternalPlayerMode = true;
+      mPendingWasStandalone = false;
+      Log.d(TAG, "Main: Warm transition to external player mode (delayed, standalone was running)");
+    }
     for (final DelayedIntent delayedIntent : mDelayedIntents)
     {
       handler.postDelayed(new Runnable()
@@ -257,7 +481,10 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
         {
           try
           {
-            _onNewIntent(delayedIntent.mIntent);
+            _onNewIntent(
+                delayedIntent.mLifecycleToken,
+                delayedIntent.mIntent,
+                delayedIntent.mPreparedRequestId);
           }
           catch (UnsatisfiedLinkError e)
           {
@@ -289,12 +516,92 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
                                Intent resultData)
   {
     super.onActivityResult(requestCode, resultCode, resultData);
-    _onActivityResult(requestCode, resultCode, resultData);
+    _onActivityResult(mBackLifecycleToken, requestCode, resultCode, resultData);
+  }
+
+  private void registerApi36BackCallback()
+  {
+    if (Build.VERSION.SDK_INT < 36 || mOnBackAnimationCallback != null)
+      return;
+
+    mOnBackAnimationCallback = PredictiveBackApi36.register(this, mBackLifecycleToken);
+  }
+
+  private void unregisterApi36BackCallback()
+  {
+    Object callback = mOnBackAnimationCallback;
+    mOnBackAnimationCallback = null;
+    if (Build.VERSION.SDK_INT < 36 || callback == null)
+      return;
+
+    PredictiveBackApi36.unregister(this, callback);
+  }
+
+  @TargetApi(36)
+  private static final class PredictiveBackApi36
+  {
+    static Object register(final Main activity, final long lifecycleToken)
+    {
+      OnBackAnimationCallback callback = new OnBackAnimationCallback()
+      {
+        @Override
+        public void onBackStarted(BackEvent backEvent)
+        {
+          int swipeEdge = backEvent.getSwipeEdge();
+          int source = BACK_SOURCE_GESTURE_LEFT;
+          if (swipeEdge == BackEvent.EDGE_RIGHT)
+            source = BACK_SOURCE_GESTURE_RIGHT;
+          else if (swipeEdge == BackEvent.EDGE_NONE)
+            source = BACK_SOURCE_BUTTON;
+          activity.handler.removeCallbacks(activity.mBackLongPressRunnable);
+          activity._onBackStarted(lifecycleToken, source);
+          if (swipeEdge == BackEvent.EDGE_NONE)
+            activity.handler.postDelayed(
+                activity.mBackLongPressRunnable, BACK_LONG_PRESS_THRESHOLD_MS);
+        }
+
+        @Override
+        public void onBackCancelled()
+        {
+          activity.handler.removeCallbacks(activity.mBackLongPressRunnable);
+          activity._onBackCancelled(lifecycleToken);
+        }
+
+        @Override
+        public void onBackInvoked()
+        {
+          activity.handler.removeCallbacks(activity.mBackLongPressRunnable);
+          activity._onBackInvoked(lifecycleToken);
+        }
+      };
+      activity.getOnBackInvokedDispatcher().registerOnBackInvokedCallback(
+          OnBackInvokedDispatcher.PRIORITY_DEFAULT, callback);
+      return callback;
+    }
+
+    static void unregister(Main activity, Object callback)
+    {
+      activity.getOnBackInvokedDispatcher().unregisterOnBackInvokedCallback(
+          (OnBackAnimationCallback) callback);
+    }
+  }
+
+  public long getBackLifecycleToken()
+  {
+    return mBackLifecycleToken;
   }
 
   @Override
   public void onDestroy()
   {
+    handler.removeCallbacks(mBackLongPressRunnable);
+    unregisterApi36BackCallback();
+    terminalizeExternalPlayerResultForTeardown();
+    final long lifecycleToken = mBackLifecycleToken;
+    mBackLifecycleToken = 0;
+    if (lifecycleToken != 0)
+      _onBackDestroyed(lifecycleToken);
+
     TvUtil.cancelAllScheduledJobs(this);
 
     // unregister the InputDeviceListener implementation
@@ -302,8 +609,15 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
     manager.unregisterInputDeviceListener(mInputDeviceListener);
 
     getApplicationContext().getContentResolver().unregisterContentObserver(mSettingsContentObserver);
+    if (MainActivity == this)
+    {
+      MainActivity = null;
+      mActivityRunning = false;
+      Intent wakeup = new Intent(ExternalPlayerResultCoordinator.ACTION_MAIN_DESTROYED);
+      wakeup.setPackage(getPackageName());
+      getApplicationContext().sendBroadcast(wakeup);
+    }
     super.onDestroy();
-    mActivityRunning = false;
   }
 
   public static boolean isActivityRunning() {
@@ -314,7 +628,7 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
   @SuppressWarnings("deprecation")
   public void onVisibleBehindCanceled()
   {
-    _onVisibleBehindCanceled();
+    _onVisibleBehindCanceled(mBackLifecycleToken);
     super.onVisibleBehindCanceled();
   }
 
@@ -322,7 +636,7 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
   public void doFrame(long frameTimeNanos)
   {
     Choreographer.getInstance().postFrameCallback(this);
-    _doFrame(frameTimeNanos);
+    _doFrame(mBackLifecycleToken, frameTimeNanos);
   }
 
   private native void _callNative(long funcAddr, long variantAddr);
@@ -351,5 +665,1472 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
       name = res.activityInfo.packageName;
     }
     return name;
+  }
+
+  // --- External Player Mode ---
+
+  private void postNativeExternalIntentRetry(
+      long lifecycleToken, Intent intent, String preparedRequestId) {
+    if (intent == null
+        || lifecycleToken == 0
+        || lifecycleToken != mBackLifecycleToken
+        || intent.getIntExtra(NATIVE_INTENT_RETRY, 0) >= MAX_NATIVE_INTENT_RETRIES) {
+      postDeferredExternalPlayerRejection(lifecycleToken, preparedRequestId);
+      return;
+    }
+
+    final Intent retryIntent = new Intent(intent);
+    retryIntent.putExtra(
+        NATIVE_INTENT_RETRY, intent.getIntExtra(NATIVE_INTENT_RETRY, 0) + 1);
+    final String exactRequestId = preparedRequestId == null ? "" : preparedRequestId;
+    if (!handler.postDelayed(
+        () -> {
+          if (lifecycleToken != mBackLifecycleToken) {
+            postDeferredExternalPlayerRejection(lifecycleToken, exactRequestId);
+            return;
+          }
+          _onNewIntent(lifecycleToken, retryIntent, exactRequestId);
+        },
+        16L)) {
+      postDeferredExternalPlayerRejection(lifecycleToken, exactRequestId);
+    }
+  }
+
+  private void postDeferredExternalPlayerRejection(
+      long lifecycleToken, String preparedRequestId) {
+    if (!ExternalPlayerResultCoordinator.isValidRequestId(preparedRequestId)) return;
+
+    final long generation;
+    synchronized (this) {
+      if (lifecycleToken != mBackLifecycleToken
+          || !mExternalResultProducer.isPrepared(preparedRequestId)) return;
+      generation = mDeferredRejectionGeneration++;
+    }
+
+    Runnable rejection = () -> rejectExternalPlayerResult(generation, preparedRequestId);
+    if (!handler.post(rejection)) {
+      // At most one exact prepared request can own this Main instance, so this
+      // fallback is bounded even while its Looper is shutting down.
+      new Thread(rejection, "jumpgate-result-rejection").start();
+    }
+  }
+
+  public synchronized boolean beginExternalPlayerMode(
+      long generation, String requestId, boolean wasStandalone) {
+    ExternalPlayerResultCoordinator.Admission admission =
+        mExternalResultProducer.admitPrepared(generation, requestId);
+    if (admission == null) {
+      Log.e(TAG, "Main: External playback lacked exact prepared request ownership");
+      return true;
+    }
+
+    boolean cancellationRequested = admission.wasCancellationRequested();
+    ExternalPlayerResultCoordinator.Owner owner =
+        ExternalPlayerResultStore.bindActive(this, requestId, generation);
+    if (owner == null) {
+      Log.e(
+          TAG,
+          "Main: External playback has no forwarded result owner for generation " + generation);
+      mExternalResultProducer.cancelOwner(generation, requestId);
+      cancellationRequested = true;
+    } else if (owner.wasCanceled()) {
+      mExternalResultProducer.cancelOwner(generation, requestId);
+      cancellationRequested = true;
+    }
+
+    mExternalPlayerMode = true;
+    mWasStandalone = wasStandalone;
+    return cancellationRequested;
+  }
+
+  public synchronized boolean isExternalPlayerResultCanceled(long generation, String requestId) {
+    return mExternalResultProducer.isOwnerCanceled(generation, requestId);
+  }
+
+  public synchronized boolean recordEarlyExternalPlayerBack() {
+    return mExternalResultProducer.cancelEarlyBack();
+  }
+
+  public void postExternalPlayerCancellationResult(
+      long generation, String requestId, boolean wasStandalone) {
+    handler.post(
+        () -> exitExternalPlayerMode(generation, requestId, 0, 0, false, wasStandalone));
+  }
+
+  private boolean publishExternalPlayerTerminalOrClearCanceledOwner(
+      ExternalPlayerResultCoordinator.Terminal terminal) {
+    ExternalPlayerResultCoordinator.Owner owner =
+        ExternalPlayerResultStore.readOwner(this, terminal.requestId);
+    if (owner != null
+        && owner.expectedGeneration() == terminal.generation
+        && owner.wasCanceled()) {
+      return ExternalPlayerResultStore.clear(this, terminal.requestId, terminal.generation);
+    }
+    return ExternalPlayerResultStore.publish(this, terminal);
+  }
+
+  private synchronized void terminalizeExternalPlayerResultForTeardown() {
+    String preparedRequestId = mExternalResultProducer.preparedRequestId();
+    if (ExternalPlayerResultCoordinator.isValidRequestId(preparedRequestId))
+      rejectExternalPlayerResult(mDeferredRejectionGeneration++, preparedRequestId);
+
+    long activeGeneration = mExternalResultProducer.activeGeneration();
+    String activeRequestId = mExternalResultProducer.activeRequestId();
+    if (activeGeneration <= 0
+        || !ExternalPlayerResultCoordinator.isValidRequestId(activeRequestId)) return;
+
+    ExternalPlayerResultCoordinator.TerminalReservation reservation =
+        mExternalResultProducer.reserveFinish(
+            activeGeneration,
+            activeRequestId,
+            mLastPlaybackPosition,
+            mLastPlaybackDuration,
+            false,
+            false);
+    if (reservation == null) return;
+
+    ExternalPlayerResultCoordinator.Terminal terminal = reservation.terminal();
+    if (!publishExternalPlayerTerminalOrClearCanceledOwner(terminal)) {
+      reservation.rollback();
+      Log.e(TAG, "Main: Could not persist exact teardown terminal");
+      return;
+    }
+    if (!reservation.commit())
+      throw new IllegalStateException("Exact teardown terminal reservation changed");
+  }
+
+  public synchronized void supersedeExternalPlayerResult(long generation, String requestId) {
+    ExternalPlayerResultCoordinator.TerminalReservation reservation =
+        mExternalResultProducer.reserveSupersede(generation, requestId);
+    if (reservation == null) {
+      Log.d(TAG, "Main: Ignoring stale external player supersession " + generation);
+      return;
+    }
+
+    if (!publishExternalPlayerTerminalOrClearCanceledOwner(reservation.terminal())) {
+      reservation.rollback();
+      Log.e(TAG, "Main: Could not persist superseded external player result");
+      return;
+    }
+    if (!reservation.commit())
+      throw new IllegalStateException("Exact supersession reservation changed");
+  }
+
+  public synchronized void rejectExternalPlayerResult(long generation, String requestId) {
+    ExternalPlayerResultCoordinator.TerminalReservation reservation =
+        mExternalResultProducer.reservePreparedRejection(generation, requestId);
+    if (reservation == null) {
+      Log.d(TAG, "Main: Ignoring stale prepared rejection " + generation);
+      return;
+    }
+
+    ExternalPlayerResultCoordinator.Owner owner =
+        ExternalPlayerResultStore.bind(this, requestId, generation);
+    if (owner == null) {
+      reservation.rollback();
+      Log.e(TAG, "Main: Rejected playback has no exact result owner " + generation);
+      return;
+    }
+    if (owner.wasCanceled()) {
+      if (!ExternalPlayerResultStore.clear(this, requestId, generation)) {
+        reservation.rollback();
+        Log.e(TAG, "Main: Could not clear exact canceled rejected owner " + generation);
+        return;
+      }
+    } else if (!ExternalPlayerResultStore.publish(this, reservation.terminal())) {
+      reservation.rollback();
+      Log.e(TAG, "Main: Could not persist rejected external player result");
+      return;
+    }
+    if (!reservation.commit())
+      throw new IllegalStateException("Exact prepared rejection reservation changed");
+  }
+
+  /**
+   * Called from native code when playback position updates
+   */
+  public void updatePlaybackPosition(long positionMs, long durationMs) {
+    mLastPlaybackPosition = positionMs;
+    mLastPlaybackDuration = durationMs;
+
+    if (mLoadingOverlay == null) {
+      return;
+    }
+
+    runOnUiThread(() -> {
+      if (mLoadingOverlay == null) {
+        return;
+      }
+
+      if (durationMs > 0 && mOverlayProgress < 88) {
+        setLoadingOverlayProgress(88);
+      }
+
+      if (positionMs > 0) {
+        setLoadingOverlayStatus("Jumpgate lock acquired. Rendering first frames...");
+        setLoadingOverlayProgress(Math.max(mOverlayProgress, 96));
+      } else if (durationMs > 0) {
+        setLoadingOverlayStatus("Manifest decoded. Priming video pipeline...");
+      }
+    });
+  }
+
+  /**
+   * Called from native code when external player mode should exit. Sets the result intent with
+   * VLC/MX Player compatible extras.
+   *
+   * @param generation exact native playback generation owning this result.
+   * @param requestId exact result-owner activity request bound to {@code generation}.
+   * @param wasStandalone if true, returns to standalone Kodi instead of killing the process. This
+   *     is set when external player was launched from an already-running standalone Kodi instance
+   *     (warm-transition via onNewIntent).
+   */
+  public synchronized void exitExternalPlayerMode(
+      long generation,
+      String requestId,
+      long positionMs,
+      long durationMs,
+      boolean completed,
+      boolean wasStandalone) {
+    if (generation != mExternalResultProducer.activeGeneration()
+        || !mExternalResultProducer.activeRequestId().equals(requestId)) {
+      Log.d(TAG, "Main: Ignoring stale external player result generation " + generation);
+      return;
+    }
+
+    ExternalPlayerResultCoordinator.TerminalReservation reservation =
+        mExternalResultProducer.reserveFinish(
+            generation, requestId, positionMs, durationMs, completed, !wasStandalone);
+    if (reservation == null) {
+      Log.d(TAG, "Main: Ignoring stale external player result generation " + generation);
+      return;
+    }
+
+    ExternalPlayerResultCoordinator.Owner durableOwner =
+        ExternalPlayerResultStore.readOwner(this, requestId);
+    boolean ownerCanceled = mExternalResultProducer.isOwnerCanceled(generation, requestId);
+    boolean callerAlreadyCanceled =
+        ownerCanceled
+            && durableOwner != null
+            && durableOwner.expectedGeneration() == generation
+            && durableOwner.wasCanceled();
+    boolean canceledExitAcknowledged = false;
+    boolean durable;
+    if (callerAlreadyCanceled) {
+      if (wasStandalone) {
+        durable = ExternalPlayerResultStore.clear(this, requestId, generation);
+      } else {
+        canceledExitAcknowledged =
+            ExternalPlayerResultStore.acknowledgeCanceledExit(this, requestId, generation);
+        durable = canceledExitAcknowledged;
+      }
+    } else {
+      durable = ExternalPlayerResultStore.publish(this, reservation.terminal());
+    }
+    if (!durable) {
+      reservation.rollback();
+      Log.e(TAG, "Main: Could not persist external player result " + generation);
+      return;
+    }
+    if (!reservation.commit())
+      throw new IllegalStateException("Exact external player terminal reservation changed");
+
+    Log.d(
+        TAG,
+        "Main: Exiting external player mode. pos="
+            + positionMs
+            + " dur="
+            + durationMs
+            + " completed="
+            + completed
+            + " wasStandalone="
+            + wasStandalone);
+
+    if (wasStandalone) {
+      // Warm-transition: return to standalone Kodi.
+      // Do NOT finish Main (it stays alive as standalone Kodi).
+      // Do NOT kill the process (native engine keeps running).
+      mExternalPlayerMode = false;
+      mExternalResultProducer.clear(generation, requestId);
+      mWasStandalone = false;
+      // Hide loading overlay so Kodi home screen is visible again
+      hideLoadingOverlay();
+      Log.d(TAG, "Main: Returning to standalone mode after external player");
+    } else {
+      // The result-owner activity acknowledges only after it has set its caller result and
+      // requested finish. Until that exact acknowledgement, keep the process alive so recreation
+      // can consume the durable terminal.
+      mExternalPlayerMode = false;
+      finish();
+      if (callerAlreadyCanceled && canceledExitAcknowledged)
+        scheduleExternalPlayerProcessExit(generation, requestId);
+    }
+  }
+
+  public static boolean acknowledgeExternalPlayerResult(long generation, String requestId) {
+    Main activity = MainActivity;
+    return activity != null
+        && activity.acknowledgeExternalPlayerResultInternal(generation, requestId);
+  }
+
+  private synchronized boolean acknowledgeExternalPlayerResultInternal(
+      long generation, String requestId) {
+    if (mExternalPlayerMode || !mExternalResultProducer.acknowledgeExit(generation, requestId))
+      return false;
+
+    return scheduleExternalPlayerProcessExit(generation, requestId);
+  }
+
+  public static boolean cancelExternalPlayerResult(long generation, String requestId) {
+    Main activity = MainActivity;
+    return activity != null && activity.cancelExternalPlayerResultInternal(generation, requestId);
+  }
+
+  private synchronized boolean cancelExternalPlayerResultInternal(
+      long generation, String requestId) {
+    return mExternalResultProducer.cancelOwner(generation, requestId);
+  }
+
+  private boolean scheduleExternalPlayerProcessExit(long generation, String requestId) {
+    if (!mExternalResultProducer.claimProcessExit(generation, requestId)) return false;
+
+    final long acknowledgedGeneration = generation;
+    final String acknowledgedRequestId = requestId;
+    return handler.post(
+        () -> {
+          synchronized (Main.this) {
+            if (!mExternalResultProducer.shouldExitProcess(
+                    acknowledgedGeneration, acknowledgedRequestId)
+                || mExternalPlayerMode) {
+              Log.d(TAG, "Main: Skipping stale external player process exit");
+              return;
+            }
+          }
+          ExternalPlayerResultStore.executeAcknowledgedProcessExit(
+              Main.this,
+              acknowledgedRequestId,
+              acknowledgedGeneration,
+              () -> {
+                Log.d(TAG, "Main: Killing process after acknowledged external player result");
+                android.os.Process.killProcess(android.os.Process.myPid());
+              });
+        });
+  }
+
+  /**
+   * Shows a cinematic Jumpgate loading overlay above the SurfaceView.
+   * Uses WindowManager so it stays above XBMCMainView's Surface layer.
+   */
+  private void showLoadingOverlay(Intent sourceIntent) {
+    if (mLoadingOverlay != null) {
+      updateLoadingOverlayMetadata(sourceIntent);
+      setLoadingOverlayStatus("Re-linking jumpgate route...");
+      setLoadingOverlayProgress(Math.max(mOverlayProgress, 12));
+      return;
+    }
+
+    mWindowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
+
+    FrameLayout overlay = new FrameLayout(this);
+    overlay.setBackgroundColor(Color.BLACK);
+
+    View backdrop = new View(this);
+    GradientDrawable backdropGradient = new GradientDrawable(
+        GradientDrawable.Orientation.TOP_BOTTOM,
+        new int[] {
+            Color.parseColor("#0B2B63"),
+            Color.parseColor("#071A3E"),
+            Color.parseColor("#040A1A")
+        });
+    backdrop.setBackground(backdropGradient);
+    backdrop.setAlpha(0.98f);
+    overlay.addView(backdrop, new FrameLayout.LayoutParams(
+        FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+
+    View haze = new View(this);
+    GradientDrawable hazeGradient = new GradientDrawable(
+        GradientDrawable.Orientation.TL_BR,
+        new int[] {
+            Color.parseColor("#0047B5FF"),
+            Color.parseColor("#332D86FF"),
+            Color.parseColor("#00168BE8")
+        });
+    haze.setBackground(hazeGradient);
+    haze.setAlpha(0.40f);
+    overlay.addView(haze, new FrameLayout.LayoutParams(
+        FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+
+    FrameLayout gateContainer = new FrameLayout(this);
+    FrameLayout.LayoutParams gateContainerParams = new FrameLayout.LayoutParams(dp(132), dp(132));
+    gateContainerParams.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
+    gateContainerParams.topMargin = dp(88);
+    overlay.addView(gateContainer, gateContainerParams);
+
+    View gateRing = new View(this);
+    GradientDrawable gateRingDrawable = new GradientDrawable();
+    gateRingDrawable.setShape(GradientDrawable.OVAL);
+    gateRingDrawable.setColor(Color.TRANSPARENT);
+    // Kodi-ish blue accent for the jumpgate ring.
+    gateRingDrawable.setStroke(dp(3), Color.parseColor("#C217B2E7"));
+    gateRing.setBackground(gateRingDrawable);
+    gateContainer.addView(gateRing, new FrameLayout.LayoutParams(
+        FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+    mOverlayGateRing = gateRing;
+
+    View gatePulse = new View(this);
+    GradientDrawable gatePulseDrawable = new GradientDrawable();
+    gatePulseDrawable.setShape(GradientDrawable.OVAL);
+    gatePulseDrawable.setColor(Color.TRANSPARENT);
+    gatePulseDrawable.setStroke(dp(2), Color.parseColor("#8A17B2E7"));
+    gatePulse.setBackground(gatePulseDrawable);
+    gatePulse.setScaleX(0.86f);
+    gatePulse.setScaleY(0.86f);
+    gateContainer.addView(gatePulse, new FrameLayout.LayoutParams(
+        FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+    mOverlayGatePulse = gatePulse;
+
+    LinearLayout content = new LinearLayout(this);
+    content.setOrientation(LinearLayout.VERTICAL);
+    content.setGravity(Gravity.CENTER_HORIZONTAL);
+    FrameLayout.LayoutParams contentParams = new FrameLayout.LayoutParams(
+        FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT);
+    contentParams.gravity = Gravity.TOP;
+    contentParams.topMargin = dp(248);
+    contentParams.leftMargin = dp(24);
+    contentParams.rightMargin = dp(24);
+    overlay.addView(content, contentParams);
+
+    TextView badge = new TextView(this);
+    badge.setText("JUMPGATE BRIDGE");
+    badge.setTextColor(Color.parseColor("#BED6FF"));
+    badge.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
+    badge.setLetterSpacing(0.28f);
+    badge.setAllCaps(true);
+    badge.setGravity(Gravity.CENTER);
+    content.addView(badge);
+
+    ImageView logoView = new ImageView(this);
+    logoView.setAdjustViewBounds(true);
+    logoView.setScaleType(ImageView.ScaleType.FIT_CENTER);
+    logoView.setVisibility(View.GONE);
+    LinearLayout.LayoutParams logoParams = new LinearLayout.LayoutParams(
+        LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+    logoParams.topMargin = dp(14);
+    logoView.setMaxHeight(dp(74));
+    content.addView(logoView, logoParams);
+    mOverlayLogoView = logoView;
+
+    TextView title = new TextView(this);
+    title.setTextColor(Color.WHITE);
+    // Slightly smaller to avoid oversized token-like or proxy-derived titles.
+    title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
+    title.setTypeface(title.getTypeface(), android.graphics.Typeface.BOLD);
+    title.setGravity(Gravity.CENTER);
+    title.setMaxLines(2);
+    title.setEllipsize(TextUtils.TruncateAt.END);
+    LinearLayout.LayoutParams titleParams = new LinearLayout.LayoutParams(
+        LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+    titleParams.topMargin = dp(12);
+    content.addView(title, titleParams);
+    mOverlayTitleText = title;
+
+    TextView meta = new TextView(this);
+    meta.setTextColor(Color.parseColor("#C2D9FF"));
+    meta.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+    meta.setGravity(Gravity.CENTER);
+    meta.setAllCaps(true);
+    LinearLayout.LayoutParams metaParams = new LinearLayout.LayoutParams(
+        LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+    metaParams.topMargin = dp(6);
+    content.addView(meta, metaParams);
+    mOverlayMetaText = meta;
+
+    TextView status = new TextView(this);
+    status.setTextColor(Color.parseColor("#E2EEFF"));
+    status.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+    status.setGravity(Gravity.CENTER);
+    status.setMaxLines(2);
+    status.setEllipsize(TextUtils.TruncateAt.END);
+    LinearLayout.LayoutParams statusParams = new LinearLayout.LayoutParams(
+        LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+    statusParams.topMargin = dp(22);
+    content.addView(status, statusParams);
+    mOverlayStatusText = status;
+
+    FrameLayout progressTrack = new FrameLayout(this);
+    GradientDrawable progressTrackDrawable = new GradientDrawable();
+    progressTrackDrawable.setShape(GradientDrawable.RECTANGLE);
+    progressTrackDrawable.setCornerRadius(dp(8));
+    progressTrackDrawable.setColor(Color.parseColor("#243D66"));
+    progressTrackDrawable.setStroke(dp(1), Color.parseColor("#5D83B8"));
+    progressTrack.setBackground(progressTrackDrawable);
+    LinearLayout.LayoutParams progressTrackParams = new LinearLayout.LayoutParams(
+        LinearLayout.LayoutParams.MATCH_PARENT, dp(16));
+    progressTrackParams.topMargin = dp(20);
+    progressTrackParams.leftMargin = dp(18);
+    progressTrackParams.rightMargin = dp(18);
+    content.addView(progressTrack, progressTrackParams);
+
+    View progressFill = new View(this);
+    GradientDrawable progressFillDrawable = new GradientDrawable(
+        GradientDrawable.Orientation.LEFT_RIGHT,
+        new int[] {
+            Color.parseColor("#1FD2FF"),
+            Color.parseColor("#17B2E7"),
+            Color.parseColor("#1A7DD8")
+        });
+    progressFillDrawable.setCornerRadius(dp(7));
+    progressFill.setBackground(progressFillDrawable);
+    FrameLayout.LayoutParams progressFillParams = new FrameLayout.LayoutParams(
+        FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT);
+    progressTrack.addView(progressFill, progressFillParams);
+    progressFill.setPivotX(0f);
+    progressFill.setScaleX(0f);
+    mOverlayProgressFill = progressFill;
+
+    TextView percent = new TextView(this);
+    percent.setTextColor(Color.parseColor("#D6E8FF"));
+    percent.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+    percent.setGravity(Gravity.CENTER);
+    LinearLayout.LayoutParams percentParams = new LinearLayout.LayoutParams(
+        LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+    percentParams.topMargin = dp(10);
+    content.addView(percent, percentParams);
+    mOverlayPercentText = percent;
+
+    updateLoadingOverlayMetadata(sourceIntent);
+    setLoadingOverlayStatus("Opening jumpgate channel...");
+    setLoadingOverlayProgress(8);
+
+    WindowManager.LayoutParams params = new WindowManager.LayoutParams(
+        WindowManager.LayoutParams.MATCH_PARENT,
+        WindowManager.LayoutParams.MATCH_PARENT,
+        WindowManager.LayoutParams.TYPE_APPLICATION,
+        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+            | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+            | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+        PixelFormat.OPAQUE);
+
+    mWindowManager.addView(overlay, params);
+    mLoadingOverlay = overlay;
+    mOverlayShownAtMs = System.currentTimeMillis();
+    Log.d(TAG, "Main: Jumpgate loading overlay shown");
+
+    startLoadingOverlayAnimations();
+    startLoadingOverlayProgressTicker();
+
+    // Safety timeout: never permanently block the player view.
+    handler.postDelayed(() -> hideLoadingOverlay(), 30000);
+  }
+
+  /**
+   * Called from native code when playback actually starts.
+   * Removes the WindowManager overlay to reveal the video surface.
+   */
+  public void hideLoadingOverlay() {
+    runOnUiThread(() -> {
+      if (mOverlayProgressRunnable != null) {
+        handler.removeCallbacks(mOverlayProgressRunnable);
+        mOverlayProgressRunnable = null;
+      }
+
+      if (mOverlayRotationAnimator != null) {
+        mOverlayRotationAnimator.cancel();
+        mOverlayRotationAnimator = null;
+      }
+
+      if (mOverlayPulseAnimator != null) {
+        mOverlayPulseAnimator.cancel();
+        mOverlayPulseAnimator = null;
+      }
+
+      if (mLoadingOverlay != null && mWindowManager != null) {
+        mWindowManager.removeView(mLoadingOverlay);
+        mLoadingOverlay = null;
+        mOverlayGateRing = null;
+        mOverlayGatePulse = null;
+        mOverlayProgressFill = null;
+        mOverlayStatusText = null;
+        mOverlayPercentText = null;
+        mOverlayTitleText = null;
+        mOverlayMetaText = null;
+        mOverlayLogoView = null;
+        mOverlayLogoUrl = "";
+        mOverlayLogoRequestId = 0;
+        mOverlayProgress = 0;
+        Log.d(TAG, "Main: Loading overlay hidden (playback started)");
+      }
+    });
+  }
+
+  private void startLoadingOverlayAnimations() {
+    if (mOverlayGateRing != null) {
+      mOverlayRotationAnimator = ObjectAnimator.ofFloat(mOverlayGateRing, View.ROTATION, 0f, 360f);
+      mOverlayRotationAnimator.setDuration(2600L);
+      mOverlayRotationAnimator.setInterpolator(new LinearInterpolator());
+      mOverlayRotationAnimator.setRepeatCount(ValueAnimator.INFINITE);
+      mOverlayRotationAnimator.start();
+    }
+
+    if (mOverlayGatePulse != null) {
+      mOverlayPulseAnimator = ValueAnimator.ofFloat(0.86f, 1.12f);
+      mOverlayPulseAnimator.setDuration(1250L);
+      mOverlayPulseAnimator.setRepeatMode(ValueAnimator.REVERSE);
+      mOverlayPulseAnimator.setRepeatCount(ValueAnimator.INFINITE);
+      mOverlayPulseAnimator.addUpdateListener(animator -> {
+        if (mOverlayGatePulse == null) {
+          return;
+        }
+        float scale = (float) animator.getAnimatedValue();
+        mOverlayGatePulse.setScaleX(scale);
+        mOverlayGatePulse.setScaleY(scale);
+        mOverlayGatePulse.setAlpha(0.30f + ((scale - 0.86f) / 0.26f) * 0.45f);
+      });
+      mOverlayPulseAnimator.start();
+    }
+  }
+
+  private void startLoadingOverlayProgressTicker() {
+    if (mOverlayProgressRunnable != null) {
+      handler.removeCallbacks(mOverlayProgressRunnable);
+    }
+
+    mOverlayProgressRunnable = new Runnable() {
+      @Override
+      public void run() {
+        if (mLoadingOverlay == null) {
+          return;
+        }
+
+        long elapsedMs = System.currentTimeMillis() - mOverlayShownAtMs;
+        int targetProgress;
+        String status;
+
+        if (elapsedMs < 1200L) {
+          targetProgress = 14;
+          status = "Opening jumpgate channel...";
+        } else if (elapsedMs < 2600L) {
+          targetProgress = 30;
+          status = "Negotiating source tunnel...";
+        } else if (elapsedMs < 4500L) {
+          targetProgress = 48;
+          status = "Locking codecs and container map...";
+        } else if (elapsedMs < 7000L) {
+          targetProgress = 66;
+          status = "Syncing bridge metadata and resume markers...";
+        } else if (elapsedMs < 10000L) {
+          targetProgress = 78;
+          status = "Spooling first packets...";
+        } else if (elapsedMs < 15000L) {
+          targetProgress = 87;
+          status = "Buffering first video frame...";
+        } else {
+          targetProgress = 92;
+          status = "Waiting for decoder warm-up...";
+        }
+
+        if (mLastPlaybackDuration > 0) {
+          targetProgress = Math.max(targetProgress, 88);
+          status = "Manifest decoded. Priming video pipeline...";
+        }
+        if (mLastPlaybackPosition > 0) {
+          targetProgress = Math.max(targetProgress, 96);
+          status = "Jumpgate lock acquired. Rendering first frames...";
+        }
+
+        setLoadingOverlayStatus(status);
+        if (targetProgress > mOverlayProgress) {
+          setLoadingOverlayProgress(Math.min(97, targetProgress));
+        }
+
+        handler.postDelayed(this, 300L);
+      }
+    };
+
+    handler.post(mOverlayProgressRunnable);
+  }
+
+  private void setLoadingOverlayStatus(String status) {
+    if (mOverlayStatusText != null) {
+      mOverlayStatusText.setText(status);
+    }
+  }
+
+  private void setLoadingOverlayProgress(int progress) {
+    int safeProgress = Math.max(0, Math.min(progress, 100));
+    mOverlayProgress = safeProgress;
+
+    if (mOverlayProgressFill != null) {
+      mOverlayProgressFill.setScaleX(safeProgress / 100f);
+    }
+
+    if (mOverlayPercentText != null) {
+      mOverlayPercentText.setText(String.format(Locale.US, "%d%%", safeProgress));
+    }
+  }
+
+  private void updateLoadingOverlayMetadata(Intent intent) {
+    if (mOverlayTitleText != null) {
+      String derivedTitle = deriveOverlayTitle(intent);
+      mOverlayTitleText.setText(derivedTitle);
+      Log.d(TAG, "Main: Jumpgate overlay title: " + derivedTitle);
+    }
+    if (mOverlayMetaText != null) {
+      mOverlayMetaText.setText(deriveOverlayMeta(intent));
+    }
+  }
+
+  private String deriveOverlayTitle(Intent intent) {
+    String title = getExtraString(intent, "_mk_title");
+    if (TextUtils.isEmpty(title)) {
+      title = getExtraString(intent, Intent.EXTRA_TITLE);
+    }
+    if (TextUtils.isEmpty(title)) {
+      title = getExtraString(intent, "title");
+    }
+    if (TextUtils.isEmpty(title)) {
+      String uriTitle = extractTitleFromUri(intent != null ? intent.getData() : null);
+      if (!TextUtils.isEmpty(uriTitle) && !isLikelyLowConfidenceUriTitle(uriTitle)) {
+        title = uriTitle;
+      }
+    }
+
+    if (!TextUtils.isEmpty(title) && isLikelyOpaqueTokenTitle(title)) {
+      title = "";
+    }
+
+    if (TextUtils.isEmpty(title)) {
+      title = "Identifying...";
+    }
+    return title;
+  }
+
+  /**
+   * Called from native code when content identification completes (or improves).
+   * Updates overlay title/meta without relying on intent token-derived strings.
+   */
+  public void updateLoadingOverlayContentInfo(final String title, final String meta, final String logoUrl) {
+    if (mLoadingOverlay == null) {
+      return;
+    }
+
+    runOnUiThread(() -> {
+      if (mLoadingOverlay == null) {
+        return;
+      }
+
+      String safeTitle = title != null ? title.trim() : "";
+      if (TextUtils.isEmpty(safeTitle) || isLikelyOpaqueTokenTitle(safeTitle)) {
+        safeTitle = "Identifying...";
+      }
+
+      if (mOverlayTitleText != null) {
+        mOverlayTitleText.setText(safeTitle);
+        mOverlayTitleText.setVisibility(View.VISIBLE);
+      }
+
+      String safeMeta = meta != null ? meta.trim() : "";
+      if (!TextUtils.isEmpty(safeMeta) && !isLikelyOpaqueTokenTitle(safeMeta) && mOverlayMetaText != null) {
+        mOverlayMetaText.setText(safeMeta);
+      }
+
+      final boolean isEpisode = isEpisodeMeta(safeMeta);
+      loadOverlayLogo(logoUrl, isEpisode);
+    });
+  }
+
+  private boolean isEpisodeMeta(String meta) {
+    if (TextUtils.isEmpty(meta)) {
+      return false;
+    }
+    return meta.matches("(?i).*\\bS\\d{1,2}E\\d{1,2}\\b.*");
+  }
+
+  private boolean isAllowedLogoUrl(String rawUrl) {
+    if (TextUtils.isEmpty(rawUrl)) {
+      return false;
+    }
+    try {
+      Uri u = Uri.parse(rawUrl);
+      String scheme = u.getScheme();
+      String host = u.getHost();
+      return "https".equalsIgnoreCase(scheme)
+          && host != null
+          && host.equalsIgnoreCase("image.tmdb.org");
+    } catch (Exception _e) {
+      return false;
+    }
+  }
+
+  private void clearOverlayLogo(boolean isEpisode) {
+    if (mOverlayLogoView != null) {
+      mOverlayLogoView.setImageDrawable(null);
+      mOverlayLogoView.setVisibility(View.GONE);
+    }
+    mOverlayLogoUrl = "";
+
+    // For movies, the logo replaces the title. If logo is gone, ensure title is visible again.
+    if (!isEpisode && mOverlayTitleText != null) {
+      mOverlayTitleText.setVisibility(View.VISIBLE);
+    }
+  }
+
+  private String hashOverlayLogoUrl(String rawUrl) {
+    try {
+      MessageDigest md = MessageDigest.getInstance("SHA-256");
+      byte[] digest = md.digest(rawUrl.getBytes("UTF-8"));
+      StringBuilder out = new StringBuilder(digest.length * 2);
+      for (byte b : digest) {
+        out.append(String.format(Locale.US, "%02x", b));
+      }
+      return out.toString();
+    } catch (Exception _e) {
+      return Integer.toHexString(rawUrl.hashCode());
+    }
+  }
+
+  private File getOverlayLogoCacheDir() {
+    try {
+      File dir = new File(getCacheDir(), "jumpgate_logo_cache");
+      if (!dir.exists() && !dir.mkdirs()) {
+        return null;
+      }
+      return dir;
+    } catch (Exception _e) {
+      return null;
+    }
+  }
+
+  private File getOverlayLogoDiskFile(String rawUrl) {
+    File dir = getOverlayLogoCacheDir();
+    if (dir == null) {
+      return null;
+    }
+    return new File(dir, hashOverlayLogoUrl(rawUrl) + ".png");
+  }
+
+  private Bitmap loadOverlayLogoFromDisk(String rawUrl) {
+    File cacheFile = getOverlayLogoDiskFile(rawUrl);
+    if (cacheFile == null || !cacheFile.exists() || !cacheFile.isFile()) {
+      return null;
+    }
+
+    long now = System.currentTimeMillis();
+    long ageMs = now - cacheFile.lastModified();
+    if (ageMs > OVERLAY_LOGO_DISK_MAX_AGE_MS) {
+      cacheFile.delete();
+      return null;
+    }
+
+    FileInputStream in = null;
+    try {
+      in = new FileInputStream(cacheFile);
+      BitmapFactory.Options opts = new BitmapFactory.Options();
+      opts.inPreferredConfig = Bitmap.Config.RGB_565;
+      Bitmap bmp = BitmapFactory.decodeStream(in, null, opts);
+      if (bmp != null) {
+        cacheFile.setLastModified(now);
+      }
+      return bmp;
+    } catch (Exception _e) {
+      return null;
+    } finally {
+      try {
+        if (in != null) in.close();
+      } catch (Exception _e) {}
+    }
+  }
+
+  private void pruneOverlayLogoDiskCache(File dir) {
+    if (dir == null) {
+      return;
+    }
+    File[] files = dir.listFiles();
+    if (files == null || files.length == 0) {
+      return;
+    }
+
+    final long now = System.currentTimeMillis();
+    long totalBytes = 0L;
+    int count = 0;
+
+    for (File f : files) {
+      if (f == null || !f.isFile()) {
+        continue;
+      }
+      long age = now - f.lastModified();
+      if (age > OVERLAY_LOGO_DISK_MAX_AGE_MS) {
+        f.delete();
+        continue;
+      }
+      totalBytes += Math.max(0L, f.length());
+      count++;
+    }
+
+    if (count <= OVERLAY_LOGO_DISK_MAX_FILES && totalBytes <= OVERLAY_LOGO_DISK_MAX_BYTES) {
+      return;
+    }
+
+    files = dir.listFiles();
+    if (files == null || files.length == 0) {
+      return;
+    }
+    Arrays.sort(files, (a, b) -> Long.compare(a.lastModified(), b.lastModified()));
+    for (File f : files) {
+      if (f == null || !f.isFile()) {
+        continue;
+      }
+      if (count <= OVERLAY_LOGO_DISK_MAX_FILES && totalBytes <= OVERLAY_LOGO_DISK_MAX_BYTES) {
+        break;
+      }
+      long len = Math.max(0L, f.length());
+      if (f.delete()) {
+        count--;
+        totalBytes = Math.max(0L, totalBytes - len);
+      }
+    }
+  }
+
+  private void saveOverlayLogoToDisk(String rawUrl, Bitmap bmp) {
+    if (bmp == null || bmp.isRecycled()) {
+      return;
+    }
+
+    File cacheFile = getOverlayLogoDiskFile(rawUrl);
+    if (cacheFile == null) {
+      return;
+    }
+    File dir = cacheFile.getParentFile();
+    if (dir == null) {
+      return;
+    }
+
+    File temp = new File(cacheFile.getAbsolutePath() + ".tmp");
+    FileOutputStream out = null;
+    try {
+      out = new FileOutputStream(temp, false);
+      if (!bmp.compress(Bitmap.CompressFormat.PNG, 100, out)) {
+        return;
+      }
+      out.flush();
+      if (cacheFile.exists()) {
+        cacheFile.delete();
+      }
+      if (!temp.renameTo(cacheFile)) {
+        temp.delete();
+        return;
+      }
+      cacheFile.setLastModified(System.currentTimeMillis());
+      pruneOverlayLogoDiskCache(dir);
+    } catch (Exception _e) {
+      // Non-critical best-effort cache write.
+    } finally {
+      try {
+        if (out != null) out.close();
+      } catch (Exception _e) {}
+      if (temp.exists() && !temp.equals(cacheFile)) {
+        temp.delete();
+      }
+    }
+  }
+
+  private void loadOverlayLogo(String rawUrl, boolean isEpisode) {
+    if (mOverlayLogoView == null) {
+      return;
+    }
+
+    String url = rawUrl != null ? rawUrl.trim() : "";
+    if (TextUtils.isEmpty(url) || !isAllowedLogoUrl(url)) {
+      clearOverlayLogo(isEpisode);
+      return;
+    }
+
+    if (url.equals(mOverlayLogoUrl)) {
+      return;
+    }
+
+    Bitmap cachedBmp = sOverlayLogoCache.get(url);
+    if (cachedBmp != null && !cachedBmp.isRecycled()) {
+      mOverlayLogoUrl = url;
+      mOverlayLogoRequestId++;
+      mOverlayLogoView.setImageBitmap(cachedBmp);
+      mOverlayLogoView.setVisibility(View.VISIBLE);
+      if (!isEpisode && mOverlayTitleText != null) {
+        mOverlayTitleText.setVisibility(View.GONE);
+      }
+      return;
+    }
+
+    Bitmap diskBmp = loadOverlayLogoFromDisk(url);
+    if (diskBmp != null && !diskBmp.isRecycled()) {
+      sOverlayLogoCache.put(url, diskBmp);
+      mOverlayLogoUrl = url;
+      mOverlayLogoRequestId++;
+      mOverlayLogoView.setImageBitmap(diskBmp);
+      mOverlayLogoView.setVisibility(View.VISIBLE);
+      if (!isEpisode && mOverlayTitleText != null) {
+        mOverlayTitleText.setVisibility(View.GONE);
+      }
+      return;
+    }
+
+    mOverlayLogoUrl = url;
+    mOverlayLogoRequestId++;
+    final int reqId = mOverlayLogoRequestId;
+    final String loadedUrl = url;
+
+    // Hide until actually loaded (prevents showing broken/empty placeholder).
+    mOverlayLogoView.setVisibility(View.GONE);
+
+    new Thread(() -> {
+      Bitmap bmp = null;
+      HttpURLConnection conn = null;
+      InputStream in = null;
+      try {
+        conn = (HttpURLConnection) new URL(url).openConnection();
+        conn.setConnectTimeout(2000);
+        conn.setReadTimeout(3000);
+        conn.setInstanceFollowRedirects(true);
+        conn.setUseCaches(true);
+        conn.setRequestProperty("User-Agent", "Jumpgate");
+        conn.setRequestProperty("Accept", "image/webp,image/*,*/*;q=0.8");
+
+        in = conn.getInputStream();
+        BitmapFactory.Options opts = new BitmapFactory.Options();
+        opts.inPreferredConfig = Bitmap.Config.RGB_565;
+        bmp = BitmapFactory.decodeStream(in, null, opts);
+      } catch (Exception _e) {
+        bmp = null;
+      } finally {
+        try { if (in != null) in.close(); } catch (Exception _e) {}
+        if (conn != null) conn.disconnect();
+      }
+
+      if (bmp != null) {
+        saveOverlayLogoToDisk(loadedUrl, bmp);
+      }
+
+      final Bitmap finalBmp = bmp;
+      runOnUiThread(() -> {
+        if (mLoadingOverlay == null) {
+          return;
+        }
+        if (reqId != mOverlayLogoRequestId) {
+          return;
+        }
+        if (mOverlayLogoView == null) {
+          return;
+        }
+
+        if (finalBmp != null) {
+          sOverlayLogoCache.put(loadedUrl, finalBmp);
+          mOverlayLogoView.setImageBitmap(finalBmp);
+          mOverlayLogoView.setVisibility(View.VISIBLE);
+          if (!isEpisode && mOverlayTitleText != null) {
+            mOverlayTitleText.setVisibility(View.GONE);
+          }
+        } else {
+          clearOverlayLogo(isEpisode);
+        }
+      });
+    }).start();
+  }
+
+  private String deriveOverlayMeta(Intent intent) {
+    int season = intent != null ? intent.getIntExtra("_mk_s", -1) : -1;
+    int episode = intent != null ? intent.getIntExtra("_mk_e", -1) : -1;
+
+    StringBuilder meta = new StringBuilder();
+    if (season > 0 && episode > 0) {
+      meta.append(String.format(Locale.US, "S%02dE%02d", season, episode));
+    }
+
+    String quality = extractQualityHint(deriveOverlayTitle(intent));
+    if (!TextUtils.isEmpty(quality)) {
+      if (meta.length() > 0) {
+        meta.append("  -  ");
+      }
+      meta.append(quality);
+    }
+
+    if (meta.length() > 0) {
+      meta.append("  -  ");
+    }
+    meta.append("EXTERNAL STREAM");
+
+    return meta.toString();
+  }
+
+  private String getExtraString(Intent intent, String key) {
+    if (intent == null || TextUtils.isEmpty(key) || intent.getExtras() == null) {
+      return "";
+    }
+
+    String value = intent.getExtras().getString(key, "");
+    return value != null ? value.trim() : "";
+  }
+
+  private String extractTitleFromUri(Uri uri) {
+    if (uri == null) {
+      return "";
+    }
+
+    // Best-case query hints from some proxies/debrid endpoints.
+    String[] candidateParams =
+        new String[] {"_mk_title", "title", "filename", "file", "name", "dn"};
+    try {
+      for (String key : candidateParams) {
+        String value = uri.getQueryParameter(key);
+        String cleaned = sanitizeTitleCandidate(value);
+        if (!TextUtils.isEmpty(cleaned)) {
+          return cleaned;
+        }
+      }
+    } catch (UnsupportedOperationException e) {
+      // Opaque URIs don't support query parameters. Fall through to path parsing.
+    } catch (Exception e) {
+      // Defensive: title extraction must never crash the player.
+      Log.w(TAG, "Main: Failed to extract title from URI query params", e);
+    }
+
+    // debridmediamanager.com URLs are frequently opaque token paths; avoid displaying those.
+    String host = uri.getHost();
+    if (!TextUtils.isEmpty(host) && host.toLowerCase(Locale.US).contains("debridmediamanager")) {
+      return "";
+    }
+
+    String bestCandidate = "";
+    int bestScore = -1;
+    String path = uri.getPath();
+    if (!TextUtils.isEmpty(path)) {
+      String[] segments = path.split("/");
+      for (String segment : segments) {
+        String candidate = sanitizeTitleCandidate(segment);
+        int score = scoreTitleCandidate(candidate);
+        if (score > bestScore) {
+          bestScore = score;
+          bestCandidate = candidate;
+        }
+      }
+    }
+
+    if (!TextUtils.isEmpty(bestCandidate)) {
+      return bestCandidate;
+    }
+
+    return sanitizeTitleCandidate(uri.toString());
+  }
+
+  private int scoreTitleCandidate(String candidate) {
+    if (TextUtils.isEmpty(candidate)) {
+      return -1;
+    }
+
+    int letters = 0;
+    for (int i = 0; i < candidate.length(); i++) {
+      if (Character.isLetter(candidate.charAt(i))) {
+        letters++;
+      }
+    }
+
+    // Strongly prefer human-readable title-like strings.
+    int score = letters + (candidate.contains(" ") ? 6 : 0) - Math.max(0, candidate.length() - 64);
+    if (candidate.equalsIgnoreCase("jumpgate stream")) {
+      score -= 100;
+    }
+    return score;
+  }
+
+  private String sanitizeTitleCandidate(String rawCandidate) {
+    if (TextUtils.isEmpty(rawCandidate)) {
+      return "";
+    }
+
+    // Fast reject common token-like inputs (UUIDs, long opaque ids).
+    String raw = rawCandidate.trim();
+    if (raw.matches("(?i)^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$")) {
+      return "";
+    }
+    if (raw.length() >= 28 && raw.matches("^[A-Za-z0-9_-]+$") && !raw.contains(".")) {
+      return "";
+    }
+
+    String decoded;
+    try {
+      decoded = Uri.decode(rawCandidate);
+    } catch (Exception e) {
+      decoded = rawCandidate;
+    }
+    int queryIdx = decoded.indexOf('?');
+    if (queryIdx >= 0) {
+      decoded = decoded.substring(0, queryIdx);
+    }
+    int hashIdx = decoded.indexOf('#');
+    if (hashIdx >= 0) {
+      decoded = decoded.substring(0, hashIdx);
+    }
+    int slashIdx = decoded.lastIndexOf('/');
+    if (slashIdx >= 0 && slashIdx + 1 < decoded.length()) {
+      decoded = decoded.substring(slashIdx + 1);
+    }
+
+    if (decoded.toLowerCase(Locale.US).startsWith("_token_")) {
+      return "";
+    }
+
+    decoded = decoded.replaceAll("(?i)\\.(mkv|mp4|avi|mov|wmv|webm|ts|m3u8|mpd)$", "");
+    decoded = decoded.replaceAll("\\[[^\\]]*\\]|\\([^\\)]*\\)|\\{[^\\}]*\\}", " ");
+    decoded = decoded.replaceAll("[._]+", " ");
+    decoded = decoded.replaceAll("\\s+", " ").trim();
+
+    if (TextUtils.isEmpty(decoded)) {
+      return "";
+    }
+
+    Matcher yearMatch = Pattern.compile("\\b(19|20)\\d{2}\\b").matcher(decoded);
+    if (yearMatch.find() && yearMatch.start() > 2) {
+      decoded = decoded.substring(0, yearMatch.start()).trim();
+    }
+
+    Matcher seasonEpisodeMatch = Pattern.compile("(?i)\\bS\\d{1,2}E\\d{1,2}\\b").matcher(decoded);
+    if (seasonEpisodeMatch.find() && seasonEpisodeMatch.start() > 2) {
+      decoded = decoded.substring(0, seasonEpisodeMatch.start()).trim();
+    }
+
+    String[] parts = decoded.split("\\s+");
+    StringBuilder clean = new StringBuilder();
+    for (String part : parts) {
+      String token = part.replaceAll("^[^A-Za-z0-9]+|[^A-Za-z0-9]+$", "");
+      if (TextUtils.isEmpty(token)) {
+        continue;
+      }
+
+      if (isLikelyReleaseToken(token)) {
+        continue;
+      }
+
+      if (token.matches("^\\d{1,2}$")) {
+        continue;
+      }
+
+      if (token.matches("(?i)^[A-Za-z]{4,}\\d{1,4}$")) {
+        continue;
+      }
+
+      if (token.matches("(?i)^[A-Za-z0-9]{8,}$")
+          && token.matches(".*\\d.*")
+          && token.matches(".*[A-Za-z].*")
+          && !token.matches("(?i).*[aeiou].*")) {
+        continue;
+      }
+
+      if (token.length() == 1 && Character.isLetter(token.charAt(0))) {
+        continue;
+      }
+
+      if (clean.length() > 0) {
+        clean.append(" ");
+      }
+      clean.append(token);
+    }
+
+    String pretty = clean.length() > 0 ? clean.toString() : decoded;
+    pretty = toTitleCase(pretty);
+
+    if (isLikelyOpaqueTokenTitle(pretty)) {
+      return "";
+    }
+
+    if (pretty.length() > 72) {
+      pretty = pretty.substring(0, 72).trim() + "...";
+    }
+
+    return pretty;
+  }
+
+  private boolean isLikelyOpaqueTokenTitle(String value) {
+    if (TextUtils.isEmpty(value)) {
+      return false;
+    }
+
+    String s = value.trim();
+    if (s.length() < 18) {
+      return false;
+    }
+
+    // Opaque tokens are typically long, space-less, and digit-heavy.
+    if (!s.contains(" ")) {
+      int letters = 0;
+      int digits = 0;
+      int vowels = 0;
+      for (int i = 0; i < s.length(); i++) {
+        char c = s.charAt(i);
+        if (Character.isLetter(c)) {
+          letters++;
+          char lc = Character.toLowerCase(c);
+          if (lc == 'a' || lc == 'e' || lc == 'i' || lc == 'o' || lc == 'u') {
+            vowels++;
+          }
+        } else if (Character.isDigit(c)) {
+          digits++;
+        }
+      }
+
+      if (s.length() >= 24) {
+        if (s.matches("(?i)^[0-9a-f]{24,}$")) {
+          return true;
+        }
+        float digitRatio = (float) digits / (float) s.length();
+        if (digitRatio >= 0.35f) {
+          return true;
+        }
+        if (letters > 0) {
+          float vowelRatio = (float) vowels / (float) letters;
+          if (vowelRatio < 0.18f) {
+            return true;
+          }
+        }
+      }
+    }
+
+    return false;
+  }
+
+  private boolean isLikelyLowConfidenceUriTitle(String value) {
+    if (TextUtils.isEmpty(value)) {
+      return true;
+    }
+
+    String s = value.trim();
+    if (s.matches("(?i)^\\d{1,2}\\s+[a-z]{4,}\\d{1,4}$")) {
+      return true;
+    }
+
+    if (s.length() <= 10) {
+      String[] parts = s.split("\\s+");
+      int alphaWordCount = 0;
+      for (String part : parts) {
+        if (part.matches("(?i)^[a-z]{3,}$")) {
+          alphaWordCount++;
+        }
+      }
+      if (alphaWordCount == 0) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  private String extractQualityHint(String title) {
+    if (TextUtils.isEmpty(title)) {
+      return "";
+    }
+
+    String lower = title.toLowerCase(Locale.US);
+    if (lower.contains("2160") || lower.contains("4k")) {
+      return "2160P";
+    }
+    if (lower.contains("1080")) {
+      return "1080P";
+    }
+    if (lower.contains("720")) {
+      return "720P";
+    }
+    if (lower.contains("hevc") || lower.contains("x265")) {
+      return "HEVC";
+    }
+    if (lower.contains("h264") || lower.contains("x264")) {
+      return "H264";
+    }
+    return "";
+  }
+
+  private boolean isLikelyReleaseToken(String token) {
+    String lower = token.toLowerCase(Locale.US);
+
+    if (lower.matches("^(19|20)\\d{2}$")
+        || lower.matches("^\\d{3,4}p$")
+        || lower.matches("^x\\d{3}$")
+        || lower.matches("^h\\d{3}$")
+        || lower.matches("^\\d{1,2}bit$")
+        || lower.matches("^ddp?\\d?(\\.\\d)?$")
+        || lower.matches("^dts(hd|ma)?$")
+        || lower.matches("^ac3|eac3|aac\\d?$")) {
+      return true;
+    }
+
+    switch (lower) {
+      case "bluray":
+      case "brrip":
+      case "bdrip":
+      case "web":
+      case "webrip":
+      case "webdl":
+      case "web-dl":
+      case "hdrip":
+      case "dvdrip":
+      case "rip":
+      case "proper":
+      case "repack":
+      case "remux":
+      case "hevc":
+      case "x264":
+      case "x265":
+      case "h264":
+      case "h265":
+      case "hdr":
+      case "sdr":
+      case "dv":
+      case "atvp":
+      case "atv":
+      case "ntb":
+      case "tgx":
+      case "amzn":
+      case "nf":
+      case "hmax":
+      case "uhd":
+      case "hd":
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  private String toTitleCase(String value) {
+    if (TextUtils.isEmpty(value)) {
+      return "";
+    }
+
+    String[] words = value.toLowerCase(Locale.US).split("\\s+");
+    StringBuilder out = new StringBuilder();
+    for (int i = 0; i < words.length; i++) {
+      String word = words[i];
+      if (word.isEmpty()) {
+        continue;
+      }
+
+      String finalWord;
+      if (word.length() <= 2 && i > 0) {
+        // Keep small joiner words lowercase unless they're the first token.
+        finalWord = word;
+      } else {
+        finalWord = Character.toUpperCase(word.charAt(0)) + word.substring(1);
+      }
+
+      if (out.length() > 0) {
+        out.append(" ");
+      }
+      out.append(finalWord);
+    }
+    return out.toString().trim();
+  }
+
+  private int dp(int value) {
+    return Math.round(value * getResources().getDisplayMetrics().density);
+  }
+
+  public boolean isExternalPlayerMode() {
+    return mExternalPlayerMode;
   }
 }

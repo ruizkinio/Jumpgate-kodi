@@ -1,3 +1,11 @@
+# Jumpgate
+
+> **Pre-release:** Jumpgate is a pre-release Android Kodi fork used as a source-aware external player for Stremio. Normal standalone Kodi behavior remains available. Release APKs must come only from coordinated [Jumpgate releases](https://github.com/ruizkinio/Jumpgate); current development builds are not public releases.
+
+Jumpgate is an independent project and is not affiliated with or endorsed by Kodi, Stremio, or Trakt. The Kodi upstream README is retained below for attribution, licensing, project links, and build documentation.
+
+---
+
 ![Kodi Logo](docs/resources/banner.png)
 
 <p align="center">

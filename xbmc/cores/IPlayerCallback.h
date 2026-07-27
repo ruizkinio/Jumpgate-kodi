@@ -20,12 +20,18 @@ class IPlayerCallback
 public:
   virtual ~IPlayerCallback() = default;
   virtual void OnPlayBackEnded() = 0;
+  virtual void OnPlayBackEndedWithItem(const CFileItem&) { OnPlayBackEnded(); }
+  virtual void OnPlayBackOpening(const CFileItem&, bool deferred = false) {}
+  virtual void OnPlayBackOpenNext(const CFileItem&) {}
+  virtual void OnPlayBackOpenFailed(const CFileItem&) {}
   virtual void OnPlayBackStarted(const CFileItem &file) = 0;
   virtual void OnPlayerCloseFile(const CFileItem& file, const CBookmark& bookmark) {}
   virtual void OnPlayBackPaused() {}
   virtual void OnPlayBackResumed() {}
   virtual void OnPlayBackStopped() = 0;
+  virtual void OnPlayBackStoppedWithItem(const CFileItem&) { OnPlayBackStopped(); }
   virtual void OnPlayBackError() = 0;
+  virtual void OnPlayBackErrorWithItem(const CFileItem&) { OnPlayBackError(); }
   virtual void OnQueueNextItem() = 0;
   virtual void OnPlayBackSeek(int64_t iTime, int64_t seekOffset) {}
   virtual void OnPlayBackSeekChapter(int iChapter) {}

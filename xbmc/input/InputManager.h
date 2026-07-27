@@ -124,6 +124,13 @@ public:
    */
   bool OnEvent(XBMC_Event& newEvent);
 
+  /*! \brief Process one complete synthetic key press on the current input thread.
+   *
+   * This preserves normal keymap and keyboard-handler behavior without leaving
+   * a split key-down/key-up sequence in a platform queue.
+   */
+  bool ProcessKeyPress(const CKey& key);
+
   /*! \brief Control if the mouse is actively used or not
    *
    * \param[in] active sets mouse active or inactive
@@ -254,7 +261,7 @@ private:
    * \param key details of released key
    * \sa CKey
    */
-  void OnKeyUp(const CKey& key);
+  bool OnKeyUp(const CKey& key);
 
   /*! \brief Handle keypress
    *

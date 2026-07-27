@@ -18,6 +18,7 @@
 
 #include <atomic>
 #include <list>
+#include <mutex>
 #include <vector>
 
 class IAEStream;
@@ -132,6 +133,8 @@ private:
   int64_t m_newForcedPlayerTime = -1;
   int64_t m_newForcedTotalTime = -1;
   std::unique_ptr<CProcessInfo> m_processInfo;
+  mutable std::mutex m_callbackFileMutex;
+  std::unique_ptr<CFileItem> m_callbackFileItem;
 
   bool QueueNextFileEx(const CFileItem &file, bool fadeIn);
   void SoftStart(bool wait = false);
@@ -150,5 +153,7 @@ private:
   bool SetTotalTimeInternal(int64_t time);
   void CloseFileCB(StreamInfo &si);
   void AdvancePlaylistOnError(CFileItem &fileItem);
+  void SetCallbackFile(const CFileItem& fileItem);
+  std::unique_ptr<CFileItem> GetCallbackFile() const;
 };
 
