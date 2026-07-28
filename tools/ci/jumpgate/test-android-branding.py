@@ -54,6 +54,18 @@ ANDROID_MANIFEST = (
 MAIN_ACTIVITY = (
     ROOT / "tools" / "android" / "packaging" / "xbmc" / "src" / "Main.java.in"
 )
+ANDROID_APP_GRADLE = (
+    ROOT / "tools" / "android" / "packaging" / "xbmc" / "build.gradle.in"
+)
+EXTERNAL_RESULT_TEST = (
+    ROOT
+    / "tools"
+    / "android"
+    / "packaging"
+    / "xbmc"
+    / "test"
+    / "ExternalPlayerResultCoordinatorTest.java.in"
+)
 BACK_BOOL_BASE = (
     ROOT / "tools" / "android" / "packaging" / "xbmc" / "res" / "values" / "bools.xml"
 )
@@ -1714,7 +1726,9 @@ def require_in_order(source, *contracts):
         offset = index + len(contract)
 
 
-def verify_warm_task_handoff_contract(main_activity, external_activity, app_source):
+def verify_warm_task_handoff_contract(
+    main_activity, external_activity, result_coordinator, app_source
+):
     normal_exit = extract_braced_block(
         main_activity, "public synchronized void exitExternalPlayerMode("
     )
@@ -1722,9 +1736,10 @@ def verify_warm_task_handoff_contract(main_activity, external_activity, app_sour
     warm_exit = extract_braced_block(post_commit_exit, "if (wasStandalone)")
     require_in_order(
         warm_exit,
+        "mExternalResultProducer.isCallerResultAcknowledged(generation, requestId)",
         "mExternalPlayerMode = false",
         "mExternalResultProducer.clear(generation, requestId)",
-        "prepareWarmTaskHandoff(generation, requestId)",
+        "prepareWarmTaskHandoff(generation, requestId, callerResultAcknowledged)",
         "mWasStandalone = false",
         "hideLoadingOverlay()",
     )
@@ -1866,26 +1881,18 @@ def verify_warm_task_handoff_contract(main_activity, external_activity, app_sour
     cancel_handoff = extract_braced_block(
         main_activity, "private synchronized void cancelPendingWarmTaskHandoff()"
     )
-    require_in_order(
-        cancel_handoff,
-        "mWarmTaskHandoffRunnable = null",
-        "handler.removeCallbacks(pendingHandoff)",
-        "mWarmTaskHandoffGeneration = 0",
-        'mWarmTaskHandoffRequestId = ""',
-        "mWarmTaskHandoffNativeReady = false",
-        "mWarmTaskHandoffResultDelivered = false",
-    )
+    if "mWarmTaskHandoff.cancel()" not in cancel_handoff:
+        raise AssertionError("warm task handoff cancellation bypasses the executable controller")
     prepare_handoff = extract_braced_block(
         main_activity, "private synchronized void prepareWarmTaskHandoff("
     )
     require_in_order(
         prepare_handoff,
-        "boolean resultAlreadyDelivered",
-        "ownsWarmTaskHandoff(generation, requestId)",
-        "cancelPendingWarmTaskHandoff()",
-        "mWarmTaskHandoffGeneration = generation",
-        "mWarmTaskHandoffRequestId = requestId",
-        "mWarmTaskHandoffResultDelivered = resultAlreadyDelivered",
+        "mWarmTaskHandoff.prepare(",
+        "mBackLifecycleToken",
+        "generation",
+        "requestId",
+        "callerResultAcknowledged",
     )
 
     schedule_handoff = extract_braced_block(
@@ -1893,43 +1900,86 @@ def verify_warm_task_handoff_contract(main_activity, external_activity, app_sour
     )
     require_in_order(
         schedule_handoff,
-        "mWarmTaskHandoffNativeReady",
-        "mWarmTaskHandoffResultDelivered",
-        "final Main activity = this",
-        "final long exactLifecycleToken = lifecycleToken",
-        "final long exactGeneration = mWarmTaskHandoffGeneration",
-        "final String exactRequestId = mWarmTaskHandoffRequestId",
-        "mWarmTaskHandoffRunnable = handoff",
-        "handler.post(handoff)",
+        "mWarmTaskHandoff.scheduleIfReady(",
+        "lifecycleToken",
+        "generation",
+        "requestId",
     )
-    callback = extract_braced_block(schedule_handoff, "synchronized (activity)")
-    for guard in (
-        "activity.mWarmTaskHandoffRunnable != this",
-        "MainActivity != activity",
-        "exactLifecycleToken == 0",
-        "exactLifecycleToken != activity.mBackLifecycleToken",
-        "activity.ownsWarmTaskHandoff(exactGeneration, exactRequestId)",
-        "activity.mWarmTaskHandoffNativeReady",
-        "activity.mWarmTaskHandoffResultDelivered",
-        "activity.isFinishing()",
-        "activity.isDestroyed()",
-        "activity.mExternalPlayerMode",
-        "activity.mExternalResultProducer.activeGeneration() != 0",
-        "activity.mExternalResultProducer.preparedRequestId()",
+    for forbidden in (
+        "handler.post",
+        "moveTaskToBack",
+        "MainActivity",
+        "mBackLifecycleToken",
+        "isFinishing()",
+        "isDestroyed()",
+        "mExternalPlayerMode",
+        "activeGeneration()",
+        "preparedRequestId()",
     ):
-        if guard not in callback:
-            raise AssertionError(f"warm task handoff callback is missing guard {guard!r}")
-    if callback.find("activity.moveTaskToBack(true)") < callback.find("preparedRequestId()"):
-        raise AssertionError("warm task handoff can run before its lifecycle/admission guards")
+        if forbidden in schedule_handoff:
+            raise AssertionError(
+                f"Main schedule adapter retains warm-task policy {forbidden!r}"
+            )
+
+    main_constructor = extract_braced_block(main_activity, "public Main()")
+    require_in_order(
+        main_constructor,
+        "new ExternalPlayerResultCoordinator.WarmTaskHandoffController(",
+        "new ExternalPlayerResultCoordinator.WarmTaskScheduler()",
+        "handler.post(callback)",
+        "handler.postDelayed(callback, delayMs)",
+        "handler.removeCallbacks(callback)",
+        "Main.this",
+        "this::captureWarmTaskLifecycleState",
+        "attempt -> moveTaskToBack(true)",
+        "new ExternalPlayerResultCoordinator.WarmTaskHandoffObserver()",
+        "WARM_TASK_HANDOFF_RETRY_DELAY_MS",
+    )
+    for retained_policy in (
+        "WarmTaskMoveAttemptResult.MOVED",
+        "WarmTaskMoveAttemptResult.REFUSED",
+        "WarmTaskMoveAttemptResult.STALE",
+        "try {",
+        "catch (RuntimeException",
+    ):
+        if retained_policy in main_constructor:
+            raise AssertionError(
+                f"Main move adapter retains production policy {retained_policy!r}"
+            )
+    lifecycle_capture = extract_braced_block(
+        main_activity,
+        "private synchronized ExternalPlayerResultCoordinator.WarmTaskLifecycleState",
+    )
+    require_in_order(
+        lifecycle_capture,
+        "new ExternalPlayerResultCoordinator.WarmTaskLifecycleState(",
+        "MainActivity == this",
+        "mBackLifecycleToken",
+        "isFinishing()",
+        "isDestroyed()",
+        "mExternalPlayerMode",
+        "mExternalResultProducer.activeGeneration()",
+        "mExternalResultProducer.preparedRequestId()",
+    )
+    if "if (" in lifecycle_capture or "moveTaskToBack" in lifecycle_capture:
+        raise AssertionError("Main lifecycle adapter retains warm-task policy")
+    attempt_diagnostic = extract_braced_block(
+        main_constructor, "public void onAttemptFailed("
+    )
+    fallback_diagnostic = extract_braced_block(main_constructor, "public void onFallback()")
+    for diagnostic in (attempt_diagnostic, fallback_diagnostic):
+        if "requestId" in diagnostic or "generation" in diagnostic:
+            raise AssertionError("warm task handoff diagnostics expose exact owner identifiers")
+    if "leaving Kodi in foreground" not in fallback_diagnostic:
+        raise AssertionError("warm task exhaustion has no explicit safe foreground fallback")
 
     native_ready = extract_braced_block(
         main_activity, "public synchronized void handoffWarmExternalPlayerTask("
     )
     require_in_order(
         native_ready,
-        "ownsWarmTaskHandoff(generation, requestId)",
-        "mWarmTaskHandoffNativeReady = true",
-        "scheduleWarmTaskHandoffIfReady(lifecycleToken)",
+        "mWarmTaskHandoff.markNativeReady(lifecycleToken, generation, requestId)",
+        "scheduleWarmTaskHandoffIfReady(lifecycleToken, generation, requestId)",
     )
     result_delivered = extract_braced_block(
         main_activity, "private synchronized boolean confirmWarmExternalPlayerResultInternal("
@@ -1937,13 +1987,176 @@ def verify_warm_task_handoff_contract(main_activity, external_activity, app_sour
     require_in_order(
         result_delivered,
         "ExternalPlayerResultCoordinator.isValidRequestId(requestId)",
-        "ownsWarmTaskHandoff(generation, requestId)",
+        "mWarmTaskHandoff.confirmCallerResult(generation, requestId)",
+        "scheduleWarmTaskHandoffIfReady(mBackLifecycleToken, generation, requestId)",
+        "generation == 0",
+        "mExternalResultProducer.confirmCallerResult(generation, requestId)",
+        "mExternalPlayerMode",
         "mWasStandalone",
-        "mExternalResultProducer.activeGeneration()",
-        "mExternalResultProducer.activeRequestId()",
-        "mWarmTaskHandoffResultDelivered = true",
-        "scheduleWarmTaskHandoffIfReady(mBackLifecycleToken)",
+        "mExternalResultProducer.confirmCallerResult(generation, requestId)",
     )
+
+    producer = extract_braced_block(result_coordinator, "public static final class Producer")
+    require_in_order(
+        producer,
+        "mPreparedCallerResultAcknowledged",
+        "mCallerResultAcknowledged",
+        'mPendingCallerResultRequestId = ""',
+        "boolean callerResultAcknowledged = mPendingCallerResultRequestId.equals(requestId)",
+        'mPendingCallerResultRequestId = ""',
+        "mPreparedCallerResultAcknowledged = callerResultAcknowledged",
+        "boolean callerResultAcknowledged = mPreparedCallerResultAcknowledged",
+        "begin(generation, requestId)",
+        "mPreparedCallerResultAcknowledged = false",
+        "mCallerResultAcknowledged = callerResultAcknowledged",
+    )
+    producer_confirmation = extract_braced_block(
+        producer, "public synchronized boolean confirmCallerResult("
+    )
+    require_in_order(
+        producer_confirmation,
+        "isValidRequestId(requestId)",
+        "generation == 0",
+        "mPreparedRequestId.equals(requestId)",
+        "mPreparedCallerResultAcknowledged = true",
+        "mGeneration > 0",
+        "mRequestId.equals(requestId)",
+        "mOwnerCanceled",
+        "mCallerResultAcknowledged = true",
+        "mGeneration > 0 || !mPreparedRequestId.isEmpty()",
+        "mPendingCallerResultRequestId.isEmpty()",
+        "mPendingCallerResultRequestId.equals(requestId)",
+        "mPendingCallerResultRequestId = requestId",
+        "matches(generation, requestId)",
+        "mCallerResultAcknowledged = true",
+    )
+
+    lifecycle_state = extract_braced_block(
+        result_coordinator, "public static final class WarmTaskLifecycleState"
+    )
+    lifecycle_allows = extract_braced_block(
+        lifecycle_state, "private boolean allows("
+    )
+    require_in_order(
+        lifecycle_allows,
+        "attempt != null",
+        "mCurrentActivity",
+        "attempt.lifecycleToken() > 0",
+        "attempt.lifecycleToken() == mLifecycleToken",
+        "!mFinishing",
+        "!mDestroyed",
+        "!mExternalPlayerMode",
+        "mActiveGeneration == 0",
+        "!isValidRequestId(mPreparedRequestId)",
+    )
+
+    handoff_state = extract_braced_block(
+        result_coordinator, "public static final class WarmTaskHandoff"
+    )
+    for contract in (
+        "MAX_MOVE_ATTEMPTS = 3",
+        "reserveAttempt(",
+        "completeAttempt(",
+        "cancelAttempt(",
+        "generation == 0 ? ownsRequest(requestId) : owns(generation, requestId)",
+        "attempt != mPendingAttempt",
+        "mMoveAttempts >= MAX_MOVE_ATTEMPTS",
+        "generation == 0 ? ownsRequest(requestId) : owns(generation, requestId)",
+    ):
+        if contract not in handoff_state:
+            raise AssertionError(f"warm task handoff state is missing {contract!r}")
+    handoff_completion = extract_braced_block(
+        handoff_state, "public synchronized WarmTaskMoveResult completeAttempt("
+    )
+    require_in_order(
+        handoff_completion,
+        "attempt != mPendingAttempt",
+        "mPendingAttempt = null",
+        "if (moved)",
+        "clear()",
+        "WarmTaskMoveResult.MOVED",
+        "WarmTaskMoveResult.RETRY",
+        "WarmTaskMoveResult.EXHAUSTED",
+    )
+
+    handoff_controller = extract_braced_block(
+        result_coordinator, "public static final class WarmTaskHandoffController"
+    )
+    for contract in (
+        "WarmTaskScheduler mScheduler",
+        "Object mLifecycleLock",
+        "WarmTaskLifecycleStateSource mLifecycleStateSource",
+        "WarmTaskMoveAdapter mMoveAdapter",
+        "WarmTaskHandoffObserver mObserver",
+        "mScheduler.post(task)",
+        "mScheduler.postDelayed(task, mRetryDelayMs)",
+        "mScheduler.removeCallbacks(pending)",
+        "synchronized (mLifecycleLock)",
+        "mLifecycleStateSource.capture()",
+        "lifecycleState.allows(attempt)",
+        "mMoveAdapter.moveTaskToBack(attempt)",
+        "? WarmTaskMoveAttemptResult.MOVED",
+        ": WarmTaskMoveAttemptResult.REFUSED",
+        "WarmTaskMoveAttemptResult.STALE",
+        "WarmTaskMoveResult.EXHAUSTED",
+        "mHandoff.clear()",
+        "mObserver.onFallback()",
+        "task.mAttempt.lifecycleToken()",
+        "task.mAttempt.generation()",
+        "task.mAttempt.requestId()",
+        "mRetryDelayMs",
+    ):
+        if contract not in handoff_controller:
+            raise AssertionError(f"executable warm task controller is missing {contract!r}")
+    production_move = extract_braced_block(
+        handoff_controller, "private WarmTaskMoveAttemptResult move("
+    )
+    require_in_order(
+        production_move,
+        "synchronized (mLifecycleLock)",
+        "mLifecycleStateSource.capture()",
+        "lifecycleState == null",
+        "!lifecycleState.allows(attempt)",
+        "WarmTaskMoveAttemptResult.STALE",
+        "mMoveAdapter.moveTaskToBack(attempt)",
+        "WarmTaskMoveAttemptResult.MOVED",
+        "WarmTaskMoveAttemptResult.REFUSED",
+        "catch (RuntimeException e)",
+        "WarmTaskMoveAttemptResult.REFUSED",
+    )
+
+    gradle = ANDROID_APP_GRADLE.read_text(encoding="utf-8")
+    require_in_order(
+        gradle,
+        "tasks.register('compileExternalPlayerResultTests', JavaCompile)",
+        "tasks.register('externalPlayerResultTests', JavaExec)",
+        "dependsOn tasks.named('compileExternalPlayerResultTests')",
+        "mainClass = '@APP_PACKAGE@.ExternalPlayerResultCoordinatorTest'",
+        "tasks.named('check').configure",
+        "dependsOn tasks.named('externalPlayerResultTests')",
+    )
+    if "preBuild.dependsOn 'externalPlayerResultTests'" not in gradle:
+        raise AssertionError("mandatory Android APK assembly does not run result tests")
+    workflow = ANDROID_WORKFLOW.read_text(encoding="utf-8")
+    if 'make -C "$KODI_BUILD_DIR" apk' not in workflow:
+        raise AssertionError("protected Android CI bypasses mandatory APK assembly tests")
+
+    executable_tests = EXTERNAL_RESULT_TEST.read_text(encoding="utf-8")
+    for test in (
+        "prePrepareCallerAcknowledgementConvergesThroughHandoff()",
+        "staleAndRejectedCallerConfirmationsStayFenced()",
+        "warmTaskMoveFailureRetriesWithoutLosingState()",
+        "warmTaskProductionLifecycleGuardsFenceMove()",
+        "warmTaskMoveExceptionRetriesToForegroundFallback()",
+        "warmTaskInitialPostRefusalRetriesExecutably()",
+        "warmTaskDelayedPostRefusalExhaustsToFallback()",
+        "warmTaskMoveRetriesExhaustToForegroundFallback()",
+        "warmTaskNewerLaunchFencesQueuedControllerCallback()",
+        "warmTaskRetryCannotAttachToNewerSameLifecycleLaunch()",
+        "warmTaskDuplicateCallbacksAndNewerLaunchStayFenced()",
+    ):
+        if executable_tests.count(test) < 2:
+            raise AssertionError(f"external result host test is not invoked: {test}")
 
     creation = extract_braced_block(main_activity, "public void onCreate(")
     require_in_order(
@@ -2805,7 +3018,9 @@ def verify_back_lifecycle_rejection_contract():
         "reservation.commit()",
         "mExternalPlayerMode = false",
     )
-    verify_warm_task_handoff_contract(main_activity, external_activity, app_source)
+    verify_warm_task_handoff_contract(
+        main_activity, external_activity, result_coordinator, app_source
+    )
 
     for contract in (
         "class TerminalReservation",

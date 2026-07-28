@@ -58,7 +58,7 @@ android {
 }
 
 project.afterEvaluate {
-    preBuild.dependsOn
+    preBuild.dependsOn 'externalPlayerResultTests'
 }
 
 dependencies {
@@ -98,7 +98,7 @@ tasks.register('compileExternalPlayerResultTests', JavaCompile) {
     }
 }
 
-tasks.register('externalPlayerResultTest', JavaExec) {
+tasks.register('externalPlayerResultTests', JavaExec) {
     group = 'verification'
     description = 'Runs production coordinator race tests and activity-controller behavior tests.'
     dependsOn tasks.named('compileExternalPlayerResultTests')
@@ -108,5 +108,5 @@ tasks.register('externalPlayerResultTest', JavaExec) {
 }
 
 tasks.named('check').configure {
-    dependsOn tasks.named('externalPlayerResultTest')
+    dependsOn tasks.named('externalPlayerResultTests')
 }

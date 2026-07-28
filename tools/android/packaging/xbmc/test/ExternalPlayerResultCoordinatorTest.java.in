@@ -33,6 +33,156 @@ public final class ExternalPlayerResultCoordinatorTest {
     }
   }
 
+  private static final class FakeWarmTaskScheduler
+      implements ExternalPlayerResultCoordinator.WarmTaskScheduler {
+    private final ArrayDeque<Runnable> mTasks = new ArrayDeque<>();
+    private final ArrayDeque<Boolean> mPostResults = new ArrayDeque<>();
+    private final ArrayDeque<Boolean> mDelayedResults = new ArrayDeque<>();
+    int postCalls;
+    int postDelayedCalls;
+    int removeCalls;
+
+    void enqueuePostResult(boolean result) {
+      mPostResults.addLast(result);
+    }
+
+    void enqueueDelayedResult(boolean result) {
+      mDelayedResults.addLast(result);
+    }
+
+    @Override
+    public boolean post(Runnable callback) {
+      ++postCalls;
+      boolean accepted = mPostResults.isEmpty() || mPostResults.removeFirst();
+      if (accepted) mTasks.addLast(callback);
+      return accepted;
+    }
+
+    @Override
+    public boolean postDelayed(Runnable callback, long delayMs) {
+      require(delayMs >= 0, "scheduler delay is nonnegative");
+      ++postDelayedCalls;
+      boolean accepted = mDelayedResults.isEmpty() || mDelayedResults.removeFirst();
+      if (accepted) mTasks.addLast(callback);
+      return accepted;
+    }
+
+    @Override
+    public void removeCallbacks(Runnable callback) {
+      ++removeCalls;
+      // Keep queued callbacks so tests execute the race Handler.removeCallbacks cannot prevent.
+    }
+
+    void runNext() {
+      mTasks.removeFirst().run();
+    }
+
+    int size() {
+      return mTasks.size();
+    }
+  }
+
+  private static final class FakeWarmTaskLifecycleStateSource
+      implements ExternalPlayerResultCoordinator.WarmTaskLifecycleStateSource {
+    ExternalPlayerResultCoordinator.WarmTaskLifecycleState state;
+    int captures;
+
+    FakeWarmTaskLifecycleStateSource(long lifecycleToken) {
+      state = warmTaskLifecycleState(true, lifecycleToken, false, false, false, 0, "");
+    }
+
+    @Override
+    public ExternalPlayerResultCoordinator.WarmTaskLifecycleState capture() {
+      require(Thread.holdsLock(this), "production lifecycle capture holds the activity lock");
+      ++captures;
+      return state;
+    }
+  }
+
+  private static final class FakeWarmTaskMoveAdapter
+      implements ExternalPlayerResultCoordinator.WarmTaskMoveAdapter {
+    private final ArrayDeque<Boolean> mResults = new ArrayDeque<>();
+    private int mFailures;
+    Object expectedLifecycleLock;
+    int calls;
+    long lastGeneration;
+    String lastRequestId = "";
+    int lastAttemptNumber;
+
+    void enqueue(boolean result) {
+      mResults.addLast(result);
+    }
+
+    void enqueueFailure() {
+      ++mFailures;
+    }
+
+    @Override
+    public boolean moveTaskToBack(
+        ExternalPlayerResultCoordinator.WarmTaskHandoff.Attempt attempt) {
+      require(
+          expectedLifecycleLock == null || Thread.holdsLock(expectedLifecycleLock),
+          "production task move holds the activity lock");
+      ++calls;
+      lastGeneration = attempt.generation();
+      lastRequestId = attempt.requestId();
+      lastAttemptNumber = attempt.number();
+      if (mFailures > 0) {
+        --mFailures;
+        throw new IllegalStateException("simulated moveTaskToBack failure");
+      }
+      return mResults.isEmpty() || mResults.removeFirst();
+    }
+  }
+
+  private static final class FakeWarmTaskObserver
+      implements ExternalPlayerResultCoordinator.WarmTaskHandoffObserver {
+    int failedAttempts;
+    int schedulerRejections;
+    int fallbacks;
+
+    @Override
+    public void onAttemptFailed(
+        int attemptNumber, int maxAttempts, boolean schedulerRejected) {
+      require(attemptNumber > 0 && attemptNumber <= maxAttempts, "attempt diagnostics bounded");
+      ++failedAttempts;
+      if (schedulerRejected) ++schedulerRejections;
+    }
+
+    @Override
+    public void onFallback() {
+      ++fallbacks;
+    }
+  }
+
+  private static ExternalPlayerResultCoordinator.WarmTaskHandoffController warmTaskController(
+      FakeWarmTaskScheduler scheduler,
+      FakeWarmTaskLifecycleStateSource lifecycleState,
+      FakeWarmTaskMoveAdapter moveAdapter,
+      ExternalPlayerResultCoordinator.WarmTaskHandoffObserver observer) {
+    moveAdapter.expectedLifecycleLock = lifecycleState;
+    return new ExternalPlayerResultCoordinator.WarmTaskHandoffController(
+        scheduler, lifecycleState, lifecycleState, moveAdapter, observer, 100);
+  }
+
+  private static ExternalPlayerResultCoordinator.WarmTaskLifecycleState warmTaskLifecycleState(
+      boolean currentActivity,
+      long lifecycleToken,
+      boolean finishing,
+      boolean destroyed,
+      boolean externalPlayerMode,
+      long activeGeneration,
+      String preparedRequestId) {
+    return new ExternalPlayerResultCoordinator.WarmTaskLifecycleState(
+        currentActivity,
+        lifecycleToken,
+        finishing,
+        destroyed,
+        externalPlayerMode,
+        activeGeneration,
+        preparedRequestId);
+  }
+
   private static final class FakeHost implements ExternalPlayerActivity.Host {
     boolean persistSucceeds = true;
     boolean startSucceeds = true;
@@ -468,6 +618,428 @@ public final class ExternalPlayerResultCoordinatorTest {
     require(!replacement.wasCancellationRequested(), "old cancellation cannot cross requests");
   }
 
+  private static void prePrepareCallerAcknowledgementConvergesThroughHandoff() {
+    ExternalPlayerResultCoordinator.Producer producer =
+        new ExternalPlayerResultCoordinator.Producer();
+    require(
+        producer.confirmCallerResult(0, OLD_REQUEST_ID),
+        "exact caller acknowledgement is retained before preparation");
+    require(
+        producer.confirmCallerResult(0, OLD_REQUEST_ID),
+        "duplicate pre-prepare acknowledgement is idempotent");
+    require(
+        !producer.confirmCallerResult(0, NEW_REQUEST_ID),
+        "another request cannot replace pending acknowledgement authority");
+    require(producer.prepare(OLD_REQUEST_ID), "acknowledged request prepares exactly");
+    require(producer.cancelPrepared(OLD_REQUEST_ID), "forwarded request canceled before binding");
+    require(
+        !producer.confirmCallerResult(60, OLD_REQUEST_ID),
+        "unbound generation confirmation rejected");
+
+    ExternalPlayerResultCoordinator.Admission admission =
+        producer.admitPrepared(60, OLD_REQUEST_ID);
+    require(admission != null, "canceled request later binds its native generation");
+    require(admission.wasCancellationRequested(), "cancellation follows exact later binding");
+    require(
+        admission.wasCallerResultAcknowledged(),
+        "caller acknowledgement follows exact later binding");
+    require(
+        producer.isCallerResultAcknowledged(60, OLD_REQUEST_ID),
+        "bound generation retains caller acknowledgement");
+    require(
+        !producer.isCallerResultAcknowledged(60, NEW_REQUEST_ID),
+        "bound acknowledgement rejects another request");
+    require(
+        !producer.isCallerResultAcknowledged(61, OLD_REQUEST_ID),
+        "bound acknowledgement rejects another generation");
+    require(
+        producer.finish(60, OLD_REQUEST_ID, 0, 0, false, false) != null,
+        "canceled binding reaches one terminal");
+    require(
+        producer.isCallerResultAcknowledged(60, OLD_REQUEST_ID),
+        "terminal convergence retains caller acknowledgement");
+
+    FakeWarmTaskScheduler scheduler = new FakeWarmTaskScheduler();
+    FakeWarmTaskLifecycleStateSource lifecycleState =
+        new FakeWarmTaskLifecycleStateSource(70);
+    FakeWarmTaskMoveAdapter moveAdapter = new FakeWarmTaskMoveAdapter();
+    FakeWarmTaskObserver observer = new FakeWarmTaskObserver();
+    ExternalPlayerResultCoordinator.WarmTaskHandoffController handoff =
+        warmTaskController(scheduler, lifecycleState, moveAdapter, observer);
+    require(
+        handoff.prepare(70, 60, OLD_REQUEST_ID, admission.wasCallerResultAcknowledged()),
+        "exited exact request prepares warm handoff");
+    require(handoff.markNativeReady(70, 60, OLD_REQUEST_ID), "native exit readies handoff");
+    require(
+        handoff.scheduleIfReady(70, 60, OLD_REQUEST_ID),
+        "acknowledged handoff posts exactly");
+    scheduler.runNext();
+    require(moveAdapter.calls == 1, "acknowledged exited request moves once");
+    require(!handoff.owns(60, OLD_REQUEST_ID), "completed handoff clears exact owner");
+    require(observer.fallbacks == 0, "successful exact handoff needs no fallback");
+
+    ExternalPlayerResultCoordinator.Producer lateConfirmation =
+        new ExternalPlayerResultCoordinator.Producer();
+    require(lateConfirmation.prepare(NEW_REQUEST_ID), "late-confirmation request prepared");
+    require(
+        lateConfirmation.cancelPrepared(NEW_REQUEST_ID),
+        "late-confirmation request canceled before binding");
+    require(
+        lateConfirmation.admitPrepared(61, NEW_REQUEST_ID) != null,
+        "late-confirmation cancellation binds before callback");
+    require(
+        lateConfirmation.confirmCallerResult(0, NEW_REQUEST_ID),
+        "request-scoped acknowledgement follows exact later binding");
+    require(
+        lateConfirmation.isCallerResultAcknowledged(61, NEW_REQUEST_ID),
+        "late request acknowledgement binds to the current exact generation");
+  }
+
+  private static void staleAndRejectedCallerConfirmationsStayFenced() {
+    ExternalPlayerResultCoordinator.Producer producer =
+        new ExternalPlayerResultCoordinator.Producer();
+    require(
+        producer.confirmCallerResult(0, OLD_REQUEST_ID),
+        "unprepared exact confirmation is retained");
+    require(
+        !producer.confirmCallerResult(0, NEW_REQUEST_ID),
+        "different unprepared confirmation cannot replace exact pending state");
+    require(producer.prepare(NEW_REQUEST_ID), "newer preparation fences stale pending state");
+    ExternalPlayerResultCoordinator.Admission replacement =
+        producer.admitPrepared(61, NEW_REQUEST_ID);
+    require(replacement != null, "newer owner admitted exactly");
+    require(
+        !replacement.wasCallerResultAcknowledged(),
+        "stale request acknowledgement cannot cross into newer preparation");
+    require(
+        !producer.confirmCallerResult(0, OLD_REQUEST_ID),
+        "stale request cannot confirm active newer owner");
+    require(producer.finish(61, NEW_REQUEST_ID, 1, 10, false, false) != null, "new terminal");
+    producer.clear(61, NEW_REQUEST_ID);
+
+    require(producer.prepare(THIRD_REQUEST_ID), "later confirmation owner prepared");
+    require(
+        !producer.confirmCallerResult(0, OLD_REQUEST_ID),
+        "stale request cannot confirm newer preparation");
+    require(producer.confirmCallerResult(0, THIRD_REQUEST_ID), "later request confirms exactly");
+    require(producer.admitPrepared(62, THIRD_REQUEST_ID) != null, "later owner admitted exactly");
+    require(
+        !producer.isCallerResultAcknowledged(61, NEW_REQUEST_ID),
+        "newer launch fences stale acknowledged pair");
+    require(
+        producer.isCallerResultAcknowledged(62, THIRD_REQUEST_ID),
+        "newer launch retains only its exact acknowledgement");
+  }
+
+  private static void warmTaskMoveFailureRetriesWithoutLosingState() {
+    ExternalPlayerResultCoordinator.WarmTaskHandoff handoff =
+        new ExternalPlayerResultCoordinator.WarmTaskHandoff();
+    require(handoff.prepare(70, 63, OLD_REQUEST_ID, true), "warm handoff prepared");
+    require(handoff.markNativeReady(70, 63, OLD_REQUEST_ID), "native cleanup confirmed");
+
+    ExternalPlayerResultCoordinator.WarmTaskHandoff.Attempt first =
+        handoff.reserveAttempt(70, 63, OLD_REQUEST_ID);
+    require(first != null && first.number() == 1, "first task move reserved");
+    require(
+        handoff.completeAttempt(first, false)
+            == ExternalPlayerResultCoordinator.WarmTaskMoveResult.RETRY,
+        "Android task-move refusal requests a bounded retry");
+    require(handoff.owns(63, OLD_REQUEST_ID), "failed task move retains exact handoff state");
+
+    ExternalPlayerResultCoordinator.WarmTaskHandoff.Attempt retry =
+        handoff.reserveAttempt(70, 63, OLD_REQUEST_ID);
+    require(retry != null && retry.number() == 2, "task move retried once");
+    require(
+        handoff.completeAttempt(retry, true)
+            == ExternalPlayerResultCoordinator.WarmTaskMoveResult.MOVED,
+        "successful retry completes handoff");
+    require(!handoff.owns(63, OLD_REQUEST_ID), "successful task move clears exact state");
+    require(
+        handoff.completeAttempt(retry, true)
+            == ExternalPlayerResultCoordinator.WarmTaskMoveResult.STALE,
+        "duplicate task-move callback is stale");
+  }
+
+  private static void warmTaskProductionLifecycleGuardsFenceMove() {
+    ExternalPlayerResultCoordinator.WarmTaskLifecycleState[] blockedStates = {
+      warmTaskLifecycleState(false, 76, false, false, false, 0, ""),
+      warmTaskLifecycleState(true, 0, false, false, false, 0, ""),
+      warmTaskLifecycleState(true, 77, false, false, false, 0, ""),
+      warmTaskLifecycleState(true, 76, true, false, false, 0, ""),
+      warmTaskLifecycleState(true, 76, false, true, false, 0, ""),
+      warmTaskLifecycleState(true, 76, false, false, true, 0, ""),
+      warmTaskLifecycleState(true, 76, false, false, false, 70, ""),
+      warmTaskLifecycleState(true, 76, false, false, false, 0, NEW_REQUEST_ID),
+    };
+
+    for (int guard = 0; guard < blockedStates.length; ++guard) {
+      FakeWarmTaskScheduler scheduler = new FakeWarmTaskScheduler();
+      FakeWarmTaskLifecycleStateSource lifecycleState =
+          new FakeWarmTaskLifecycleStateSource(76);
+      lifecycleState.state = blockedStates[guard];
+      FakeWarmTaskMoveAdapter moveAdapter = new FakeWarmTaskMoveAdapter();
+      FakeWarmTaskObserver observer = new FakeWarmTaskObserver();
+      ExternalPlayerResultCoordinator.WarmTaskHandoffController controller =
+          warmTaskController(scheduler, lifecycleState, moveAdapter, observer);
+      require(controller.prepare(76, 70, OLD_REQUEST_ID, true), "guarded handoff prepared");
+      require(controller.markNativeReady(76, 70, OLD_REQUEST_ID), "guarded native ready");
+      require(
+          controller.scheduleIfReady(76, 70, OLD_REQUEST_ID),
+          "guarded callback reaches production lifecycle seam");
+
+      scheduler.runNext();
+      require(lifecycleState.captures == 1, "production lifecycle state captured once");
+      require(moveAdapter.calls == 0, "failed lifecycle guard fences Android task move");
+      require(observer.failedAttempts == 0, "stale lifecycle is not retried as refusal");
+      require(observer.fallbacks == 1, "stale lifecycle selects safe foreground fallback");
+      require(!controller.owns(70, OLD_REQUEST_ID), "lifecycle fallback clears exact handoff");
+      require(scheduler.size() == 0, "lifecycle fallback leaves no queued callback");
+    }
+  }
+
+  private static void warmTaskMoveExceptionRetriesToForegroundFallback() {
+    FakeWarmTaskScheduler scheduler = new FakeWarmTaskScheduler();
+    FakeWarmTaskLifecycleStateSource lifecycleState =
+        new FakeWarmTaskLifecycleStateSource(77);
+    FakeWarmTaskMoveAdapter moveAdapter = new FakeWarmTaskMoveAdapter();
+    moveAdapter.enqueueFailure();
+    moveAdapter.enqueueFailure();
+    moveAdapter.enqueueFailure();
+    FakeWarmTaskObserver observer = new FakeWarmTaskObserver();
+    ExternalPlayerResultCoordinator.WarmTaskHandoffController controller =
+        warmTaskController(scheduler, lifecycleState, moveAdapter, observer);
+    require(controller.prepare(77, 71, OLD_REQUEST_ID, true), "throwing mover handoff prepared");
+    require(controller.markNativeReady(77, 71, OLD_REQUEST_ID), "throwing mover native ready");
+    require(
+        controller.scheduleIfReady(77, 71, OLD_REQUEST_ID),
+        "throwing mover callback posts");
+
+    scheduler.runNext();
+    scheduler.runNext();
+    scheduler.runNext();
+    require(moveAdapter.calls == 3, "move exceptions stop at the production retry bound");
+    require(observer.failedAttempts == 3, "each move exception maps to one refusal");
+    require(observer.schedulerRejections == 0, "move exception is not scheduler refusal");
+    require(observer.fallbacks == 1, "move exception exhaustion leaves Kodi foreground");
+    require(!controller.owns(71, OLD_REQUEST_ID), "move exception fallback clears exact state");
+    require(scheduler.size() == 0, "move exception exhaustion leaves no retry");
+  }
+
+  private static void warmTaskInitialPostRefusalRetriesExecutably() {
+    FakeWarmTaskScheduler scheduler = new FakeWarmTaskScheduler();
+    scheduler.enqueuePostResult(false);
+    scheduler.enqueueDelayedResult(true);
+    FakeWarmTaskLifecycleStateSource lifecycleState =
+        new FakeWarmTaskLifecycleStateSource(71);
+    FakeWarmTaskMoveAdapter moveAdapter = new FakeWarmTaskMoveAdapter();
+    FakeWarmTaskObserver observer = new FakeWarmTaskObserver();
+    ExternalPlayerResultCoordinator.WarmTaskHandoffController controller =
+        warmTaskController(scheduler, lifecycleState, moveAdapter, observer);
+    require(controller.prepare(71, 64, OLD_REQUEST_ID, true), "post-refusal handoff prepared");
+    require(controller.markNativeReady(71, 64, OLD_REQUEST_ID), "post-refusal native ready");
+
+    require(
+        !controller.scheduleIfReady(71, 64, OLD_REQUEST_ID),
+        "initial scheduler refusal is reported");
+    require(scheduler.postCalls == 1, "initial post attempted once");
+    require(scheduler.postDelayedCalls == 1, "scheduler refusal uses delayed retry");
+    require(observer.failedAttempts == 1, "initial post refusal is observed once");
+    require(observer.schedulerRejections == 1, "initial post refusal is classified safely");
+    require(scheduler.size() == 1, "accepted delayed retry remains queued");
+    scheduler.runNext();
+    require(moveAdapter.calls == 1, "accepted retry executes the production move seam");
+    require(!controller.owns(64, OLD_REQUEST_ID), "successful retry clears exact handoff");
+    require(observer.fallbacks == 0, "successful retry avoids foreground fallback");
+  }
+
+  private static void warmTaskDelayedPostRefusalExhaustsToFallback() {
+    FakeWarmTaskScheduler scheduler = new FakeWarmTaskScheduler();
+    scheduler.enqueueDelayedResult(false);
+    scheduler.enqueueDelayedResult(false);
+    FakeWarmTaskLifecycleStateSource lifecycleState =
+        new FakeWarmTaskLifecycleStateSource(72);
+    FakeWarmTaskMoveAdapter moveAdapter = new FakeWarmTaskMoveAdapter();
+    moveAdapter.enqueue(false);
+    FakeWarmTaskObserver observer = new FakeWarmTaskObserver();
+    ExternalPlayerResultCoordinator.WarmTaskHandoffController controller =
+        warmTaskController(scheduler, lifecycleState, moveAdapter, observer);
+    require(controller.prepare(72, 65, OLD_REQUEST_ID, true), "delayed-refusal prepared");
+    require(controller.markNativeReady(72, 65, OLD_REQUEST_ID), "delayed-refusal native ready");
+    require(
+        controller.scheduleIfReady(72, 65, OLD_REQUEST_ID),
+        "first move callback posts");
+
+    scheduler.runNext();
+    require(scheduler.postDelayedCalls == 2, "both delayed retry refusals are bounded");
+    require(observer.schedulerRejections == 2, "postDelayed false is executable twice");
+    require(observer.failedAttempts == 3, "move plus scheduler refusals consume three attempts");
+    require(observer.fallbacks == 1, "scheduler exhaustion selects foreground fallback");
+    require(!controller.owns(65, OLD_REQUEST_ID), "fallback clears exhausted exact state");
+    require(scheduler.size() == 0, "scheduler exhaustion leaves no inert callback");
+  }
+
+  private static void warmTaskMoveRetriesExhaustToForegroundFallback() {
+    FakeWarmTaskScheduler scheduler = new FakeWarmTaskScheduler();
+    FakeWarmTaskLifecycleStateSource lifecycleState =
+        new FakeWarmTaskLifecycleStateSource(73);
+    FakeWarmTaskMoveAdapter moveAdapter = new FakeWarmTaskMoveAdapter();
+    moveAdapter.enqueue(false);
+    moveAdapter.enqueue(false);
+    moveAdapter.enqueue(false);
+    FakeWarmTaskObserver observer = new FakeWarmTaskObserver();
+    ExternalPlayerResultCoordinator.WarmTaskHandoffController controller =
+        warmTaskController(scheduler, lifecycleState, moveAdapter, observer);
+    require(controller.prepare(73, 66, OLD_REQUEST_ID, true), "bounded move handoff prepared");
+    require(controller.markNativeReady(73, 66, OLD_REQUEST_ID), "bounded move native ready");
+    require(
+        controller.scheduleIfReady(73, 66, OLD_REQUEST_ID),
+        "bounded first move posts");
+
+    scheduler.runNext();
+    scheduler.runNext();
+    scheduler.runNext();
+    require(moveAdapter.calls == 3, "move refusal stops at the fixed bound");
+    require(observer.failedAttempts == 3, "each move refusal is observed");
+    require(observer.schedulerRejections == 0, "move refusal is not a scheduler leak");
+    require(observer.fallbacks == 1, "third move refusal selects explicit safe fallback");
+    require(!controller.owns(66, OLD_REQUEST_ID), "move exhaustion cannot retain inert state");
+    require(scheduler.size() == 0, "move exhaustion leaves no queued retry");
+  }
+
+  private static void warmTaskNewerLaunchFencesQueuedControllerCallback() {
+    FakeWarmTaskScheduler scheduler = new FakeWarmTaskScheduler();
+    FakeWarmTaskLifecycleStateSource lifecycleState =
+        new FakeWarmTaskLifecycleStateSource(74);
+    FakeWarmTaskMoveAdapter moveAdapter = new FakeWarmTaskMoveAdapter();
+    FakeWarmTaskObserver observer = new FakeWarmTaskObserver();
+    ExternalPlayerResultCoordinator.WarmTaskHandoffController controller =
+        warmTaskController(scheduler, lifecycleState, moveAdapter, observer);
+    require(controller.prepare(74, 67, OLD_REQUEST_ID, true), "queued old handoff prepared");
+    require(controller.markNativeReady(74, 67, OLD_REQUEST_ID), "queued old native ready");
+    require(
+        controller.scheduleIfReady(74, 67, OLD_REQUEST_ID),
+        "queued old callback posts");
+
+    require(controller.prepare(75, 68, NEW_REQUEST_ID, true), "newer launch replaces old state");
+    lifecycleState.state =
+        warmTaskLifecycleState(true, 75, false, false, false, 0, "");
+    require(scheduler.removeCalls == 1, "newer launch requests exact callback removal");
+    require(controller.markNativeReady(75, 68, NEW_REQUEST_ID), "newer native ready");
+    require(
+        controller.scheduleIfReady(75, 68, NEW_REQUEST_ID),
+        "newer callback posts");
+    require(scheduler.size() == 2, "removed old callback remains executable for race proof");
+
+    scheduler.runNext();
+    require(moveAdapter.calls == 0, "queued old callback cannot reach production move seam");
+    require(controller.owns(68, NEW_REQUEST_ID), "old callback cannot clear newer authority");
+    scheduler.runNext();
+    require(moveAdapter.calls == 1, "newer exact callback moves once");
+    require(moveAdapter.lastGeneration == 68, "only newer generation reaches task mover");
+    require(NEW_REQUEST_ID.equals(moveAdapter.lastRequestId), "only newer request reaches mover");
+    require(observer.fallbacks == 0, "stale queued callback cannot trigger fallback");
+  }
+
+  private static void warmTaskRetryCannotAttachToNewerSameLifecycleLaunch() {
+    FakeWarmTaskScheduler scheduler = new FakeWarmTaskScheduler();
+    FakeWarmTaskLifecycleStateSource lifecycleState =
+        new FakeWarmTaskLifecycleStateSource(74);
+    FakeWarmTaskMoveAdapter moveAdapter = new FakeWarmTaskMoveAdapter();
+    moveAdapter.enqueue(false);
+    AtomicReference<ExternalPlayerResultCoordinator.WarmTaskHandoffController> controllerRef =
+        new AtomicReference<>();
+    AtomicInteger failedAttempts = new AtomicInteger();
+    AtomicInteger fallbacks = new AtomicInteger();
+    ExternalPlayerResultCoordinator.WarmTaskHandoffObserver observer =
+        new ExternalPlayerResultCoordinator.WarmTaskHandoffObserver() {
+          @Override
+          public void onAttemptFailed(
+              int attemptNumber, int maxAttempts, boolean schedulerRejected) {
+            require(attemptNumber == 1, "old launch reports only its first failed attempt");
+            require(!schedulerRejected, "old move refusal is not a scheduler rejection");
+            failedAttempts.incrementAndGet();
+            ExternalPlayerResultCoordinator.WarmTaskHandoffController controller =
+                controllerRef.get();
+            require(
+                controller.prepare(74, 68, NEW_REQUEST_ID, true),
+                "newer launch replaces state before old retry scheduling");
+            require(
+                controller.markNativeReady(74, 68, NEW_REQUEST_ID),
+                "newer same-lifecycle launch becomes ready");
+          }
+
+          @Override
+          public void onFallback() {
+            fallbacks.incrementAndGet();
+          }
+        };
+    ExternalPlayerResultCoordinator.WarmTaskHandoffController controller =
+        warmTaskController(scheduler, lifecycleState, moveAdapter, observer);
+    controllerRef.set(controller);
+    require(controller.prepare(74, 67, OLD_REQUEST_ID, true), "old retry owner prepared");
+    require(controller.markNativeReady(74, 67, OLD_REQUEST_ID), "old retry owner ready");
+    require(
+        controller.scheduleIfReady(74, 67, OLD_REQUEST_ID),
+        "old retry callback posts");
+
+    scheduler.runNext();
+    require(failedAttempts.get() == 1, "old refusal is observed once");
+    require(scheduler.size() == 0, "old continuation cannot queue work for newer launch");
+    require(controller.owns(68, NEW_REQUEST_ID), "newer exact authority remains ready");
+    require(
+        controller.scheduleIfReady(74, 68, NEW_REQUEST_ID),
+        "newer owner schedules its own exact move");
+    scheduler.runNext();
+    require(moveAdapter.calls == 2, "old and newer owners each reach the mover once");
+    require(moveAdapter.lastGeneration == 68, "newer generation owns the second move");
+    require(NEW_REQUEST_ID.equals(moveAdapter.lastRequestId), "newer request owns the second move");
+    require(moveAdapter.lastAttemptNumber == 1, "old retry cannot consume newer attempt budget");
+    require(fallbacks.get() == 0, "newer-launch fencing does not trigger fallback");
+  }
+
+  private static void warmTaskDuplicateCallbacksAndNewerLaunchStayFenced() {
+    ExternalPlayerResultCoordinator.WarmTaskHandoff handoff =
+        new ExternalPlayerResultCoordinator.WarmTaskHandoff();
+    require(handoff.prepare(72, 65, OLD_REQUEST_ID, false), "old handoff prepared");
+    require(handoff.confirmCallerResult(0, OLD_REQUEST_ID), "old caller confirms by request");
+    require(
+        handoff.confirmCallerResult(0, OLD_REQUEST_ID),
+        "duplicate request-scoped caller callback accepted");
+    require(handoff.markNativeReady(72, 65, OLD_REQUEST_ID), "old native callback accepted");
+    require(handoff.markNativeReady(72, 65, OLD_REQUEST_ID), "duplicate native callback accepted");
+    ExternalPlayerResultCoordinator.WarmTaskHandoff.Attempt oldAttempt =
+        handoff.reserveAttempt(72, 65, OLD_REQUEST_ID);
+    require(oldAttempt != null, "old handoff reserves one callback");
+    require(
+        handoff.reserveAttempt(72, 65, OLD_REQUEST_ID) == null,
+        "duplicate callback cannot reserve another move");
+
+    require(handoff.prepare(73, 66, NEW_REQUEST_ID, false), "newer launch replaces old handoff");
+    require(
+        handoff.completeAttempt(oldAttempt, true)
+            == ExternalPlayerResultCoordinator.WarmTaskMoveResult.STALE,
+        "queued old callback cannot move newer launch");
+    require(handoff.owns(66, NEW_REQUEST_ID), "newer launch keeps exact ownership");
+    require(
+        !handoff.confirmCallerResult(65, OLD_REQUEST_ID),
+        "old caller callback cannot confirm newer launch");
+    require(
+        !handoff.markNativeReady(72, 65, OLD_REQUEST_ID),
+        "old native callback cannot ready newer launch");
+    require(handoff.confirmCallerResult(0, NEW_REQUEST_ID), "new caller confirms exactly");
+    require(
+        !handoff.markNativeReady(72, 66, NEW_REQUEST_ID),
+        "stale lifecycle cannot ready newer launch");
+    require(handoff.markNativeReady(73, 66, NEW_REQUEST_ID), "new lifecycle readies handoff");
+    ExternalPlayerResultCoordinator.WarmTaskHandoff.Attempt newAttempt =
+        handoff.reserveAttempt(73, 66, NEW_REQUEST_ID);
+    require(newAttempt != null, "newer launch reserves exact move");
+    require(
+        handoff.completeAttempt(newAttempt, true)
+            == ExternalPlayerResultCoordinator.WarmTaskMoveResult.MOVED,
+        "newer exact callback moves task");
+  }
+
   private static void normalTeardownTerminalizesExactOwnerOnce() {
     FakeHost host = new FakeHost();
     ExternalPlayerActivity.Controller controller =
@@ -711,6 +1283,17 @@ public final class ExternalPlayerResultCoordinatorTest {
   }
 
   public static void main(String[] args) throws Exception {
+    prePrepareCallerAcknowledgementConvergesThroughHandoff();
+    staleAndRejectedCallerConfirmationsStayFenced();
+    warmTaskMoveFailureRetriesWithoutLosingState();
+    warmTaskProductionLifecycleGuardsFenceMove();
+    warmTaskMoveExceptionRetriesToForegroundFallback();
+    warmTaskInitialPostRefusalRetriesExecutably();
+    warmTaskDelayedPostRefusalExhaustsToFallback();
+    warmTaskMoveRetriesExhaustToForegroundFallback();
+    warmTaskNewerLaunchFencesQueuedControllerCallback();
+    warmTaskRetryCannotAttachToNewerSameLifecycleLaunch();
+    warmTaskDuplicateCallbacksAndNewerLaunchStayFenced();
     for (int i = 0; i < 5000; ++i) {
       recreationPreservesForwardingAndExactBinding();
       processDeathRotatesOwnerWithoutStaleReplay();
