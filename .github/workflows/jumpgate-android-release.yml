@@ -1788,7 +1788,7 @@ jobs:
             const fullReleaseRef = 'refs/tags/' + tag;
             const shortReleaseRef = 'tags/' + tag;
             const releaseName = 'Jumpgate ' + versionName;
-            const assetContentType = 'application/octet-stream';
+            const uploadAssetContentType = 'application/octet-stream';
             const canonicalTagPattern = /^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/;
             const shaPattern = /^[0-9a-f]{40}$/;
             const ownershipMarker = [
@@ -1858,6 +1858,13 @@ jobs:
 
             function sameStrings(left, right) {
               return JSON.stringify(left) === JSON.stringify(right);
+            }
+
+            function expectedReleaseAssetContentType(name) {
+              // GitHub normalizes APK assets by extension even for octet-stream uploads.
+              return name.endsWith('.apk')
+                ? 'application/vnd.android.package-archive'
+                : uploadAssetContentType;
             }
 
             function historyFingerprint(releaseTags, tagRefs) {
@@ -1959,7 +1966,7 @@ jobs:
                   || asset.id !== expected.id
                   || asset.size !== expected.size
                   || asset.digest !== expected.digest
-                  || asset.content_type !== assetContentType
+                  || asset.content_type !== expected.contentType
                   || asset.state !== 'uploaded'
                 ) {
                   throw new Error(
@@ -1981,7 +1988,7 @@ jobs:
                 || asset.id !== assetId
                 || asset.name !== expected.name
                 || asset.size !== expected.size
-                || asset.content_type !== assetContentType
+                || asset.content_type !== expected.contentType
                 || !['open', 'uploaded'].includes(asset.state)
                 || (asset.digest != null && asset.digest !== expected.digest)
               ) {
@@ -2403,6 +2410,7 @@ jobs:
                     name,
                     size: stat.size,
                     digest: 'sha256:' + crypto.createHash('sha256').update(data).digest('hex'),
+                    contentType: expectedReleaseAssetContentType(name),
                   };
                   const response = await github.rest.repos.uploadReleaseAsset({
                     owner,
@@ -2410,7 +2418,7 @@ jobs:
                     release_id: release.id,
                     name,
                     headers: {
-                      'content-type': assetContentType,
+                      'content-type': uploadAssetContentType,
                       'content-length': stat.size,
                     },
                     data,
@@ -2422,6 +2430,7 @@ jobs:
                     || uploaded.id <= 0
                     || uploadedAssetIds.has(uploaded.id)
                     || uploaded.name !== name
+                    || uploaded.content_type !== expected.contentType
                     || !['open', 'uploaded'].includes(uploaded.state)
                     || (uploaded.digest != null && uploaded.digest !== expected.digest)
                   ) {

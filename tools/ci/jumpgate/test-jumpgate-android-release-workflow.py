@@ -763,7 +763,7 @@ for required_create_only_token in (
     "asset.id !== expected.id",
     "asset.size !== expected.size",
     "asset.digest !== expected.digest",
-    "asset.content_type !== assetContentType",
+    "asset.content_type !== expected.contentType",
     "asset.state !== 'uploaded'",
     "observedAssets.length !== expectedAssets.size",
     "expectedAssets.get(asset.name)",
@@ -1088,7 +1088,9 @@ async function runScenario(scenario) {
       name,
       size: data.length,
       digest: 'sha256:' + crypto.createHash('sha256').update(data).digest('hex'),
-      content_type: 'application/octet-stream',
+      content_type: name.endsWith('.apk')
+        ? 'application/vnd.android.package-archive'
+        : 'application/octet-stream',
       state: 'uploaded',
     };
   }
