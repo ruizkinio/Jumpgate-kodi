@@ -23,6 +23,7 @@ import android.os.Message;
 import android.provider.Settings;
 import android.text.Html;
 import android.text.method.LinkMovementMethod;
+import android.graphics.Color;
 import android.util.Log;
 import android.view.View;
 import android.widget.ProgressBar;
@@ -106,7 +107,8 @@ public class Splash extends Activity
           showInfoDialog(getString(R.string.notice_dialog, "@APP_NAME@"), CheckingPermissions);
           break;
         case RecordAudioInfo:
-          showInfoDialog(getString(R.string.record_audio_dialog, "@APP_NAME@"), RecordAudioPermission);
+          showInfoDialog(
+              getString(R.string.record_audio_dialog, "@APP_NAME@"), RecordAudioPermission);
           break;
         case RecordAudioPermission:
           requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO},
@@ -611,12 +613,22 @@ public class Splash extends Activity
       unregisterReceiver(mExternalStorageReceiver);
   }
 
+  protected boolean prepareToStartXBMC(Bundle savedInstanceState) {
+    return false;
+  }
+
   protected void startXBMC()
   {
     // Run @APP_NAME@
-    Intent intent = getIntent();
+    Intent intent = new Intent(getIntent());
     intent.setClass(this, @APP_PACKAGE@.Main.class);
-    intent.addFlags(Intent.FLAG_ACTIVITY_PREVIOUS_IS_TOP);
+    int contentGrantFlags =
+        intent.getFlags()
+            & (Intent.FLAG_GRANT_READ_URI_PERMISSION
+                | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+                | Intent.FLAG_GRANT_PREFIX_URI_PERMISSION);
+    intent.setFlags(contentGrantFlags | Intent.FLAG_ACTIVITY_PREVIOUS_IS_TOP);
     startActivity(intent);
     finish();
   }
@@ -624,10 +636,29 @@ public class Splash extends Activity
   @Override
   public void onCreate(Bundle savedInstanceState)
   {
+    // For external player mode, black out Splash so the user doesn't see
+    // "Starting Kodi..." text or the splash layout during initialization.
+    // This runs before super.onCreate() to catch Android's preview window too.
+    boolean isExternalPlayer = Intent.ACTION_VIEW.equals(getIntent().getAction())
+            && getIntent().getData() != null;
+    if (isExternalPlayer) {
+      getWindow().getDecorView().setBackgroundColor(Color.BLACK);
+    }
+
     super.onCreate(savedInstanceState);
+
+    if (prepareToStartXBMC(savedInstanceState)) return;
 
     // Be sure properties are initialized for native
     XBMCProperties.initialize(getApplicationContext());
+
+    // In external player mode, ensure a content view is attached before any early
+    // return/startXBMC path to reduce risk of ANR during rapid activity chaining.
+    if (isExternalPlayer) {
+      View blank = new View(this);
+      blank.setBackgroundColor(Color.BLACK);
+      setContentView(blank);
+    }
 
     if (Main.isActivityRunning()) {
       Log.d(TAG, "@APP_NAME@ already running; just activate it");
@@ -674,6 +705,12 @@ public class Splash extends Activity
     mProgress = findViewById(R.id.progressBar1);
     mProgress.setVisibility(View.INVISIBLE);
     mTextView = findViewById(R.id.textView1);
+
+    // In external player mode, hide splash text/progress — user sees black until Main's overlay
+    if (isExternalPlayer) {
+      mTextView.setVisibility(View.GONE);
+      mProgress.setVisibility(View.GONE);
+    }
 
     if (mState == InError || mState == CheckingPermissionsInfo)
     {

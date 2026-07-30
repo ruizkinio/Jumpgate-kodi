@@ -1,0 +1,405 @@
+package @APP_PACKAGE@;
+
+import android.app.Activity;
+import android.content.Context;
+import android.content.Intent;
+import android.content.SharedPreferences;
+
+public final class ExternalPlayerResultStore {
+  private static final String PREFERENCES = "@APP_PACKAGE@.jumpgate.external_player_results";
+  private static final String OWNER_READY = ".owner_ready";
+  private static final String FORWARDED = ".forwarded";
+  private static final String GENERATION = ".generation";
+  private static final String OWNER_COMPLETED = ".owner_completed";
+  private static final String OWNER_CANCELED = ".owner_canceled";
+  private static final String TERMINAL_READY = ".terminal_ready";
+  private static final String POSITION = ".position";
+  private static final String DURATION = ".duration";
+  private static final String COMPLETED = ".completed";
+  private static final String EXIT_PROCESS = ".exit_process";
+  private static final String PROCESS_EXIT_READY = "process_exit.ready";
+  private static final String PROCESS_EXIT_REQUEST_ID = "process_exit.request_id";
+  private static final String PROCESS_EXIT_GENERATION = "process_exit.generation";
+  private static final String PROCESS_EXIT_REQUESTED = "process_exit.requested";
+  private static final String PROCESS_EXIT_ACKNOWLEDGED = "process_exit.acknowledged";
+  private static final String PROCESS_EXIT_CLAIMED = "process_exit.claimed";
+
+  private ExternalPlayerResultStore() {}
+
+  public static synchronized boolean writeOwner(
+      Context context, ExternalPlayerResultCoordinator.Owner owner) {
+    return context != null && owner != null && writeOwner(preferences(context), owner);
+  }
+
+  public static synchronized ExternalPlayerResultCoordinator.Owner readOwner(
+      Context context, String requestId) {
+    if (context == null || !ExternalPlayerResultCoordinator.isValidRequestId(requestId))
+      return null;
+
+    return readOwner(preferences(context), requestId);
+  }
+
+  public static synchronized ExternalPlayerResultCoordinator.Owner bind(
+      Context context, String requestId, long generation) {
+    return bind(context, requestId, generation, false);
+  }
+
+  public static synchronized ExternalPlayerResultCoordinator.Owner bindActive(
+      Context context, String requestId, long generation) {
+    return bind(context, requestId, generation, true);
+  }
+
+  private static ExternalPlayerResultCoordinator.Owner bind(
+      Context context, String requestId, long generation, boolean activateProcessExit) {
+    if (context == null
+        || !ExternalPlayerResultCoordinator.isValidRequestId(requestId)
+        || generation <= 0) return null;
+
+    SharedPreferences preferences = preferences(context);
+    ExternalPlayerResultCoordinator.Owner owner = readOwner(preferences, requestId);
+    if (owner == null || !owner.bind(generation, requestId)) return null;
+
+    ExternalPlayerResultCoordinator.ProcessExitState processExitState = null;
+    if (activateProcessExit) {
+      processExitState = readProcessExitState(preferences);
+      if (!processExitState.activate(generation, requestId)) return null;
+    }
+
+    SharedPreferences.Editor editor = preferences.edit();
+    putOwner(editor, owner);
+    if (processExitState != null) putProcessExitState(editor, processExitState);
+    if (!editor.commit()) return null;
+
+    Intent binding = new Intent(ExternalPlayerResultCoordinator.ACTION_BINDING);
+    binding.setPackage(context.getPackageName());
+    binding.putExtra(ExternalPlayerResultCoordinator.EXTRA_REQUEST_ID, requestId);
+    binding.putExtra(ExternalPlayerResultCoordinator.EXTRA_GENERATION, generation);
+    context.sendBroadcast(binding);
+    return owner;
+  }
+
+  public static synchronized boolean publish(
+      Context context, ExternalPlayerResultCoordinator.Terminal terminal) {
+    if (context == null || terminal == null) return false;
+
+    SharedPreferences preferences = preferences(context);
+    ExternalPlayerResultCoordinator.Owner owner = readOwner(preferences, terminal.requestId);
+    if (owner == null || owner.wasCompleted() || owner.wasCanceled() || !owner.matches(terminal))
+      return false;
+    if (preferences.getBoolean(terminalKey(terminal, TERMINAL_READY), false)) return false;
+
+    ExternalPlayerResultCoordinator.ProcessExitState processExitState = null;
+    if (terminal.exitProcess) {
+      processExitState = readProcessExitState(preferences);
+      if (!processExitState.requestExit(terminal.generation, terminal.requestId)) return false;
+    }
+
+    SharedPreferences.Editor editor =
+        preferences
+            .edit()
+            .putLong(terminalKey(terminal, POSITION), terminal.positionMs)
+            .putLong(terminalKey(terminal, DURATION), terminal.durationMs)
+            .putBoolean(terminalKey(terminal, COMPLETED), terminal.completed)
+            .putBoolean(terminalKey(terminal, EXIT_PROCESS), terminal.exitProcess)
+            .putBoolean(terminalKey(terminal, TERMINAL_READY), true);
+    if (processExitState != null) putProcessExitState(editor, processExitState);
+    if (!editor.commit()) return false;
+
+    Intent delivery = toDeliveryIntent(terminal);
+    delivery.setPackage(context.getPackageName());
+    context.sendBroadcast(delivery);
+    return true;
+  }
+
+  public static synchronized ExternalPlayerResultCoordinator.Terminal read(
+      Context context, String requestId, long generation) {
+    if (context == null
+        || !ExternalPlayerResultCoordinator.isValidRequestId(requestId)
+        || generation <= 0) return null;
+
+    SharedPreferences preferences = preferences(context);
+    ExternalPlayerResultCoordinator.Owner owner = readOwner(preferences, requestId);
+    if (owner == null || owner.expectedGeneration() != generation || owner.wasCanceled())
+      return null;
+    if (!preferences.getBoolean(terminalKey(requestId, generation, TERMINAL_READY), false))
+      return null;
+
+    return new ExternalPlayerResultCoordinator.Terminal(
+        requestId,
+        generation,
+        preferences.getLong(terminalKey(requestId, generation, POSITION), 0),
+        preferences.getLong(terminalKey(requestId, generation, DURATION), 0),
+        preferences.getBoolean(terminalKey(requestId, generation, COMPLETED), false),
+        preferences.getBoolean(terminalKey(requestId, generation, EXIT_PROCESS), false));
+  }
+
+  public static long bindingFromIntent(Intent intent, String requestId) {
+    if (intent == null
+        || !ExternalPlayerResultCoordinator.ACTION_BINDING.equals(intent.getAction())
+        || !ExternalPlayerResultCoordinator.isValidRequestId(requestId)
+        || !requestId.equals(
+            intent.getStringExtra(ExternalPlayerResultCoordinator.EXTRA_REQUEST_ID))) return 0;
+
+    return Math.max(0, intent.getLongExtra(ExternalPlayerResultCoordinator.EXTRA_GENERATION, 0));
+  }
+
+  public static ExternalPlayerResultCoordinator.Terminal fromDeliveryIntent(Intent intent) {
+    if (intent == null || !ExternalPlayerResultCoordinator.ACTION_RESULT.equals(intent.getAction()))
+      return null;
+
+    String requestId = intent.getStringExtra(ExternalPlayerResultCoordinator.EXTRA_REQUEST_ID);
+    long generation = intent.getLongExtra(ExternalPlayerResultCoordinator.EXTRA_GENERATION, 0);
+    if (!ExternalPlayerResultCoordinator.isValidRequestId(requestId) || generation <= 0)
+      return null;
+
+    return new ExternalPlayerResultCoordinator.Terminal(
+        requestId,
+        generation,
+        intent.getLongExtra(ExternalPlayerResultCoordinator.EXTRA_POSITION_MS, 0),
+        intent.getLongExtra(ExternalPlayerResultCoordinator.EXTRA_DURATION_MS, 0),
+        intent.getBooleanExtra(ExternalPlayerResultCoordinator.EXTRA_COMPLETED, false),
+        intent.getBooleanExtra(ExternalPlayerResultCoordinator.EXTRA_EXIT_PROCESS, false));
+  }
+
+  public static synchronized boolean acknowledgeExit(
+      Context context, String requestId, long generation) {
+    if (context == null
+        || !ExternalPlayerResultCoordinator.isValidRequestId(requestId)
+        || generation <= 0) return false;
+
+    SharedPreferences preferences = preferences(context);
+    ExternalPlayerResultCoordinator.Owner owner = readOwner(preferences, requestId);
+    if (owner == null
+        || owner.expectedGeneration() != generation
+        || !owner.wasCompleted()
+        || owner.wasCanceled()
+        || !preferences.getBoolean(terminalKey(requestId, generation, TERMINAL_READY), false)
+        || !preferences.getBoolean(terminalKey(requestId, generation, EXIT_PROCESS), false))
+      return false;
+
+    ExternalPlayerResultCoordinator.ProcessExitState processExitState =
+        readProcessExitState(preferences);
+    if (!processExitState.acknowledge(generation, requestId)) return false;
+    SharedPreferences.Editor editor = preferences.edit();
+    putProcessExitState(editor, processExitState);
+    return editor.commit();
+  }
+
+  public static synchronized boolean acknowledgeCanceledExit(
+      Context context, String requestId, long generation) {
+    if (context == null
+        || !ExternalPlayerResultCoordinator.isValidRequestId(requestId)
+        || generation <= 0) return false;
+
+    SharedPreferences preferences = preferences(context);
+    ExternalPlayerResultCoordinator.Owner owner = readOwner(preferences, requestId);
+    if (owner == null
+        || owner.expectedGeneration() != generation
+        || !owner.wasCompleted()
+        || !owner.wasCanceled()) return false;
+
+    ExternalPlayerResultCoordinator.ProcessExitState processExitState =
+        readProcessExitState(preferences);
+    if (!processExitState.requestExit(generation, requestId)
+        || !processExitState.acknowledge(generation, requestId)) return false;
+
+    SharedPreferences.Editor editor = preferences.edit();
+    putProcessExitState(editor, processExitState);
+    return editor.commit();
+  }
+
+  public static synchronized boolean isExitAcknowledged(
+      Context context, String requestId, long generation) {
+    if (context == null
+        || !ExternalPlayerResultCoordinator.isValidRequestId(requestId)
+        || generation <= 0) return false;
+
+    return readProcessExitState(preferences(context)).isAcknowledged(generation, requestId);
+  }
+
+  public static synchronized boolean executeAcknowledgedProcessExit(
+      Context context, String requestId, long generation, Runnable terminator) {
+    if (context == null
+        || terminator == null
+        || !ExternalPlayerResultCoordinator.isValidRequestId(requestId)
+        || generation <= 0) return false;
+
+    SharedPreferences preferences = preferences(context);
+    ExternalPlayerResultCoordinator.ProcessExitState processExitState =
+        readProcessExitState(preferences);
+    if (!processExitState.claim(generation, requestId)) return false;
+
+    SharedPreferences.Editor editor = preferences.edit();
+    putProcessExitState(editor, processExitState);
+    if (!editor.commit()) return false;
+
+    // Keep the authority lock through termination so a newer activation either wins before this
+    // claim or cannot be admitted into a process that is already being terminated.
+    terminator.run();
+    return true;
+  }
+
+  public static synchronized boolean clear(Context context, String requestId, long generation) {
+    if (context == null
+        || !ExternalPlayerResultCoordinator.isValidRequestId(requestId)
+        || generation <= 0) return false;
+
+    SharedPreferences preferences = preferences(context);
+    ExternalPlayerResultCoordinator.Owner owner = readOwner(preferences, requestId);
+    if (owner == null || owner.expectedGeneration() != generation) return false;
+
+    SharedPreferences.Editor editor =
+        removeOwner(preferences.edit(), requestId)
+            .remove(terminalKey(requestId, generation, TERMINAL_READY))
+            .remove(terminalKey(requestId, generation, POSITION))
+            .remove(terminalKey(requestId, generation, DURATION))
+            .remove(terminalKey(requestId, generation, COMPLETED))
+            .remove(terminalKey(requestId, generation, EXIT_PROCESS));
+    ExternalPlayerResultCoordinator.ProcessExitState processExitState =
+        readProcessExitState(preferences);
+    if (processExitState.matches(generation, requestId)
+        && !processExitState.isAcknowledged(generation, requestId)) {
+      processExitState.clear(generation, requestId);
+      putProcessExitState(editor, processExitState);
+    }
+    return editor.commit();
+  }
+
+  public static synchronized boolean clearUnbound(Context context, String requestId) {
+    if (context == null || !ExternalPlayerResultCoordinator.isValidRequestId(requestId))
+      return false;
+
+    SharedPreferences preferences = preferences(context);
+    ExternalPlayerResultCoordinator.Owner owner = readOwner(preferences, requestId);
+    if (owner == null || owner.expectedGeneration() != 0) return false;
+    return removeOwner(preferences.edit(), requestId).commit();
+  }
+
+  public static Intent toCallerResult(ExternalPlayerResultCoordinator.Terminal terminal) {
+    Intent result = new Intent("org.videolan.vlc.player.result");
+    result.putExtra("extra_position", terminal.positionMs);
+    result.putExtra("extra_duration", terminal.durationMs);
+    result.putExtra("position", (int) terminal.positionMs);
+    result.putExtra("duration", (int) terminal.durationMs);
+    result.putExtra("end_by", terminal.completed ? "playback_completion" : "user");
+    result.putExtra("jumpgate_failed_to_start", terminal.failedToStart());
+    return result;
+  }
+
+  public static int resultCode(ExternalPlayerResultCoordinator.Terminal terminal) {
+    return terminal.failedToStart() ? Activity.RESULT_CANCELED : Activity.RESULT_OK;
+  }
+
+  private static ExternalPlayerResultCoordinator.Owner readOwner(
+      SharedPreferences preferences, String requestId) {
+    if (!preferences.getBoolean(ownerKey(requestId, OWNER_READY), false)) return null;
+
+    try {
+      return new ExternalPlayerResultCoordinator.Owner(
+          requestId,
+          preferences.getBoolean(ownerKey(requestId, FORWARDED), false),
+          preferences.getLong(ownerKey(requestId, GENERATION), 0),
+          preferences.getBoolean(ownerKey(requestId, OWNER_COMPLETED), false),
+          preferences.getBoolean(ownerKey(requestId, OWNER_CANCELED), false));
+    } catch (IllegalArgumentException e) {
+      return null;
+    }
+  }
+
+  private static boolean writeOwner(
+      SharedPreferences preferences, ExternalPlayerResultCoordinator.Owner owner) {
+    SharedPreferences.Editor editor = preferences.edit();
+    putOwner(editor, owner);
+    return editor.commit();
+  }
+
+  private static void putOwner(
+      SharedPreferences.Editor editor, ExternalPlayerResultCoordinator.Owner owner) {
+    editor
+        .putBoolean(ownerKey(owner.requestId(), FORWARDED), owner.wasLaunchForwarded())
+        .putLong(ownerKey(owner.requestId(), GENERATION), owner.expectedGeneration())
+        .putBoolean(ownerKey(owner.requestId(), OWNER_COMPLETED), owner.wasCompleted())
+        .putBoolean(ownerKey(owner.requestId(), OWNER_CANCELED), owner.wasCanceled())
+        .putBoolean(ownerKey(owner.requestId(), OWNER_READY), true);
+  }
+
+  private static SharedPreferences.Editor removeOwner(
+      SharedPreferences.Editor editor, String requestId) {
+    return editor
+        .remove(ownerKey(requestId, OWNER_READY))
+        .remove(ownerKey(requestId, FORWARDED))
+        .remove(ownerKey(requestId, GENERATION))
+        .remove(ownerKey(requestId, OWNER_COMPLETED))
+        .remove(ownerKey(requestId, OWNER_CANCELED));
+  }
+
+  private static ExternalPlayerResultCoordinator.ProcessExitState readProcessExitState(
+      SharedPreferences preferences) {
+    if (!preferences.getBoolean(PROCESS_EXIT_READY, false))
+      return new ExternalPlayerResultCoordinator.ProcessExitState();
+
+    try {
+      return new ExternalPlayerResultCoordinator.ProcessExitState(
+          preferences.getString(PROCESS_EXIT_REQUEST_ID, ""),
+          preferences.getLong(PROCESS_EXIT_GENERATION, 0),
+          preferences.getBoolean(PROCESS_EXIT_REQUESTED, false),
+          preferences.getBoolean(PROCESS_EXIT_ACKNOWLEDGED, false),
+          preferences.getBoolean(PROCESS_EXIT_CLAIMED, false));
+    } catch (IllegalArgumentException e) {
+      return new ExternalPlayerResultCoordinator.ProcessExitState();
+    }
+  }
+
+  private static void putProcessExitState(
+      SharedPreferences.Editor editor,
+      ExternalPlayerResultCoordinator.ProcessExitState processExitState) {
+    if (!processExitState.isActive()) {
+      editor
+          .remove(PROCESS_EXIT_READY)
+          .remove(PROCESS_EXIT_REQUEST_ID)
+          .remove(PROCESS_EXIT_GENERATION)
+          .remove(PROCESS_EXIT_REQUESTED)
+          .remove(PROCESS_EXIT_ACKNOWLEDGED)
+          .remove(PROCESS_EXIT_CLAIMED);
+      return;
+    }
+
+    editor
+        .putString(PROCESS_EXIT_REQUEST_ID, processExitState.requestId())
+        .putLong(PROCESS_EXIT_GENERATION, processExitState.generation())
+        .putBoolean(PROCESS_EXIT_REQUESTED, processExitState.wasExitRequested())
+        .putBoolean(PROCESS_EXIT_ACKNOWLEDGED, processExitState.wasAcknowledged())
+        .putBoolean(PROCESS_EXIT_CLAIMED, processExitState.wasClaimed())
+        .putBoolean(PROCESS_EXIT_READY, true);
+  }
+
+  private static Intent toDeliveryIntent(ExternalPlayerResultCoordinator.Terminal terminal) {
+    Intent intent = new Intent(ExternalPlayerResultCoordinator.ACTION_RESULT);
+    intent.putExtra(ExternalPlayerResultCoordinator.EXTRA_REQUEST_ID, terminal.requestId);
+    intent.putExtra(ExternalPlayerResultCoordinator.EXTRA_GENERATION, terminal.generation);
+    intent.putExtra(ExternalPlayerResultCoordinator.EXTRA_POSITION_MS, terminal.positionMs);
+    intent.putExtra(ExternalPlayerResultCoordinator.EXTRA_DURATION_MS, terminal.durationMs);
+    intent.putExtra(ExternalPlayerResultCoordinator.EXTRA_COMPLETED, terminal.completed);
+    intent.putExtra(ExternalPlayerResultCoordinator.EXTRA_EXIT_PROCESS, terminal.exitProcess);
+    return intent;
+  }
+
+  private static SharedPreferences preferences(Context context) {
+    Context applicationContext = context.getApplicationContext();
+    Context owner = applicationContext != null ? applicationContext : context;
+    return owner.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE);
+  }
+
+  private static String ownerKey(String requestId, String suffix) {
+    return requestId + suffix;
+  }
+
+  private static String terminalKey(
+      ExternalPlayerResultCoordinator.Terminal terminal, String suffix) {
+    return terminalKey(terminal.requestId, terminal.generation, suffix);
+  }
+
+  private static String terminalKey(String requestId, long generation, String suffix) {
+    return requestId + "." + generation + suffix;
+  }
+}

@@ -45,6 +45,9 @@ android {
             assets.srcDirs = ['assets']
             jniLibs.srcDirs = ['lib']
         }
+        test {
+            java.srcDirs = ['test']
+        }
     }
     packagingOptions{
       doNotStrip '**.setup'
@@ -55,7 +58,7 @@ android {
 }
 
 project.afterEvaluate {
-    preBuild.dependsOn
+    preBuild.dependsOn 'externalPlayerResultTests'
 }
 
 dependencies {
@@ -68,4 +71,42 @@ java {
     toolchain {
         languageVersion = JavaLanguageVersion.of(17)
     }
+}
+
+def androidApi36Jar = file("${android.sdkDirectory}/platforms/android-36/android.jar")
+def externalPlayerTestClasses = layout.buildDirectory.dir('classes/externalPlayerResultTest')
+
+tasks.register('compileExternalPlayerResultTests', JavaCompile) {
+    group = 'verification'
+    description = 'Strictly compiles the production external-player result seam against API 36.'
+    source files(
+        'src/ExternalPlayerActivity.java',
+        'src/ExternalPlayerResultCoordinator.java',
+        'src/ExternalPlayerResultStore.java'
+    )
+    source fileTree('test') { include '**/*.java' }
+    source fileTree('test-support') { include '**/*.java' }
+    classpath = files(androidApi36Jar)
+    destinationDirectory = externalPlayerTestClasses
+    options.release = 17
+    options.encoding = 'UTF-8'
+    options.compilerArgs.addAll(['-Xlint:all', '-Werror'])
+    doFirst {
+        if (!androidApi36Jar.isFile()) {
+            throw new GradleException("Android API 36 is required: ${androidApi36Jar}")
+        }
+    }
+}
+
+tasks.register('externalPlayerResultTests', JavaExec) {
+    group = 'verification'
+    description = 'Runs production coordinator race tests and activity-controller behavior tests.'
+    dependsOn tasks.named('compileExternalPlayerResultTests')
+    classpath = files(externalPlayerTestClasses, androidApi36Jar)
+    mainClass = '@APP_PACKAGE@.ExternalPlayerResultCoordinatorTest'
+    jvmArgs '-ea'
+}
+
+tasks.named('check').configure {
+    dependsOn tasks.named('externalPlayerResultTests')
 }

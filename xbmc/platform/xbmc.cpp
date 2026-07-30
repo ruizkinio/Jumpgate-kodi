@@ -17,11 +17,28 @@
 
 #if defined(TARGET_ANDROID)
 #include "platform/android/activity/XBMCApp.h"
+
+namespace
+{
+class CAndroidJumpgateShutdownGuard final
+{
+public:
+  ~CAndroidJumpgateShutdownGuard()
+  {
+    if (CXBMCApp::HasInstance())
+      CXBMCApp::Get().Deinitialize();
+  }
+};
+} // namespace
 #endif
 
 extern "C" int XBMC_Run(bool renderGUI)
 {
   int status = -1;
+
+#if defined(TARGET_ANDROID)
+  CAndroidJumpgateShutdownGuard jumpgateShutdownGuard;
+#endif
 
   if (!g_application.Create())
   {
@@ -71,10 +88,6 @@ extern "C" int XBMC_Run(bool renderGUI)
     pEnumerator->UnregisterEndpointNotificationCallback(&cMMNC);
     pEnumerator = nullptr;
   }
-#endif
-
-#if defined(TARGET_ANDROID)
-  CXBMCApp::Get().Deinitialize();
 #endif
 
   return status;

@@ -1,0 +1,465 @@
+package @APP_PACKAGE@;
+
+import android.content.BroadcastReceiver;
+import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
+import android.os.Build;
+import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.util.Log;
+
+public class ExternalPlayerActivity extends Splash {
+  private static final String TAG = "ExternalPlayerActivity";
+  private static final String REQUEST_STATE = "external_player_result_request";
+  private static final String FORWARDED_STATE = "external_player_launch_forwarded";
+  private static final String GENERATION_STATE = "external_player_expected_generation";
+  private static final String COMPLETED_STATE = "external_player_owner_completed";
+  private static final String CANCELED_STATE = "external_player_owner_canceled";
+  private static final long PROCESS_RECOVERY_DELAY_MS = 1500L;
+
+  interface Host {
+    boolean persist(ExternalPlayerResultCoordinator.Owner owner);
+
+    boolean startMain(String requestId);
+
+    void setTerminalResult(ExternalPlayerResultCoordinator.Terminal terminal);
+
+    void setCanceledResult();
+
+    void finishOwner();
+
+    void clearExact(String requestId, long generation);
+
+    void clearUnbound(String requestId);
+
+    void cancelNative(String requestId, long generation);
+
+    boolean acknowledge(ExternalPlayerResultCoordinator.Terminal terminal);
+
+    void confirmWarmTaskHandoff(long generation, String requestId);
+  }
+
+  static final class Controller {
+    private final Host mHost;
+    private ExternalPlayerResultCoordinator.Owner mOwner;
+
+    Controller(Host host, ExternalPlayerResultCoordinator.Owner owner) {
+      if (host == null || owner == null)
+        throw new IllegalArgumentException("External-player controller requires a host and owner");
+      mHost = host;
+      mOwner = owner;
+    }
+
+    synchronized boolean forwardOnce() {
+      if (!mOwner.markLaunchForwarded()) return false;
+      if (!mHost.persist(mOwner.copy())) {
+        mOwner.rollbackLaunchForwarded();
+        return false;
+      }
+
+      if (mHost.startMain(mOwner.requestId())) return true;
+
+      mOwner.rollbackLaunchForwarded();
+      mHost.persist(mOwner.copy());
+      return false;
+    }
+
+    synchronized boolean bindGeneration(long generation) {
+      if (!mOwner.bind(generation, mOwner.requestId())) return false;
+      return mHost.persist(mOwner.copy());
+    }
+
+    synchronized boolean deliver(ExternalPlayerResultCoordinator.Terminal terminal) {
+      ExternalPlayerResultCoordinator.Owner completedOwner = mOwner.copy();
+      if (!completedOwner.claim(terminal) || !mHost.persist(completedOwner.copy())) return false;
+
+      mOwner = completedOwner;
+      mHost.setTerminalResult(terminal);
+      mHost.finishOwner();
+      if (terminal.exitProcess) {
+        if (!mHost.acknowledge(terminal))
+          mHost.clearExact(terminal.requestId, terminal.generation);
+      } else {
+        mHost.confirmWarmTaskHandoff(terminal.generation, terminal.requestId);
+        mHost.clearExact(terminal.requestId, terminal.generation);
+      }
+      return true;
+    }
+
+    synchronized boolean cancelForCaller() {
+      ExternalPlayerResultCoordinator.Owner canceledOwner = canceledOwner();
+      if (canceledOwner == null || !mHost.persist(canceledOwner.copy())) return false;
+
+      mOwner = canceledOwner;
+      long generation = canceledOwner.expectedGeneration();
+      String requestId = canceledOwner.requestId();
+      mHost.setCanceledResult();
+      mHost.finishOwner();
+      mHost.confirmWarmTaskHandoff(generation, requestId);
+      finishCancellation(requestId, generation);
+      return true;
+    }
+
+    synchronized boolean abandonFinishedOwner() {
+      ExternalPlayerResultCoordinator.Owner canceledOwner = canceledOwner();
+      if (canceledOwner == null || !mHost.persist(canceledOwner.copy())) return false;
+
+      mOwner = canceledOwner;
+      long generation = canceledOwner.expectedGeneration();
+      String requestId = canceledOwner.requestId();
+      finishCancellation(requestId, generation);
+      return true;
+    }
+
+    synchronized boolean cancelForTeardown(String requestId, long generation) {
+      if (!mOwner.requestId().equals(requestId) || mOwner.expectedGeneration() != generation)
+        return false;
+      ExternalPlayerResultCoordinator.Owner canceledOwner = canceledOwner();
+      if (canceledOwner == null || !mHost.persist(canceledOwner.copy())) return false;
+
+      mOwner = canceledOwner;
+      mHost.setCanceledResult();
+      mHost.finishOwner();
+      mHost.confirmWarmTaskHandoff(generation, requestId);
+      if (generation > 0) mHost.clearExact(requestId, generation);
+      else mHost.clearUnbound(requestId);
+      return true;
+    }
+
+    synchronized boolean recoverAfterProcessDeath(String replacementRequestId) {
+      if (!needsProcessRecovery()
+          || !ExternalPlayerResultCoordinator.isValidRequestId(replacementRequestId)
+          || replacementRequestId.equals(mOwner.requestId())) return false;
+
+      String staleRequestId = mOwner.requestId();
+      long staleGeneration = mOwner.expectedGeneration();
+      ExternalPlayerResultCoordinator.Owner replacementOwner =
+          new ExternalPlayerResultCoordinator.Owner(
+              replacementRequestId, false, 0, false, false);
+      if (!mHost.persist(replacementOwner.copy())) return false;
+
+      if (staleGeneration > 0) mHost.clearExact(staleRequestId, staleGeneration);
+      else mHost.clearUnbound(staleRequestId);
+
+      mOwner = replacementOwner;
+      return forwardOnce();
+    }
+
+    synchronized boolean needsProcessRecovery() {
+      return mOwner.wasLaunchForwarded() && !mOwner.wasCompleted();
+    }
+
+    synchronized ExternalPlayerResultCoordinator.Owner owner() {
+      return mOwner.copy();
+    }
+
+    private ExternalPlayerResultCoordinator.Owner canceledOwner() {
+      ExternalPlayerResultCoordinator.Owner canceledOwner = mOwner.copy();
+      long generation = canceledOwner.expectedGeneration();
+      boolean canceled =
+          generation > 0
+              ? canceledOwner.cancel(generation, canceledOwner.requestId())
+              : canceledOwner.cancelBeforeAdmission();
+      return canceled ? canceledOwner : null;
+    }
+
+    private void finishCancellation(String requestId, long generation) {
+      if (generation > 0) mHost.cancelNative(requestId, generation);
+      else if (!mOwner.wasLaunchForwarded()) mHost.clearUnbound(requestId);
+    }
+  }
+
+  private Controller mController;
+  private BroadcastReceiver mResultReceiver;
+  private boolean mReceiverRegistered;
+  private boolean mRecoveryScheduled;
+  private final Handler mHandler = new Handler(Looper.getMainLooper());
+  private final Runnable mProcessRecovery =
+      () -> {
+        mRecoveryScheduled = false;
+        if (isFinishing() || mController == null) return;
+
+        syncBindingFromStore();
+        if (consumeStoredTerminal()
+            || !mController.needsProcessRecovery()
+            || Main.isActivityRunning()) return;
+
+        String replacementRequestId = ExternalPlayerResultCoordinator.createRequestId();
+        Log.w(TAG, "Main process disappeared; recovering with a fresh result owner");
+        if (mController.recoverAfterProcessDeath(replacementRequestId)) {
+          getIntent()
+              .putExtra(ExternalPlayerResultCoordinator.EXTRA_REQUEST_ID, replacementRequestId);
+        }
+      };
+
+  @Override
+  protected boolean prepareToStartXBMC(Bundle savedInstanceState) {
+    ExternalPlayerResultCoordinator.Owner owner = restoreOwner(savedInstanceState);
+    mController = new Controller(new ActivityHost(), owner);
+    getIntent().putExtra(ExternalPlayerResultCoordinator.EXTRA_REQUEST_ID, owner.requestId());
+    registerResultReceiver();
+
+    syncBindingFromStore();
+    if (mController.owner().wasCompleted()) {
+      scheduleAcknowledgedProcessExitIfNeeded();
+      finish();
+      return true;
+    }
+    return consumeStoredTerminal();
+  }
+
+  @Override
+  protected void startXBMC() {
+    if (mController == null || !mController.forwardOnce()) return;
+    Log.d(TAG, "Forwarded external playback request " + mController.owner().requestId());
+  }
+
+  @Override
+  protected void onStart() {
+    super.onStart();
+    if (mController == null || isFinishing()) return;
+
+    syncBindingFromStore();
+    if (consumeStoredTerminal()) return;
+    scheduleProcessRecoveryIfNeeded();
+  }
+
+  @Override
+  protected void onSaveInstanceState(Bundle outState) {
+    if (mController != null) {
+      ExternalPlayerResultCoordinator.Owner owner = mController.owner();
+      outState.putString(REQUEST_STATE, owner.requestId());
+      outState.putBoolean(FORWARDED_STATE, owner.wasLaunchForwarded());
+      outState.putLong(GENERATION_STATE, owner.expectedGeneration());
+      outState.putBoolean(COMPLETED_STATE, owner.wasCompleted());
+      outState.putBoolean(CANCELED_STATE, owner.wasCanceled());
+    }
+    super.onSaveInstanceState(outState);
+  }
+
+  @Override
+  protected void onDestroy() {
+    mHandler.removeCallbacks(mProcessRecovery);
+    mRecoveryScheduled = false;
+    if (mReceiverRegistered) {
+      unregisterReceiver(mResultReceiver);
+      mReceiverRegistered = false;
+    }
+    if (mController != null && isFinishing() && !isChangingConfigurations()) {
+      ExternalPlayerResultCoordinator.Owner owner = mController.owner();
+      mController.cancelForTeardown(owner.requestId(), owner.expectedGeneration());
+    }
+    super.onDestroy();
+  }
+
+  @Override
+  @SuppressWarnings("deprecation")
+  public void onBackPressed() {
+    if (mController != null && mController.cancelForCaller()) return;
+    super.onBackPressed();
+  }
+
+  private ExternalPlayerResultCoordinator.Owner restoreOwner(Bundle savedInstanceState) {
+    String requestId = null;
+    ExternalPlayerResultCoordinator.Owner savedOwner = null;
+    if (savedInstanceState != null) {
+      requestId = savedInstanceState.getString(REQUEST_STATE);
+      if (ExternalPlayerResultCoordinator.isValidRequestId(requestId)) {
+        try {
+          savedOwner =
+              new ExternalPlayerResultCoordinator.Owner(
+                  requestId,
+                  savedInstanceState.getBoolean(FORWARDED_STATE, false),
+                  savedInstanceState.getLong(GENERATION_STATE, 0),
+                  savedInstanceState.getBoolean(COMPLETED_STATE, false),
+                  savedInstanceState.getBoolean(CANCELED_STATE, false));
+        } catch (IllegalArgumentException e) {
+          Log.w(TAG, "Ignoring invalid saved external-player owner", e);
+        }
+      }
+    }
+
+    if (!ExternalPlayerResultCoordinator.isValidRequestId(requestId))
+      requestId = getIntent().getStringExtra(ExternalPlayerResultCoordinator.EXTRA_REQUEST_ID);
+
+    ExternalPlayerResultCoordinator.Owner durableOwner =
+        ExternalPlayerResultStore.readOwner(this, requestId);
+    if (durableOwner != null) return durableOwner;
+    if (savedOwner != null) {
+      ExternalPlayerResultStore.writeOwner(this, savedOwner);
+      return savedOwner;
+    }
+
+    ExternalPlayerResultCoordinator.Owner freshOwner =
+        new ExternalPlayerResultCoordinator.Owner(
+            ExternalPlayerResultCoordinator.createRequestId(), false, 0, false, false);
+    ExternalPlayerResultStore.writeOwner(this, freshOwner);
+    return freshOwner;
+  }
+
+  private void registerResultReceiver() {
+    if (mReceiverRegistered) return;
+
+    mResultReceiver =
+        new BroadcastReceiver() {
+          @Override
+          public void onReceive(Context context, Intent intent) {
+            if (mController == null) return;
+
+            // Broadcasts are wake-up signals only. Durable state is authoritative so a delayed
+            // or spoofed payload cannot rebind this activity or replace its exact terminal.
+            syncBindingFromStore();
+            if (!consumeStoredTerminal()
+                && ExternalPlayerResultCoordinator.ACTION_MAIN_DESTROYED.equals(intent.getAction()))
+              scheduleProcessRecoveryIfNeeded();
+          }
+        };
+
+    IntentFilter filter = new IntentFilter();
+    filter.addAction(ExternalPlayerResultCoordinator.ACTION_BINDING);
+    filter.addAction(ExternalPlayerResultCoordinator.ACTION_RESULT);
+    filter.addAction(ExternalPlayerResultCoordinator.ACTION_MAIN_DESTROYED);
+    if (Build.VERSION.SDK_INT >= 33)
+      registerReceiver(mResultReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
+    else registerReceiver(mResultReceiver, filter);
+    mReceiverRegistered = true;
+  }
+
+  private void syncBindingFromStore() {
+    if (mController == null) return;
+
+    ExternalPlayerResultCoordinator.Owner current = mController.owner();
+    ExternalPlayerResultCoordinator.Owner durable =
+        ExternalPlayerResultStore.readOwner(this, current.requestId());
+    if (durable != null && durable.expectedGeneration() > 0)
+      mController.bindGeneration(durable.expectedGeneration());
+  }
+
+  private boolean consumeStoredTerminal() {
+    if (mController == null) return false;
+
+    ExternalPlayerResultCoordinator.Owner owner = mController.owner();
+    if (owner.expectedGeneration() <= 0 || owner.wasCompleted()) return false;
+    ExternalPlayerResultCoordinator.Terminal terminal =
+        ExternalPlayerResultStore.read(this, owner.requestId(), owner.expectedGeneration());
+    return mController.deliver(terminal);
+  }
+
+  private void scheduleProcessRecoveryIfNeeded() {
+    if (mRecoveryScheduled
+        || mController == null
+        || !mController.needsProcessRecovery()
+        || Main.isActivityRunning()) return;
+
+    mRecoveryScheduled = true;
+    mHandler.postDelayed(mProcessRecovery, PROCESS_RECOVERY_DELAY_MS);
+  }
+
+  private void scheduleAcknowledgedProcessExitIfNeeded() {
+    if (mController == null) return;
+
+    ExternalPlayerResultCoordinator.Owner owner = mController.owner();
+    if (owner.expectedGeneration() <= 0
+        || !ExternalPlayerResultStore.isExitAcknowledged(
+            this, owner.requestId(), owner.expectedGeneration())) return;
+
+    scheduleProcessExitFallback(owner.requestId(), owner.expectedGeneration());
+  }
+
+  private void scheduleProcessExitFallback(String requestId, long generation) {
+    final String acknowledgedRequestId = requestId;
+    final long acknowledgedGeneration = generation;
+    mHandler.post(
+        () ->
+            ExternalPlayerResultStore.executeAcknowledgedProcessExit(
+                ExternalPlayerActivity.this,
+                acknowledgedRequestId,
+                acknowledgedGeneration,
+                () -> {
+                  Log.d(TAG, "Killing process after durable external-player acknowledgement");
+                  android.os.Process.killProcess(android.os.Process.myPid());
+                }));
+  }
+
+  private final class ActivityHost implements Host {
+    @Override
+    public boolean persist(ExternalPlayerResultCoordinator.Owner owner) {
+      return ExternalPlayerResultStore.writeOwner(ExternalPlayerActivity.this, owner);
+    }
+
+    @Override
+    public boolean startMain(String requestId) {
+      Intent intent = new Intent(getIntent());
+      intent.setClass(ExternalPlayerActivity.this, @APP_PACKAGE@.Main.class);
+      int contentGrantFlags =
+          intent.getFlags()
+              & (Intent.FLAG_GRANT_READ_URI_PERMISSION
+                  | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                  | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+                  | Intent.FLAG_GRANT_PREFIX_URI_PERMISSION);
+      intent.setFlags(
+          contentGrantFlags
+              | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
+              | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+      intent.putExtra("external_player_mode", true);
+      intent.putExtra(ExternalPlayerResultCoordinator.EXTRA_REQUEST_ID, requestId);
+      getIntent().putExtra(ExternalPlayerResultCoordinator.EXTRA_REQUEST_ID, requestId);
+      try {
+        startActivity(intent);
+        return true;
+      } catch (RuntimeException e) {
+        Log.e(TAG, "Could not forward external playback request", e);
+        return false;
+      }
+    }
+
+    @Override
+    public void setTerminalResult(ExternalPlayerResultCoordinator.Terminal terminal) {
+      setResult(
+          ExternalPlayerResultStore.resultCode(terminal),
+          ExternalPlayerResultStore.toCallerResult(terminal));
+    }
+
+    @Override
+    public void setCanceledResult() {
+      setResult(RESULT_CANCELED);
+    }
+
+    @Override
+    public void finishOwner() {
+      finish();
+    }
+
+    @Override
+    public void clearExact(String requestId, long generation) {
+      ExternalPlayerResultStore.clear(ExternalPlayerActivity.this, requestId, generation);
+    }
+
+    @Override
+    public void clearUnbound(String requestId) {
+      ExternalPlayerResultStore.clearUnbound(ExternalPlayerActivity.this, requestId);
+    }
+
+    @Override
+    public void cancelNative(String requestId, long generation) {
+      Main.cancelExternalPlayerResult(generation, requestId);
+    }
+
+    @Override
+    public boolean acknowledge(ExternalPlayerResultCoordinator.Terminal terminal) {
+      if (!ExternalPlayerResultStore.acknowledgeExit(
+          ExternalPlayerActivity.this, terminal.requestId, terminal.generation)) return false;
+
+      Main.acknowledgeExternalPlayerResult(terminal.generation, terminal.requestId);
+      scheduleProcessExitFallback(terminal.requestId, terminal.generation);
+      return true;
+    }
+
+    @Override
+    public void confirmWarmTaskHandoff(long generation, String requestId) {
+      Main.confirmWarmExternalPlayerResult(generation, requestId);
+    }
+  }
+}

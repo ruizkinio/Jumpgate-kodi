@@ -4,27 +4,34 @@ import android.hardware.input.InputManager.InputDeviceListener;
 
 public class XBMCInputDeviceListener implements InputDeviceListener
 {
-  native void _onInputDeviceAdded(int deviceId);
+  native void _onInputDeviceAdded(long lifecycleToken, int deviceId);
 
-  native void _onInputDeviceChanged(int deviceId);
+  native void _onInputDeviceChanged(long lifecycleToken, int deviceId);
 
-  native void _onInputDeviceRemoved(int deviceId);
+  native void _onInputDeviceRemoved(long lifecycleToken, int deviceId);
+
+  private final long mLifecycleToken;
+
+  public XBMCInputDeviceListener(long lifecycleToken)
+  {
+    mLifecycleToken = lifecycleToken;
+  }
 
   @Override
   public void onInputDeviceAdded(int deviceId)
   {
-    _onInputDeviceAdded(deviceId);
+    _onInputDeviceAdded(mLifecycleToken, deviceId);
   }
 
   @Override
   public void onInputDeviceChanged(int deviceId)
   {
-    _onInputDeviceChanged(deviceId);
+    _onInputDeviceChanged(mLifecycleToken, deviceId);
   }
 
   @Override
   public void onInputDeviceRemoved(int deviceId)
   {
-    _onInputDeviceRemoved(deviceId);
+    _onInputDeviceRemoved(mLifecycleToken, deviceId);
   }
 }

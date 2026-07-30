@@ -136,6 +136,7 @@
 #include "utils/CharsetConverter.h"
 #include "utils/ContentUtils.h"
 #include "utils/FileExtensionProvider.h"
+#include "utils/JumpgatePlaybackAttemptState.h"
 #include "utils/LangCodeExpander.h"
 #include "utils/PlayerUtils.h"
 #include "utils/RegExp.h"
@@ -671,8 +672,9 @@ bool CApplication::Initialize()
     std::vector<AddonInfoPtr> incompatibleAddons;
     event.Reset();
 
-    // Addon migration
-    if (CServiceBroker::GetAddonMgr().GetIncompatibleEnabledAddonInfos(incompatibleAddons))
+    // Addon migration (skip in external player mode for faster startup)
+    if (!CServiceBroker::GetAppParams()->IsExternalPlayerMode() &&
+        CServiceBroker::GetAddonMgr().GetIncompatibleEnabledAddonInfos(incompatibleAddons))
     {
       if (CAddonSystemSettings::GetInstance().GetAddonAutoUpdateMode() == AUTO_UPDATES_ON)
       {
@@ -786,7 +788,9 @@ bool CApplication::Initialize()
 
   if (!profileManager->UsingLoginScreen())
   {
-    UpdateLibraries();
+    // Skip library scanning in external player mode for faster startup
+    if (!CServiceBroker::GetAppParams()->IsExternalPlayerMode())
+      UpdateLibraries();
     SetLoggingIn(false);
   }
 
@@ -798,9 +802,13 @@ bool CApplication::Initialize()
   appListener->RegisterActionListener(&appPlayer->GetSeekHandler());
   appListener->RegisterActionListener(&CPlayerController::GetInstance());
 
-  CServiceBroker::GetRepositoryUpdater().Start();
-  if (!profileManager->UsingLoginScreen())
-    CServiceBroker::GetServiceAddons().Start();
+  // Skip repository updates and service addons in external player mode
+  if (!CServiceBroker::GetAppParams()->IsExternalPlayerMode())
+  {
+    CServiceBroker::GetRepositoryUpdater().Start();
+    if (!profileManager->UsingLoginScreen())
+      CServiceBroker::GetServiceAddons().Start();
+  }
 
   CLog::Log(LOGINFO, "initialize done");
 
@@ -1616,6 +1624,11 @@ bool CApplication::Cleanup()
     ResetCurrentItem();
     StopPlaying();
 
+#if defined(TARGET_ANDROID)
+    if (CXBMCApp::HasInstance())
+      CXBMCApp::Get().Deinitialize();
+#endif
+
     if (m_ServiceManager)
       m_ServiceManager->DeinitStageThree();
 
@@ -1745,6 +1758,11 @@ bool CApplication::Stop(int exitCode)
   CLog::Log(LOGINFO, "Stopping player");
   const auto appPlayer = GetComponent<CApplicationPlayer>();
   appPlayer->ClosePlayer();
+
+#if defined(TARGET_ANDROID)
+  if (CXBMCApp::HasInstance())
+    CXBMCApp::Get().Deinitialize();
+#endif
 
   {
     // close inbound port
@@ -2009,7 +2027,9 @@ bool CApplication::PlayFile(CFileItem item, const std::string& player, bool bRes
   else if (result == RESULT_NO_PLAYLIST_SELECTED)
   {
     m_cancelPlayback = true;
-    return true; // Special case; not to be treated as error.
+    // Preserve Kodi's historical non-error result, but an exact external
+    // admission must be canceled when no player will ever be started.
+    return !item.HasProperty("jumpgate.playback_token");
   }
 
   // Special handling for disc stubs.
@@ -2018,6 +2038,32 @@ bool CApplication::PlayFile(CFileItem item, const std::string& player, bool bRes
   if (VIDEO::IsDiscStub(resolvedItem))
     return CServiceBroker::GetMediaManager().playStubFile(resolvedItem);
 
+  CFileItem playbackItem{resolvedItem};
+#ifdef TARGET_ANDROID
+  if (item.HasProperty("jumpgate.playback_token"))
+  {
+    playbackItem.SetProperty("jumpgate.playback_token",
+                             item.GetProperty("jumpgate.playback_token"));
+  }
+  if (CXBMCApp::HasInstance() && CXBMCApp::Get().IsExternalPlayerMode())
+  {
+    uint64_t token = 0;
+    const CVariant& property = playbackItem.GetProperty("jumpgate.playback_token");
+    if (property.isUnsignedInteger())
+      token = property.asUnsignedInteger();
+    else if (property.isSignedInteger() && property.asInteger() > 0)
+      token = static_cast<uint64_t>(property.asInteger());
+
+    if (!CXBMCApp::Get().IsLatestExternalPlaybackAdmission(token))
+    {
+      const auto continuation = CXBMCApp::Get().BeginExternalPlaybackContinuation();
+      if (!continuation)
+        return false;
+      playbackItem.SetProperty("jumpgate.playback_token", CVariant{*continuation});
+    }
+  }
+#endif
+
   // Reset VideoStartWindowed as it's a temp setting
   CMediaSettings::GetInstance().SetMediaStartWindowed(false);
 
@@ -2025,23 +2071,46 @@ bool CApplication::PlayFile(CFileItem item, const std::string& player, bool bRes
   // pushed some delay message into the threadmessage list, they are not
   // expected be processed after or during the new item playback starting.
   // so we clean up previous playing item's playback callback delay messages here.
-  static constexpr std::array previousMsgsIgnoredByNewPlaying{GUI_MSG_PLAYBACK_STARTED,
-                                                              GUI_MSG_PLAYBACK_ENDED,
-                                                              GUI_MSG_PLAYBACK_STOPPED,
-                                                              GUI_MSG_PLAYLIST_CHANGED,
-                                                              GUI_MSG_PLAYLISTPLAYER_STOPPED,
-                                                              GUI_MSG_PLAYLISTPLAYER_STARTED,
-                                                              GUI_MSG_PLAYLISTPLAYER_CHANGED,
-                                                              GUI_MSG_QUEUE_NEXT_ITEM,
-                                                              0};
-  if (const int dMsgCount{
-          CServiceBroker::GetGUI()->GetWindowManager().RemoveThreadMessageByMessageIds(
-              &previousMsgsIgnoredByNewPlaying[0])};
-      dMsgCount > 0)
-    CLog::LogF(LOGDEBUG, "Ignored {} playback thread messages", dMsgCount);
+  static constexpr std::array previousMsgsIgnoredByNewPlaying{
+      GUI_MSG_PLAYBACK_STARTED,       GUI_MSG_PLAYBACK_ERROR,
+      GUI_MSG_PLAYBACK_ENDED,         GUI_MSG_PLAYBACK_STOPPED,
+      GUI_MSG_PLAYLIST_CHANGED,       GUI_MSG_PLAYLISTPLAYER_STOPPED,
+      GUI_MSG_PLAYLISTPLAYER_STARTED, GUI_MSG_PLAYLISTPLAYER_CHANGED,
+      GUI_MSG_QUEUE_NEXT_ITEM,        0};
+  std::vector<CGUIMessage> removedMessages;
+  const int delayedMessageCount =
+      CServiceBroker::GetGUI()->GetWindowManager().RemoveThreadMessageByMessageIds(
+          &previousMsgsIgnoredByNewPlaying[0], &removedMessages);
+  if (delayedMessageCount > 0)
+    CLog::LogF(LOGDEBUG, "Ignored {} playback thread messages", delayedMessageCount);
 
-  appPlayer->OpenFile(resolvedItem, appPlay.GetPlayerOptions(),
-                      m_ServiceManager->GetPlayerCoreFactory(), appPlay.GetResolvedPlayer(), *this);
+  for (const auto& removedMessage : removedMessages)
+  {
+    const auto removedTerminal = KODI::JUMPGATE::DecodeJumpgateRemovedPlaybackTerminal(
+        removedMessage.GetMessage(), GUI_MSG_PLAYBACK_STOPPED, GUI_MSG_PLAYBACK_ENDED,
+        removedMessage.GetParam1AsI64());
+    if (!removedTerminal)
+      continue;
+
+    const auto terminal =
+        AcknowledgePlaybackTerminal(removedTerminal->token, removedTerminal->completed);
+    if (!terminal)
+      continue;
+
+#ifdef TARGET_ANDROID
+    if (CXBMCApp::HasInstance())
+      CXBMCApp::Get().CommitExternalPlaybackTerminal(terminal->completed, terminal->token,
+                                                     terminal->started);
+#endif
+  }
+
+  const bool opened = appPlayer->OpenFile(playbackItem, appPlay.GetPlayerOptions(),
+                                          m_ServiceManager->GetPlayerCoreFactory(),
+                                          appPlay.GetResolvedPlayer(), *this);
+  if (!opened && playbackItem.HasProperty("jumpgate.playback_token"))
+  {
+    return false;
+  }
 
   const auto appVolume{GetComponent<CApplicationVolumeHandling>()};
   appPlayer->SetVolume(appVolume->GetVolumeRatio());
@@ -2068,7 +2137,14 @@ void CApplication::PlaybackCleanup()
     CGUIComponent *gui = CServiceBroker::GetGUI();
     if (gui)
       CServiceBroker::GetGUI()->GetAudioManager().Enable(true);
-    appPlayer->OpenNext(m_ServiceManager->GetPlayerCoreFactory());
+    const auto openNextResult = appPlayer->OpenNext(m_ServiceManager->GetPlayerCoreFactory());
+    if (openNextResult == CApplicationPlayer::OpenNextResult::Failed)
+    {
+#ifdef TARGET_ANDROID
+      if (CXBMCApp::HasInstance())
+        CXBMCApp::Get().DeliverPendingExternalPlayerResult();
+#endif
+    }
   }
 
   if (!appPlayer->IsPlayingVideo())

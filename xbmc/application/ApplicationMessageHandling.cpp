@@ -535,6 +535,9 @@ bool CApplicationMessageHandling::OnMessage(const CGUIMessage& message)
       param["player"]["speed"] = 1;
       param["player"]["playerid"] =
           static_cast<int>(CServiceBroker::GetPlaylistPlayer().GetCurrentPlaylist());
+      const int64_t rawPlaybackToken = message.GetParam1AsI64();
+      if (rawPlaybackToken > 0)
+        param["jumpgate"]["playbackToken"] = rawPlaybackToken;
 
       CServiceBroker::GetAnnouncementManager()->Announce(ANNOUNCEMENT::Player, "OnPlay",
                                                          m_app.CurrentFileItemPtr(), param);
@@ -590,6 +593,33 @@ bool CApplicationMessageHandling::OnMessage(const CGUIMessage& message)
         return true;
 #endif
 
+#ifdef TARGET_ANDROID
+      bool externalAttemptBound = false;
+      if (CXBMCApp::HasInstance() && CXBMCApp::Get().IsExternalPlayerMode())
+      {
+        uint64_t token = 0;
+        const CVariant& property = file.GetProperty("jumpgate.playback_token");
+        if (property.isUnsignedInteger())
+          token = property.asUnsignedInteger();
+        else if (property.isSignedInteger() && property.asInteger() > 0)
+          token = static_cast<uint64_t>(property.asInteger());
+
+        if (!CXBMCApp::Get().IsLatestExternalPlaybackAdmission(token))
+        {
+          const auto continuation = CXBMCApp::Get().BeginExternalPlaybackContinuation();
+          if (!continuation)
+          {
+            appPlayer->OnNothingToQueueNotify();
+            return true;
+          }
+          token = *continuation;
+          file.SetProperty("jumpgate.playback_token", CVariant{token});
+        }
+        m_app.OnPlayBackOpening(file);
+        externalAttemptBound = true;
+      }
+#endif
+
       // ok - send the file to the player, if it accepts it
       if (appPlayer->QueueNextFile(file))
       {
@@ -598,6 +628,10 @@ bool CApplicationMessageHandling::OnMessage(const CGUIMessage& message)
       }
       else
       {
+#ifdef TARGET_ANDROID
+        if (externalAttemptBound)
+          m_app.OnPlayBackOpenFailed(file);
+#endif
         /* Player didn't accept next file: *ALWAYS* advance playlist in this case so the player can
             queue the next (if it wants to) and it doesn't keep looping on this song */
         CServiceBroker::GetPlaylistPlayer().SetCurrentItemIdx(iNext);
@@ -636,11 +670,30 @@ bool CApplicationMessageHandling::OnMessage(const CGUIMessage& message)
 
     case GUI_MSG_PLAYBACK_STOPPED:
     {
+      const int64_t rawToken = message.GetParam1AsI64();
+      const uint64_t token = rawToken > 0 ? static_cast<uint64_t>(rawToken) : 0;
+      const auto terminal = m_app.AcknowledgePlaybackTerminal(token, false);
+      if (token != 0 && !terminal)
+        return true;
+#ifdef TARGET_ANDROID
+      if (terminal && CXBMCApp::HasInstance())
+        CXBMCApp::Get().CommitExternalPlaybackTerminal(false, terminal->token, terminal->started);
+#endif
+      if (terminal && terminal->superseded)
+      {
+        // The old close callback is still the trigger for a deferred OpenNext,
+        // but none of its terminal side effects belong to the replacement.
+        m_app.PlaybackCleanup();
+        return true;
+      }
+
       CServiceBroker::GetPVRManager().OnPlaybackStopped(m_app.CurrentFileItem());
       CServiceBroker::GetFavouritesService().OnPlaybackStopped(m_app.CurrentFileItem());
 
       CVariant data(CVariant::VariantTypeObject);
       data["end"] = false;
+      if (terminal)
+        data["jumpgate"]["playbackToken"] = terminal->token;
       CServiceBroker::GetAnnouncementManager()->Announce(ANNOUNCEMENT::Player, "OnStop",
                                                          m_app.CurrentFileItemPtr(), data);
 
@@ -654,17 +707,39 @@ bool CApplicationMessageHandling::OnMessage(const CGUIMessage& message)
       CServiceBroker::GetXBPython().OnPlayBackStopped();
 #endif
 
+#ifdef TARGET_ANDROID
+      if (CXBMCApp::HasInstance())
+        CXBMCApp::Get().QueuePendingExternalPlayerResult();
+#endif
+
       playCountIncrementedHandler.HandlePlaycountIncremented();
       return true;
     }
 
     case GUI_MSG_PLAYBACK_ENDED:
     {
+      const int64_t rawToken = message.GetParam1AsI64();
+      const uint64_t token = rawToken > 0 ? static_cast<uint64_t>(rawToken) : 0;
+      const auto terminal = m_app.AcknowledgePlaybackTerminal(token, true);
+      if (token != 0 && !terminal)
+        return true;
+#ifdef TARGET_ANDROID
+      if (terminal && CXBMCApp::HasInstance())
+        CXBMCApp::Get().CommitExternalPlaybackTerminal(true, terminal->token, terminal->started);
+#endif
+      if (terminal && terminal->superseded)
+      {
+        m_app.PlaybackCleanup();
+        return true;
+      }
+
       CServiceBroker::GetPVRManager().OnPlaybackEnded(m_app.CurrentFileItem());
       CServiceBroker::GetFavouritesService().OnPlaybackEnded(m_app.CurrentFileItem());
 
       CVariant data(CVariant::VariantTypeObject);
       data["end"] = true;
+      if (terminal)
+        data["jumpgate"]["playbackToken"] = terminal->token;
       CServiceBroker::GetAnnouncementManager()->Announce(ANNOUNCEMENT::Player, "OnStop",
                                                          m_app.CurrentFileItemPtr(), data);
 
@@ -696,7 +771,14 @@ bool CApplicationMessageHandling::OnMessage(const CGUIMessage& message)
       if (!isEpgPlaylistItem)
       {
         if (!CServiceBroker::GetPlaylistPlayer().PlayNext(1, true))
+        {
           m_app.GetComponent<CApplicationPlayer>()->ClosePlayer();
+
+#ifdef TARGET_ANDROID
+          if (CXBMCApp::HasInstance())
+            CXBMCApp::Get().QueuePendingExternalPlayerResult();
+#endif
+        }
 
         m_app.PlaybackCleanup();
       }
@@ -806,8 +888,15 @@ bool CApplicationMessageHandling::OnMessage(const CGUIMessage& message)
     }
 
     case GUI_MSG_PLAYBACK_ERROR:
+    {
+      const int64_t rawToken = message.GetParam1AsI64();
+      if (rawToken > 0 && m_app.IsPlaybackAttemptSuperseded(static_cast<uint64_t>(rawToken)))
+      {
+        return true;
+      }
       MESSAGING::HELPERS::ShowOKDialogText(CVariant{16026}, CVariant{16027});
       return true;
+    }
 
     case GUI_MSG_PLAYLISTPLAYER_STARTED:
     case GUI_MSG_PLAYLISTPLAYER_CHANGED:

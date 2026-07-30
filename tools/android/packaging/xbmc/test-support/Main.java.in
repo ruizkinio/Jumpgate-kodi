@@ -1,0 +1,21 @@
+package @APP_PACKAGE@;
+
+public final class Main {
+  private Main() {}
+
+  public static boolean isActivityRunning() {
+    return false;
+  }
+
+  public static boolean cancelExternalPlayerResult(long generation, String requestId) {
+    return false;
+  }
+
+  public static boolean acknowledgeExternalPlayerResult(long generation, String requestId) {
+    return false;
+  }
+
+  public static boolean confirmWarmExternalPlayerResult(long generation, String requestId) {
+    return false;
+  }
+}

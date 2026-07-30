@@ -123,6 +123,12 @@ int32_t CEventLoop::processInput(AInputEvent* event)
   int32_t type   = AInputEvent_getType(event);
   int32_t source = AInputEvent_getSource(event);
 
+  if (type == AINPUT_EVENT_TYPE_KEY && AKeyEvent_getKeyCode(event) == AKEYCODE_BACK &&
+      m_activityHandler->onBackInputEvent(event))
+  {
+    return true;
+  }
+
   // handle joystick input
   if (IS_FROM_SOURCE(source, AINPUT_SOURCE_GAMEPAD) || IS_FROM_SOURCE(source, AINPUT_SOURCE_JOYSTICK))
   {

@@ -19,6 +19,10 @@ if(NOT TARGET ${APP_NAME_LC}::${CMAKE_FIND_PACKAGE_NAME})
   # Setting cmake_build_type twice wont cause issues
   set(CMAKE_ARGS -DCMAKE_BUILD_TYPE=Release)
 
+  set(patches "${CORE_SOURCE_DIR}/tools/depends/target/${${CMAKE_FIND_PACKAGE_NAME}_MODULE_LC}/001-fix-intent-getstringextra-signature.patch")
+  generate_patchcommand("${patches}")
+  unset(patches)
+
   BUILD_DEP_TARGET()
 
   SETUP_BUILD_TARGET()

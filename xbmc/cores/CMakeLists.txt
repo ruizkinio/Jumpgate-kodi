@@ -9,6 +9,7 @@ set(HEADERS DataCacheCore.h
             IPlayer.h
             IPlayerCallback.h
             MenuType.h
+            PlayerOpenPublication.h
             VideoSettings.h)
 
 core_add_library(cores)

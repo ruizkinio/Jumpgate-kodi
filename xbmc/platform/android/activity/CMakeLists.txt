@@ -1,4 +1,7 @@
 set(SOURCES android_main.cpp
+            AndroidJumpgateCredentialStore.cpp
+            AndroidJumpgateSubtitleFileStore.cpp
+            AndroidJumpgateSubtitleTransport.cpp
             AndroidJoyStick.cpp
             AndroidKey.cpp
             AndroidMouse.cpp
@@ -21,9 +24,15 @@ set(SOURCES android_main.cpp
             JNIXBMCSpeechRecognitionListener.cpp
             JNIXBMCConnectivityManagerNetworkCallback.cpp
             JNIXBMCBroadcastReceiver.cpp
+            JumpgateProfileStorage.cpp
+            SubtitleDownloader.cpp
+            TraktScrobbler.cpp
             ${NDKROOT}/sources/android/native_app_glue/android_native_app_glue.c)
 
 set(HEADERS AndroidJoyStick.h
+            AndroidJumpgateCredentialStore.h
+            AndroidJumpgateSubtitleFileStore.h
+            AndroidJumpgateSubtitleTransport.h
             AndroidKey.h
             AndroidMouse.h
             AndroidTouch.h
@@ -46,6 +55,10 @@ set(HEADERS AndroidJoyStick.h
             JNIXBMCSpeechRecognitionListener.h
             JNIXBMCConnectivityManagerNetworkCallback.h
             JNIXBMCBroadcastReceiver.h
+            JumpgateProfileStorage.h
+            JumpgateThresholds.h
+            SubtitleDownloader.h
+            TraktScrobbler.h
             XBMCApp.h)
 
 set_source_files_properties(${NDKROOT}/sources/android/native_app_glue/android_native_app_glue.c PROPERTIES

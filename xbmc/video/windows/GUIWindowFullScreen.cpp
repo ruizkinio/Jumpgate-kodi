@@ -33,6 +33,10 @@
 #include "video/dialogs/GUIDialogSubtitleSettings.h"
 #include "windowing/WinSystem.h"
 
+#ifdef TARGET_ANDROID
+#include "platform/android/activity/XBMCApp.h"
+#endif
+
 #include <algorithm>
 #include <stdio.h>
 #if defined(TARGET_DARWIN)
@@ -84,6 +88,33 @@ bool CGUIWindowFullScreen::OnAction(const CAction &action)
   const auto appPlayer = components.GetComponent<CApplicationPlayer>();
   switch (action.GetID())
   {
+  case ACTION_NAV_BACK:
+  case ACTION_PREVIOUS_MENU:
+    {
+#ifdef TARGET_ANDROID
+      // Jumpgate external-player mode: keep default behavior where Back closes the OSD if it's open,
+      // but if no OSD is visible then Back should stop playback and exit back to the caller (Stremio).
+      // This is TV-remote friendly: first press hides UI; second press exits (instead of landing in Kodi Home).
+      if (CXBMCApp::Get().IsExternalPlayerMode())
+      {
+        CGUIDialog* osd = GetOSD();
+        if (osd && osd->IsDialogRunning())
+        {
+          osd->Close();
+          MarkDirtyRegion();
+          return true;
+        }
+
+        // Stop playback; Android external-player exit is triggered on GUI_MSG_PLAYBACK_STOPPED.
+        if (appPlayer->IsPlaying())
+          g_application.StopPlaying();
+
+        return true;
+      }
+#endif
+      break;
+    }
+
   case ACTION_SHOW_OSD:
     ToggleOSD();
     return true;

@@ -1,4 +1,6 @@
 set(SOURCES TestAlarmClock.cpp
+            TestAndroidJumpgateSubtitleIntegration.cpp
+            TestAndroidJumpgateSubtitleProduction.cpp
             TestAliasShortcutUtils.cpp
             TestArchive.cpp
             TestArtUtils.cpp
@@ -24,6 +26,33 @@ set(SOURCES TestAlarmClock.cpp
             TestJobManager.cpp
             TestJSONVariantParser.cpp
             TestJSONVariantWriter.cpp
+            TestJumpgateApplicationLifecycleStatic.cpp
+            TestJumpgateBackCoordinator.cpp
+            TestJumpgateGuiMessageRemoval.cpp
+            TestJumpgatePlaybackAttemptState.cpp
+            TestJumpgatePlaybackHistory.cpp
+            TestJumpgatePlaybackHistoryState.cpp
+            TestJumpgatePlaybackResultState.cpp
+            TestJumpgatePlaybackRetry.cpp
+            TestJumpgatePairingCoordinator.cpp
+            TestJumpgatePairingPresenter.cpp
+            TestJumpgatePlaybackClaimClient.cpp
+            TestJumpgatePlaybackClaimCoordinator.cpp
+            TestJumpgateSubtitleClient.cpp
+            TestJumpgateSubtitleCoordinator.cpp
+            TestJumpgatePlaybackContext.cpp
+            TestJumpgatePlaybackAuthority.cpp
+            TestJumpgateHistoryEventClient.cpp
+            TestJumpgateHistoryEventDispatcher.cpp
+            TestJumpgateHistoryWireFixture.cpp
+            TestJumpgateWatchedTimeState.cpp
+            TestJumpgateShutdownCoordinator.cpp
+            TestJumpgateProfileRuntime.cpp
+            TestJumpgateProfileHistoryPolicy.cpp
+            TestUPnPPlayerOpenPublication.cpp
+            TestJumpgateProfileStore.cpp
+            TestJumpgateQrCode.cpp
+            TestJumpgateSourceFingerprint.cpp
             TestLabelFormatter.cpp
             TestLangCodeExpander.cpp
             TestLocale.cpp
@@ -52,6 +81,12 @@ set(SOURCES TestAlarmClock.cpp
             TestXBMCTinyXML.cpp
             TestXBMCTinyXML2.cpp
             TestXMLUtils.cpp)
+
+if(NOT CORE_SYSTEM_NAME STREQUAL android)
+  list(APPEND SOURCES ../../platform/android/activity/AndroidJumpgateSubtitleFileStore.cpp
+                      ../../platform/android/activity/AndroidJumpgateSubtitleTransport.cpp
+                      ../../platform/android/activity/TraktScrobbler.cpp)
+endif()
 
 if(TARGET ${APP_NAME_LC}::Bluray)
   list(APPEND SOURCES TestBluray.cpp)
