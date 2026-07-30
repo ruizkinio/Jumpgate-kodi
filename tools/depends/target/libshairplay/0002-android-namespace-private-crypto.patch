@@ -1,0 +1,35 @@
+From 45868433cd38bb67fde3b2550f537810d539dd8f Mon Sep 17 00:00:00 2001
+From: Jumpgate CI <noreply@example.com>
+Date: Tue, 14 Jul 2026 00:00:00 +0200
+Subject: [PATCH] [android] Namespace Shairplay's private crypto API
+
+Shairplay bundles an internal crypto implementation into libshairplay.a.
+Give every function declared by crypto.h a library-specific symbol so a
+final static link can also consume OpenSSL's libcrypto.a without duplicate
+definitions or archive-order-dependent binding.
+
+---
+ src/lib/crypto/crypto.h | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/src/lib/crypto/crypto.h b/src/lib/crypto/crypto.h
+index a1c6ada..7927566 100644
+--- a/src/lib/crypto/crypto.h
++++ b/src/lib/crypto/crypto.h
+@@ -52,0 +53,16 @@ extern "C" {
++/* Keep the bundled crypto implementation private to Shairplay. */
++#define AES_set_key shairplay_crypto_AES_set_key
++#define AES_cbc_encrypt shairplay_crypto_AES_cbc_encrypt
++#define AES_cbc_decrypt shairplay_crypto_AES_cbc_decrypt
++#define AES_convert_key shairplay_crypto_AES_convert_key
++#define RC4_setup shairplay_crypto_RC4_setup
++#define RC4_crypt shairplay_crypto_RC4_crypt
++#define SHA1_Init shairplay_crypto_SHA1_Init
++#define SHA1_Update shairplay_crypto_SHA1_Update
++#define SHA1_Final shairplay_crypto_SHA1_Final
++#define MD5_Init shairplay_crypto_MD5_Init
++#define MD5_Update shairplay_crypto_MD5_Update
++#define MD5_Final shairplay_crypto_MD5_Final
++#define hmac_md5 shairplay_crypto_hmac_md5
++#define hmac_sha1 shairplay_crypto_hmac_sha1
++

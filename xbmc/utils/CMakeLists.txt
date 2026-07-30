@@ -38,6 +38,31 @@ set(SOURCES ActorProtocol.cpp
             InfoLoader.cpp
             JSONVariantParser.cpp
             JSONVariantWriter.cpp
+            JumpgateBackCoordinator.cpp
+            JumpgatePlaybackAttemptState.cpp
+            JumpgatePlaybackHistory.cpp
+            JumpgatePlaybackHistoryState.cpp
+            JumpgatePlaybackResultState.cpp
+            JumpgatePlaybackRetry.cpp
+            JumpgatePairingCoordinator.cpp
+            JumpgatePairingPresenter.cpp
+            JumpgatePlaybackClaimClient.cpp
+            JumpgatePlaybackClaimCoordinator.cpp
+            JumpgateSubtitleClient.cpp
+            JumpgateSubtitleCoordinator.cpp
+            JumpgatePlaybackContext.cpp
+            JumpgatePlaybackAuthority.cpp
+            JumpgateHistoryEventClient.cpp
+            JumpgateHistoryEventDispatcher.cpp
+            JumpgateHistoryEventState.cpp
+            JumpgateWatchedTimeState.cpp
+            JumpgateThreadRegistry.cpp
+            JumpgateShutdownCoordinator.cpp
+            JumpgateProfileHistoryPolicy.cpp
+            JumpgateProfileRuntime.cpp
+            JumpgateProfileStore.cpp
+            JumpgateQrCode.cpp
+            JumpgateSourceFingerprint.cpp
             LabelFormatter.cpp
             LangCodeExpander.cpp
             LegacyPathTranslation.cpp
@@ -48,6 +73,7 @@ set(SOURCES ActorProtocol.cpp
             Mp4ChplReader.cpp
             Observer.cpp
             POUtils.cpp
+            qrcodegen.cpp
             PlayerUtils.cpp
             RecentlyAddedJob.cpp
             RegExp.cpp
@@ -134,6 +160,31 @@ set(HEADERS ActorProtocol.h
             IXmlDeserializable.h
             JSONVariantParser.h
             JSONVariantWriter.h
+            JumpgateBackCoordinator.h
+            JumpgatePlaybackAttemptState.h
+            JumpgatePlaybackHistory.h
+            JumpgatePlaybackHistoryState.h
+            JumpgatePlaybackResultState.h
+            JumpgatePlaybackRetry.h
+            JumpgatePairingCoordinator.h
+            JumpgatePairingPresenter.h
+            JumpgatePlaybackClaimClient.h
+            JumpgatePlaybackClaimCoordinator.h
+            JumpgateSubtitleClient.h
+            JumpgateSubtitleCoordinator.h
+            JumpgatePlaybackContext.h
+            JumpgatePlaybackAuthority.h
+            JumpgateHistoryEventClient.h
+            JumpgateHistoryEventDispatcher.h
+            JumpgateHistoryEventState.h
+            JumpgateWatchedTimeState.h
+            JumpgateThreadRegistry.h
+            JumpgateShutdownCoordinator.h
+            JumpgateProfileHistoryPolicy.h
+            JumpgateProfileRuntime.h
+            JumpgateProfileStore.h
+            JumpgateQrCode.h
+            JumpgateSourceFingerprint.h
             LabelFormatter.h
             LangCodeExpander.h
             LegacyPathTranslation.h
@@ -150,6 +201,7 @@ set(HEADERS ActorProtocol.h
             Observer.h
             params_check_macros.h
             POUtils.h
+            qrcodegen.hpp
             PlayerUtils.h
             ProgressJob.h
             RecentlyAddedJob.h

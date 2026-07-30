@@ -9,6 +9,7 @@
 #pragma once
 
 #include "guilib/WindowIDs.h"
+#include "messaging/OwnedApplicationCallback.h"
 #include "messaging/ThreadMessage.h"
 #include "threads/Thread.h"
 
@@ -143,6 +144,7 @@
 
 
 #define TMSG_CALLBACK                     800
+#define TMSG_OWNED_CALLBACK               801
 // clang-format on
 
 class CGUIMessage;
@@ -376,6 +378,41 @@ public:
    */
   void PostMsg(uint32_t messageId, int param1, int param2, void* payload, std::string strParam, std::vector<std::string> params);
 
+  /*! \brief Post a bounded message whose payload remains owned until destination execution.
+   *
+   * The returned handle can cancel the payload before the receiver takes it. Queue rejection,
+   * shutdown, and cleanup invoke the exact cancellation callback once.
+   */
+  template<typename Payload>
+  std::shared_ptr<COwnedThreadMessagePayload> PostMsgOwned(
+      uint32_t messageId,
+      int param1,
+      int param2,
+      std::unique_ptr<Payload> payload,
+      std::function<void()> cancellation = {})
+  {
+    ThreadMessage message{messageId, param1, param2, nullptr};
+    auto ownedPayload =
+        message.SetOwnedPayload(std::move(payload), std::move(cancellation));
+    if (!ownedPayload || !PostOwnedMsg(std::move(message)))
+      return {};
+    return ownedPayload;
+  }
+
+  /*! \brief Post one bounded, owned callback to the application thread.
+   *
+   * Returns false after shutdown or when the bounded queue is full. Rejected,
+   * stopped, and cleaned-up callbacks are canceled exactly once.
+   */
+  bool PostCallback(std::shared_ptr<IApplicationCallback> callback);
+
+  /*! \brief Post bounded owned work that must not depend on the application loop.
+   *
+   * The dedicated worker is used only for generation-fenced terminal delivery.
+   * Rejection and shutdown cancel the callback exactly once without waiting.
+   */
+  bool PostAsyncCallback(std::shared_ptr<IApplicationCallback> callback);
+
   /*!
    * \brief Called from any thread to dispatch messages
    */
@@ -420,7 +457,7 @@ public:
   /*
    * \brief Signals the shutdown of the application and message processing
    */
-  void Stop() { m_bStop = true; }
+  void Stop();
 
   //! \brief Returns true if this is the process / app loop thread.
   bool IsProcessThread() const;
@@ -430,7 +467,9 @@ private:
   CApplicationMessenger const& operator=(CApplicationMessenger const&) = delete;
 
   int SendMsg(ThreadMessage&& msg, bool wait);
+  bool PostOwnedMsg(ThreadMessage&& msg);
   void ProcessMessage(ThreadMessage *pMsg);
+  void CancelPendingOwnedCallbacks();
 
   std::queue<ThreadMessage*> m_vecMessages; /*!< queue for regular messages */
   std::queue<ThreadMessage*> m_vecWindowMessages; /*!< queue for UI messages */
@@ -439,6 +478,8 @@ private:
   std::thread::id m_guiThreadId;
   std::thread::id m_processThreadId;
   bool m_bStop{ false };
+  CBoundedApplicationCallbackGate m_ownedCallbackGate{64};
+  CBoundedApplicationCallbackExecutor m_asyncCallbackExecutor{8};
 };
 }
 }

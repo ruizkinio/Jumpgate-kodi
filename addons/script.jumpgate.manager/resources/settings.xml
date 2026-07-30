@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<settings version="1">
+  <section id="script.jumpgate.manager">
+    <category id="jumpgate_manager" label="30000">
+      <group id="1">
+        <setting id="open_manager_menu" type="action" label="30007">
+          <level>0</level>
+          <data>JumpgateManager</data>
+          <control type="button" format="action">
+            <close>true</close>
+          </control>
+        </setting>
+      </group>
+    </category>
+  </section>
+</settings>

@@ -1,0 +1,12 @@
+package @APP_PACKAGE@;
+
+import android.app.Activity;
+import android.os.Bundle;
+
+public class Splash extends Activity {
+  protected boolean prepareToStartXBMC(Bundle savedInstanceState) {
+    return false;
+  }
+
+  protected void startXBMC() {}
+}

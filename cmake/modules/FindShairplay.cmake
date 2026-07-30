@@ -44,6 +44,12 @@ if(NOT TARGET ${APP_NAME_LC}::${CMAKE_FIND_PACKAGE_NAME})
                                                                        IMPORTED_LOCATION "${SHAIRPLAY_LIBRARY}"
                                                                        INTERFACE_INCLUDE_DIRECTORIES "${SHAIRPLAY_INCLUDE_DIR}"
                                                                        INTERFACE_COMPILE_DEFINITIONS HAS_AIRTUNES)
+      if("android" IN_LIST CORE_PLATFORM_NAME_LC)
+        # The private crypto symbols are namespaced in the Android depends build;
+        # keep all remaining static Shairplay internals out of Kodi's dynamic ABI.
+        set_property(TARGET ${APP_NAME_LC}::${CMAKE_FIND_PACKAGE_NAME} APPEND PROPERTY
+                     INTERFACE_LINK_OPTIONS "-Wl,--exclude-libs,libshairplay.a")
+      endif()
     endif()
   endif()
 endif()

@@ -471,6 +471,13 @@ bool CInputManager::OnEvent(XBMC_Event& newEvent)
   return true;
 }
 
+bool CInputManager::ProcessKeyPress(const CKey& key)
+{
+  const bool keyDownHandled = OnKey(key);
+  const bool keyUpHandled = OnKeyUp(key);
+  return keyDownHandled || keyUpHandled;
+}
+
 // OnKey() translates the key into a CAction which is sent on to our Window Manager.
 // The window manager will return true if the event is processed, false otherwise.
 // If not already processed, this routine handles global keypresses.  It returns
@@ -678,20 +685,23 @@ bool CInputManager::HandleKey(const CKey& key)
   return ExecuteInputAction(action);
 }
 
-void CInputManager::OnKeyUp(const CKey& key)
+bool CInputManager::OnKeyUp(const CKey& key)
 {
   for (auto handler : m_keyboardHandlers)
     handler->OnKeyRelease(key);
 
+  bool handled{false};
   if (m_LastKey.GetButtonCode() != KEY_INVALID &&
       !(m_LastKey.GetButtonCode() & CKey::MODIFIER_LONG))
   {
     CKey key = m_LastKey;
     m_LastKey.Reset(); // OnKey is reentrant; need to do this before entering
-    HandleKey(key);
+    handled = HandleKey(key);
   }
   else
     m_LastKey.Reset();
+
+  return handled;
 }
 
 bool CInputManager::AlwaysProcess(const CAction& action)

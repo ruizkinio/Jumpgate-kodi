@@ -1,0 +1,1152 @@
+package @APP_PACKAGE@;
+
+import java.util.UUID;
+
+public final class ExternalPlayerResultCoordinator {
+  public static final String ACTION_BINDING = "@APP_PACKAGE@.action.EXTERNAL_PLAYER_RESULT_BINDING";
+  public static final String ACTION_RESULT = "@APP_PACKAGE@.action.EXTERNAL_PLAYER_RESULT";
+  public static final String ACTION_MAIN_DESTROYED =
+      "@APP_PACKAGE@.action.EXTERNAL_PLAYER_MAIN_DESTROYED";
+  public static final String EXTRA_REQUEST_ID = "jumpgate_external_result_request_id";
+  public static final String EXTRA_GENERATION = "jumpgate_external_result_generation";
+  public static final String EXTRA_POSITION_MS = "jumpgate_external_result_position_ms";
+  public static final String EXTRA_DURATION_MS = "jumpgate_external_result_duration_ms";
+  public static final String EXTRA_COMPLETED = "jumpgate_external_result_completed";
+  public static final String EXTRA_EXIT_PROCESS = "jumpgate_external_result_exit_process";
+
+  private ExternalPlayerResultCoordinator() {}
+
+  public static String createRequestId() {
+    return UUID.randomUUID().toString();
+  }
+
+  public static boolean isValidRequestId(String requestId) {
+    if (requestId == null || requestId.length() != 36) return false;
+
+    try {
+      return UUID.fromString(requestId).toString().equalsIgnoreCase(requestId);
+    } catch (IllegalArgumentException e) {
+      return false;
+    }
+  }
+
+  public static final class Terminal {
+    public final String requestId;
+    public final long generation;
+    public final long positionMs;
+    public final long durationMs;
+    public final boolean completed;
+    public final boolean exitProcess;
+
+    public Terminal(
+        String requestId,
+        long generation,
+        long positionMs,
+        long durationMs,
+        boolean completed,
+        boolean exitProcess) {
+      if (!isValidRequestId(requestId) || generation <= 0)
+        throw new IllegalArgumentException("Invalid external-player terminal owner");
+
+      this.requestId = requestId;
+      this.generation = generation;
+      this.positionMs = Math.max(0, positionMs);
+      this.durationMs = Math.max(0, durationMs);
+      this.completed = completed;
+      this.exitProcess = exitProcess;
+    }
+
+    public boolean failedToStart() {
+      return !completed && positionMs <= 0 && durationMs <= 0;
+    }
+  }
+
+  public static final class Admission {
+    private final long mGeneration;
+    private final String mRequestId;
+    private final boolean mCancellationRequested;
+    private final boolean mCallerResultAcknowledged;
+
+    private Admission(
+        long generation,
+        String requestId,
+        boolean cancellationRequested,
+        boolean callerResultAcknowledged) {
+      mGeneration = generation;
+      mRequestId = requestId;
+      mCancellationRequested = cancellationRequested;
+      mCallerResultAcknowledged = callerResultAcknowledged;
+    }
+
+    public long generation() {
+      return mGeneration;
+    }
+
+    public String requestId() {
+      return mRequestId;
+    }
+
+    public boolean wasCancellationRequested() {
+      return mCancellationRequested;
+    }
+
+    public boolean wasCallerResultAcknowledged() {
+      return mCallerResultAcknowledged;
+    }
+  }
+
+  public enum WarmTaskMoveResult {
+    MOVED,
+    RETRY,
+    EXHAUSTED,
+    STALE
+  }
+
+  public enum WarmTaskMoveAttemptResult {
+    MOVED,
+    REFUSED,
+    STALE
+  }
+
+  public interface WarmTaskScheduler {
+    boolean post(Runnable callback);
+
+    boolean postDelayed(Runnable callback, long delayMs);
+
+    void removeCallbacks(Runnable callback);
+  }
+
+  public static final class WarmTaskLifecycleState {
+    private final boolean mCurrentActivity;
+    private final long mLifecycleToken;
+    private final boolean mFinishing;
+    private final boolean mDestroyed;
+    private final boolean mExternalPlayerMode;
+    private final long mActiveGeneration;
+    private final String mPreparedRequestId;
+
+    public WarmTaskLifecycleState(
+        boolean currentActivity,
+        long lifecycleToken,
+        boolean finishing,
+        boolean destroyed,
+        boolean externalPlayerMode,
+        long activeGeneration,
+        String preparedRequestId) {
+      mCurrentActivity = currentActivity;
+      mLifecycleToken = lifecycleToken;
+      mFinishing = finishing;
+      mDestroyed = destroyed;
+      mExternalPlayerMode = externalPlayerMode;
+      mActiveGeneration = activeGeneration;
+      mPreparedRequestId = preparedRequestId == null ? "" : preparedRequestId;
+    }
+
+    private boolean allows(WarmTaskHandoff.Attempt attempt) {
+      return attempt != null
+          && mCurrentActivity
+          && attempt.lifecycleToken() > 0
+          && attempt.lifecycleToken() == mLifecycleToken
+          && !mFinishing
+          && !mDestroyed
+          && !mExternalPlayerMode
+          && mActiveGeneration == 0
+          && !isValidRequestId(mPreparedRequestId);
+    }
+  }
+
+  public interface WarmTaskLifecycleStateSource {
+    WarmTaskLifecycleState capture();
+  }
+
+  public interface WarmTaskMoveAdapter {
+    boolean moveTaskToBack(WarmTaskHandoff.Attempt attempt);
+  }
+
+  public interface WarmTaskHandoffObserver {
+    void onAttemptFailed(int attemptNumber, int maxAttempts, boolean schedulerRejected);
+
+    void onFallback();
+  }
+
+  public static final class WarmTaskHandoff {
+    // Includes the initial move: three failed backgrounding attempts total.
+    public static final int MAX_MOVE_ATTEMPTS = 3;
+
+    public static final class Attempt {
+      private final long mLifecycleToken;
+      private final long mGeneration;
+      private final String mRequestId;
+      private final int mNumber;
+
+      private Attempt(long lifecycleToken, long generation, String requestId, int number) {
+        mLifecycleToken = lifecycleToken;
+        mGeneration = generation;
+        mRequestId = requestId;
+        mNumber = number;
+      }
+
+      public long lifecycleToken() {
+        return mLifecycleToken;
+      }
+
+      public long generation() {
+        return mGeneration;
+      }
+
+      public String requestId() {
+        return mRequestId;
+      }
+
+      public int number() {
+        return mNumber;
+      }
+    }
+
+    private long mLifecycleToken;
+    private long mGeneration;
+    private String mRequestId = "";
+    private boolean mNativeReady;
+    private boolean mCallerResultAcknowledged;
+    private int mMoveAttempts;
+    private Attempt mPendingAttempt;
+
+    public synchronized boolean prepare(
+        long lifecycleToken,
+        long generation,
+        String requestId,
+        boolean callerResultAcknowledged) {
+      if (lifecycleToken <= 0 || generation <= 0 || !isValidRequestId(requestId)) return false;
+
+      mLifecycleToken = lifecycleToken;
+      mGeneration = generation;
+      mRequestId = requestId;
+      mNativeReady = false;
+      mCallerResultAcknowledged = callerResultAcknowledged;
+      mMoveAttempts = 0;
+      mPendingAttempt = null;
+      return true;
+    }
+
+    public synchronized boolean confirmCallerResult(long generation, String requestId) {
+      boolean exactOwner =
+          generation == 0 ? ownsRequest(requestId) : owns(generation, requestId);
+      if (!exactOwner) return false;
+
+      mCallerResultAcknowledged = true;
+      return true;
+    }
+
+    public synchronized boolean markNativeReady(
+        long lifecycleToken, long generation, String requestId) {
+      if (lifecycleToken != mLifecycleToken || !owns(generation, requestId)) return false;
+
+      mNativeReady = true;
+      return true;
+    }
+
+    public synchronized Attempt reserveAttempt(
+        long lifecycleToken, long generation, String requestId) {
+      boolean exactOwner =
+          generation == 0 ? ownsRequest(requestId) : owns(generation, requestId);
+      if (lifecycleToken != mLifecycleToken
+          || !exactOwner
+          || !mNativeReady
+          || !mCallerResultAcknowledged
+          || mPendingAttempt != null
+          || mMoveAttempts >= MAX_MOVE_ATTEMPTS) return null;
+
+      mPendingAttempt =
+          new Attempt(mLifecycleToken, mGeneration, mRequestId, ++mMoveAttempts);
+      return mPendingAttempt;
+    }
+
+    public synchronized WarmTaskMoveResult completeAttempt(Attempt attempt, boolean moved) {
+      if (attempt == null
+          || attempt != mPendingAttempt
+          || attempt.mLifecycleToken != mLifecycleToken
+          || attempt.mGeneration != mGeneration
+          || !attempt.mRequestId.equals(mRequestId)) return WarmTaskMoveResult.STALE;
+
+      mPendingAttempt = null;
+      if (moved) {
+        clear();
+        return WarmTaskMoveResult.MOVED;
+      }
+      return mMoveAttempts < MAX_MOVE_ATTEMPTS
+          ? WarmTaskMoveResult.RETRY
+          : WarmTaskMoveResult.EXHAUSTED;
+    }
+
+    public synchronized boolean cancelAttempt(Attempt attempt) {
+      if (attempt == null
+          || attempt != mPendingAttempt
+          || attempt.mLifecycleToken != mLifecycleToken
+          || attempt.mGeneration != mGeneration
+          || !attempt.mRequestId.equals(mRequestId)) return false;
+
+      clear();
+      return true;
+    }
+
+    public synchronized boolean owns(long generation, String requestId) {
+      return generation > 0
+          && generation == mGeneration
+          && isValidRequestId(requestId)
+          && requestId.equals(mRequestId);
+    }
+
+    private boolean ownsRequest(String requestId) {
+      return mGeneration > 0 && isValidRequestId(requestId) && requestId.equals(mRequestId);
+    }
+
+    public synchronized boolean isExhausted() {
+      return mGeneration > 0
+          && mPendingAttempt == null
+          && mMoveAttempts >= MAX_MOVE_ATTEMPTS;
+    }
+
+    public synchronized void clear() {
+      mLifecycleToken = 0;
+      mGeneration = 0;
+      mRequestId = "";
+      mNativeReady = false;
+      mCallerResultAcknowledged = false;
+      mMoveAttempts = 0;
+      mPendingAttempt = null;
+    }
+  }
+
+  public static final class WarmTaskHandoffController {
+    private final WarmTaskHandoff mHandoff = new WarmTaskHandoff();
+    private final WarmTaskScheduler mScheduler;
+    private final Object mLifecycleLock;
+    private final WarmTaskLifecycleStateSource mLifecycleStateSource;
+    private final WarmTaskMoveAdapter mMoveAdapter;
+    private final WarmTaskHandoffObserver mObserver;
+    private final long mRetryDelayMs;
+    private MoveTask mPendingTask;
+
+    private final class MoveTask implements Runnable {
+      private final WarmTaskHandoff.Attempt mAttempt;
+
+      private MoveTask(WarmTaskHandoff.Attempt attempt) {
+        mAttempt = attempt;
+      }
+
+      @Override
+      public void run() {
+        runTask(this);
+      }
+    }
+
+    public WarmTaskHandoffController(
+        WarmTaskScheduler scheduler,
+        Object lifecycleLock,
+        WarmTaskLifecycleStateSource lifecycleStateSource,
+        WarmTaskMoveAdapter moveAdapter,
+        WarmTaskHandoffObserver observer,
+        long retryDelayMs) {
+      if (scheduler == null
+          || lifecycleLock == null
+          || lifecycleStateSource == null
+          || moveAdapter == null
+          || observer == null
+          || retryDelayMs < 0)
+        throw new IllegalArgumentException("Invalid warm task handoff dependency");
+
+      mScheduler = scheduler;
+      mLifecycleLock = lifecycleLock;
+      mLifecycleStateSource = lifecycleStateSource;
+      mMoveAdapter = moveAdapter;
+      mObserver = observer;
+      mRetryDelayMs = retryDelayMs;
+    }
+
+    public boolean prepare(
+        long lifecycleToken,
+        long generation,
+        String requestId,
+        boolean callerResultAcknowledged) {
+      cancel();
+      synchronized (this) {
+        return mHandoff.prepare(
+            lifecycleToken, generation, requestId, callerResultAcknowledged);
+      }
+    }
+
+    public synchronized boolean owns(long generation, String requestId) {
+      return mHandoff.owns(generation, requestId);
+    }
+
+    public synchronized boolean confirmCallerResult(long generation, String requestId) {
+      return mHandoff.confirmCallerResult(generation, requestId);
+    }
+
+    public synchronized boolean markNativeReady(
+        long lifecycleToken, long generation, String requestId) {
+      return mHandoff.markNativeReady(lifecycleToken, generation, requestId);
+    }
+
+    public boolean scheduleIfReady(long lifecycleToken, long generation, String requestId) {
+      return schedule(lifecycleToken, generation, requestId, false);
+    }
+
+    private boolean schedule(
+        long lifecycleToken, long generation, String requestId, boolean retry) {
+      final MoveTask task;
+      synchronized (this) {
+        if (mPendingTask != null) return false;
+        WarmTaskHandoff.Attempt attempt =
+            mHandoff.reserveAttempt(lifecycleToken, generation, requestId);
+        if (attempt == null) return false;
+        task = new MoveTask(attempt);
+        mPendingTask = task;
+      }
+
+      boolean posted = false;
+      try {
+        posted = retry
+            ? mScheduler.postDelayed(task, mRetryDelayMs)
+            : mScheduler.post(task);
+      } catch (RuntimeException e) {
+        // Framework scheduler failures follow the same bounded refusal path.
+      }
+      if (!posted) complete(task, WarmTaskMoveAttemptResult.REFUSED, true);
+      return posted;
+    }
+
+    public void cancel() {
+      final MoveTask pending;
+      synchronized (this) {
+        pending = mPendingTask;
+        mPendingTask = null;
+        mHandoff.clear();
+      }
+      if (pending == null) return;
+      try {
+        mScheduler.removeCallbacks(pending);
+      } catch (RuntimeException e) {
+        // Callback identity still fences a scheduler that refuses cancellation.
+      }
+    }
+
+    private void runTask(MoveTask task) {
+      synchronized (this) {
+        if (mPendingTask != task) return;
+        mPendingTask = null;
+      }
+
+      WarmTaskMoveAttemptResult result = move(task.mAttempt);
+      complete(task, result, false);
+    }
+
+    private WarmTaskMoveAttemptResult move(WarmTaskHandoff.Attempt attempt) {
+      synchronized (mLifecycleLock) {
+        final WarmTaskLifecycleState lifecycleState;
+        try {
+          lifecycleState = mLifecycleStateSource.capture();
+        } catch (RuntimeException e) {
+          return WarmTaskMoveAttemptResult.STALE;
+        }
+        if (lifecycleState == null || !lifecycleState.allows(attempt))
+          return WarmTaskMoveAttemptResult.STALE;
+
+        try {
+          return mMoveAdapter.moveTaskToBack(attempt)
+              ? WarmTaskMoveAttemptResult.MOVED
+              : WarmTaskMoveAttemptResult.REFUSED;
+        } catch (RuntimeException e) {
+          return WarmTaskMoveAttemptResult.REFUSED;
+        }
+      }
+    }
+
+    private void complete(
+        MoveTask task, WarmTaskMoveAttemptResult attemptResult, boolean schedulerRejected) {
+      WarmTaskMoveResult result;
+      boolean fallback = false;
+      synchronized (this) {
+        if (schedulerRejected) {
+          if (mPendingTask != task) return;
+          mPendingTask = null;
+        }
+        if (attemptResult == WarmTaskMoveAttemptResult.STALE) {
+          fallback = mHandoff.cancelAttempt(task.mAttempt);
+          result = WarmTaskMoveResult.STALE;
+        } else {
+          result =
+              mHandoff.completeAttempt(
+                  task.mAttempt, attemptResult == WarmTaskMoveAttemptResult.MOVED);
+          if (result == WarmTaskMoveResult.EXHAUSTED) {
+            mHandoff.clear();
+            fallback = true;
+          }
+        }
+      }
+
+      if (result == WarmTaskMoveResult.STALE || result == WarmTaskMoveResult.MOVED) {
+        if (fallback) mObserver.onFallback();
+        return;
+      }
+      mObserver.onAttemptFailed(
+          task.mAttempt.number(), WarmTaskHandoff.MAX_MOVE_ATTEMPTS, schedulerRejected);
+      if (result == WarmTaskMoveResult.RETRY) {
+        schedule(
+            task.mAttempt.lifecycleToken(),
+            task.mAttempt.generation(),
+            task.mAttempt.requestId(),
+            true);
+      } else if (fallback) {
+        mObserver.onFallback();
+      }
+    }
+  }
+
+  public static final class TerminalReservation {
+    private final Producer mProducer;
+    private final Terminal mTerminal;
+    private final boolean mPreparedRejection;
+    private boolean mOpen = true;
+
+    private TerminalReservation(
+        Producer producer, Terminal terminal, boolean preparedRejection) {
+      mProducer = producer;
+      mTerminal = terminal;
+      mPreparedRejection = preparedRejection;
+    }
+
+    public Terminal terminal() {
+      return mTerminal;
+    }
+
+    public boolean commit() {
+      return mProducer.commit(this);
+    }
+
+    public boolean rollback() {
+      return mProducer.rollback(this);
+    }
+  }
+
+  public static final class ProcessExitState {
+    private String mRequestId;
+    private long mGeneration;
+    private boolean mExitRequested;
+    private boolean mAcknowledged;
+    private boolean mClaimed;
+
+    public ProcessExitState() {
+      mRequestId = "";
+    }
+
+    public ProcessExitState(
+        String requestId,
+        long generation,
+        boolean exitRequested,
+        boolean acknowledged,
+        boolean claimed) {
+      if (!isValidRequestId(requestId)
+          || generation <= 0
+          || (acknowledged && !exitRequested)
+          || (claimed && !acknowledged))
+        throw new IllegalArgumentException("Invalid external-player process-exit state");
+
+      mRequestId = requestId;
+      mGeneration = generation;
+      mExitRequested = exitRequested;
+      mAcknowledged = acknowledged;
+      mClaimed = claimed;
+    }
+
+    public synchronized boolean activate(long generation, String requestId) {
+      if (generation <= 0 || !isValidRequestId(requestId)) return false;
+      if (matches(generation, requestId)) return true;
+
+      mRequestId = requestId;
+      mGeneration = generation;
+      mExitRequested = false;
+      mAcknowledged = false;
+      mClaimed = false;
+      return true;
+    }
+
+    public synchronized boolean requestExit(long generation, String requestId) {
+      if (!matches(generation, requestId) || mExitRequested) return false;
+
+      mExitRequested = true;
+      return true;
+    }
+
+    public synchronized boolean acknowledge(long generation, String requestId) {
+      if (!matches(generation, requestId) || !mExitRequested || mAcknowledged) return false;
+
+      mAcknowledged = true;
+      return true;
+    }
+
+    public synchronized boolean claim(long generation, String requestId) {
+      if (!matches(generation, requestId) || !mAcknowledged || mClaimed) return false;
+
+      mClaimed = true;
+      return true;
+    }
+
+    public synchronized boolean clear(long generation, String requestId) {
+      if (!matches(generation, requestId)) return false;
+
+      mRequestId = "";
+      mGeneration = 0;
+      mExitRequested = false;
+      mAcknowledged = false;
+      mClaimed = false;
+      return true;
+    }
+
+    public synchronized boolean matches(long generation, String requestId) {
+      return generation > 0 && generation == mGeneration && mRequestId.equals(requestId);
+    }
+
+    public synchronized boolean isAcknowledged(long generation, String requestId) {
+      return matches(generation, requestId) && mAcknowledged;
+    }
+
+    public synchronized boolean isClaimed(long generation, String requestId) {
+      return matches(generation, requestId) && mClaimed;
+    }
+
+    public synchronized ProcessExitState copy() {
+      if (mGeneration == 0) return new ProcessExitState();
+      return new ProcessExitState(mRequestId, mGeneration, mExitRequested, mAcknowledged, mClaimed);
+    }
+
+    public synchronized boolean isActive() {
+      return mGeneration > 0;
+    }
+
+    public synchronized String requestId() {
+      return mRequestId;
+    }
+
+    public synchronized long generation() {
+      return mGeneration;
+    }
+
+    public synchronized boolean wasExitRequested() {
+      return mExitRequested;
+    }
+
+    public synchronized boolean wasAcknowledged() {
+      return mAcknowledged;
+    }
+
+    public synchronized boolean wasClaimed() {
+      return mClaimed;
+    }
+  }
+
+  public static final class Producer {
+    private long mGeneration;
+    private String mRequestId = "";
+    private boolean mTerminalClaimed;
+    private boolean mExitProcess;
+    private boolean mExitAcknowledged;
+    private boolean mExitScheduled;
+    private boolean mOwnerCanceled;
+    private String mPreparedRequestId = "";
+    private boolean mPreparedCancellation;
+    private boolean mPreparedCallerResultAcknowledged;
+    private boolean mCallerResultAcknowledged;
+    private String mPendingCallerResultRequestId = "";
+    private TerminalReservation mTerminalReservation;
+
+    public synchronized boolean prepare(String requestId) {
+      if (!isValidRequestId(requestId)) return false;
+      if (!mPreparedRequestId.isEmpty()) return mPreparedRequestId.equals(requestId);
+      if (mGeneration > 0 && mRequestId.equals(requestId)) return true;
+
+      boolean callerResultAcknowledged = mPendingCallerResultRequestId.equals(requestId);
+      mPendingCallerResultRequestId = "";
+      mPreparedRequestId = requestId;
+      mPreparedCancellation = false;
+      mPreparedCallerResultAcknowledged = callerResultAcknowledged;
+      return true;
+    }
+
+    public synchronized boolean cancelPrepared(String requestId) {
+      if (!isValidRequestId(requestId) || !mPreparedRequestId.equals(requestId)) return false;
+
+      mPreparedCancellation = true;
+      return true;
+    }
+
+    public synchronized Admission admitPrepared(long generation, String requestId) {
+      if (generation <= mGeneration
+          || !isValidRequestId(requestId)
+          || !mPreparedRequestId.equals(requestId)
+          || mTerminalReservation != null
+          || (mGeneration > 0 && !mTerminalClaimed)) return null;
+
+      boolean cancellationRequested = mPreparedCancellation;
+      boolean callerResultAcknowledged = mPreparedCallerResultAcknowledged;
+      if (!begin(generation, requestId)) return null;
+      mPreparedRequestId = "";
+      mPreparedCancellation = false;
+      mPreparedCallerResultAcknowledged = false;
+      mOwnerCanceled = cancellationRequested;
+      mCallerResultAcknowledged = callerResultAcknowledged;
+      return new Admission(
+          generation, requestId, cancellationRequested, callerResultAcknowledged);
+    }
+
+    public synchronized TerminalReservation reservePreparedRejection(
+        long generation, String requestId) {
+      if (generation <= 0
+          || !isValidRequestId(requestId)
+          || !mPreparedRequestId.equals(requestId)
+          || mTerminalReservation != null) return null;
+
+      return reserve(new Terminal(requestId, generation, 0, 0, false, false), true);
+    }
+
+    public synchronized Terminal rejectPrepared(long generation, String requestId) {
+      TerminalReservation reservation = reservePreparedRejection(generation, requestId);
+      if (reservation == null) return null;
+
+      Terminal terminal = reservation.terminal();
+      if (reservation.commit()) return terminal;
+      reservation.rollback();
+      return null;
+    }
+
+    public synchronized boolean begin(long generation, String requestId) {
+      if (generation <= mGeneration
+          || !isValidRequestId(requestId)
+          || mTerminalReservation != null
+          || (mGeneration > 0 && !mTerminalClaimed)) return false;
+
+      mGeneration = generation;
+      mRequestId = requestId;
+      mTerminalClaimed = false;
+      mExitProcess = false;
+      mExitAcknowledged = false;
+      mExitScheduled = false;
+      mOwnerCanceled = false;
+      mCallerResultAcknowledged = false;
+      mPendingCallerResultRequestId = "";
+      return true;
+    }
+
+    public synchronized TerminalReservation reserveFinish(
+        long generation,
+        String requestId,
+        long positionMs,
+        long durationMs,
+        boolean completed,
+        boolean exitProcess) {
+      if (!matches(generation, requestId)
+          || mTerminalClaimed
+          || mTerminalReservation != null) return null;
+
+      return reserve(
+          new Terminal(
+              requestId, generation, positionMs, durationMs, completed, exitProcess),
+          false);
+    }
+
+    public synchronized Terminal finish(
+        long generation,
+        String requestId,
+        long positionMs,
+        long durationMs,
+        boolean completed,
+        boolean exitProcess) {
+      TerminalReservation reservation =
+          reserveFinish(
+              generation, requestId, positionMs, durationMs, completed, exitProcess);
+      if (reservation == null) return null;
+
+      Terminal terminal = reservation.terminal();
+      if (reservation.commit()) return terminal;
+      reservation.rollback();
+      return null;
+    }
+
+    public synchronized TerminalReservation reserveSupersede(
+        long generation, String requestId) {
+      return reserveFinish(generation, requestId, 0, 0, false, false);
+    }
+
+    public synchronized Terminal supersede(long generation, String requestId) {
+      return finish(generation, requestId, 0, 0, false, false);
+    }
+
+    public synchronized boolean matches(long generation, String requestId) {
+      return generation > 0 && generation == mGeneration && mRequestId.equals(requestId);
+    }
+
+    public synchronized boolean ownsRequest(String requestId) {
+      return (mGeneration > 0 && mRequestId.equals(requestId))
+          || (!mPreparedRequestId.isEmpty() && mPreparedRequestId.equals(requestId));
+    }
+
+    public synchronized boolean isPrepared(String requestId) {
+      return isValidRequestId(requestId) && mPreparedRequestId.equals(requestId);
+    }
+
+    public synchronized long activeGeneration() {
+      return mGeneration;
+    }
+
+    public synchronized String activeRequestId() {
+      return mRequestId;
+    }
+
+    public synchronized String preparedRequestId() {
+      return mPreparedRequestId;
+    }
+
+    public synchronized boolean acknowledgeExit(long generation, String requestId) {
+      if (!matches(generation, requestId) || !mTerminalClaimed || !mExitProcess) return false;
+
+      mExitAcknowledged = true;
+      return true;
+    }
+
+    public synchronized boolean cancelOwner(long generation, String requestId) {
+      if (!matches(generation, requestId)) return false;
+
+      mOwnerCanceled = true;
+      return true;
+    }
+
+    public synchronized boolean isOwnerCanceled(long generation, String requestId) {
+      return matches(generation, requestId) && mOwnerCanceled;
+    }
+
+    public synchronized boolean confirmCallerResult(long generation, String requestId) {
+      if (!isValidRequestId(requestId)) return false;
+      if (generation == 0) {
+        if (mPreparedRequestId.equals(requestId)) {
+          mPreparedCallerResultAcknowledged = true;
+          return true;
+        }
+        if (mGeneration > 0 && mRequestId.equals(requestId) && mOwnerCanceled) {
+          mCallerResultAcknowledged = true;
+          return true;
+        }
+        if (mGeneration > 0 || !mPreparedRequestId.isEmpty()) return false;
+        if (!mPendingCallerResultRequestId.isEmpty()
+            && !mPendingCallerResultRequestId.equals(requestId)) return false;
+        mPendingCallerResultRequestId = requestId;
+        return true;
+      }
+      if (!matches(generation, requestId)) return false;
+
+      mCallerResultAcknowledged = true;
+      return true;
+    }
+
+    public synchronized boolean isCallerResultAcknowledged(long generation, String requestId) {
+      return matches(generation, requestId) && mCallerResultAcknowledged;
+    }
+
+    public synchronized boolean claimProcessExit(long generation, String requestId) {
+      if (!matches(generation, requestId)
+          || !mTerminalClaimed
+          || !mExitProcess
+          || (!mExitAcknowledged && !mOwnerCanceled)
+          || mExitScheduled) return false;
+
+      mExitScheduled = true;
+      return true;
+    }
+
+    public synchronized boolean shouldExitProcess(long generation, String requestId) {
+      return matches(generation, requestId) && mExitScheduled && mExitProcess;
+    }
+
+    public synchronized void clear(long generation, String requestId) {
+      if (!matches(generation, requestId) || mTerminalReservation != null) return;
+
+      mGeneration = 0;
+      mRequestId = "";
+      mTerminalClaimed = false;
+      mExitProcess = false;
+      mExitAcknowledged = false;
+      mExitScheduled = false;
+      mOwnerCanceled = false;
+      mCallerResultAcknowledged = false;
+      if (mPreparedRequestId.equals(requestId)) {
+        mPreparedRequestId = "";
+        mPreparedCancellation = false;
+        mPreparedCallerResultAcknowledged = false;
+      }
+    }
+
+    private TerminalReservation reserve(Terminal terminal, boolean preparedRejection) {
+      TerminalReservation reservation =
+          new TerminalReservation(this, terminal, preparedRejection);
+      mTerminalReservation = reservation;
+      return reservation;
+    }
+
+    private synchronized boolean commit(TerminalReservation reservation) {
+      if (!isOpenReservation(reservation)) return false;
+
+      Terminal terminal = reservation.mTerminal;
+      if (reservation.mPreparedRejection) {
+        if (!mPreparedRequestId.equals(terminal.requestId)) return false;
+        mPreparedRequestId = "";
+        mPreparedCancellation = false;
+        mPreparedCallerResultAcknowledged = false;
+      } else {
+        if (!matches(terminal.generation, terminal.requestId) || mTerminalClaimed) return false;
+        mTerminalClaimed = true;
+        mExitProcess = terminal.exitProcess;
+      }
+
+      close(reservation);
+      return true;
+    }
+
+    private synchronized boolean rollback(TerminalReservation reservation) {
+      if (!isOpenReservation(reservation)) return false;
+
+      close(reservation);
+      return true;
+    }
+
+    private boolean isOpenReservation(TerminalReservation reservation) {
+      return reservation != null
+          && reservation.mProducer == this
+          && reservation.mOpen
+          && mTerminalReservation == reservation;
+    }
+
+    private void close(TerminalReservation reservation) {
+      reservation.mOpen = false;
+      mTerminalReservation = null;
+    }
+  }
+
+  public static final class MainState {
+    private final Producer mProducer = new Producer();
+
+    public synchronized boolean ownsRequest(String requestId) {
+      return mProducer.ownsRequest(requestId);
+    }
+
+    public synchronized boolean prepare(String requestId) {
+      return mProducer.prepare(requestId);
+    }
+
+    public synchronized boolean isPrepared(String requestId) {
+      return mProducer.isPrepared(requestId);
+    }
+
+    public synchronized Admission admitPrepared(long generation, String requestId) {
+      return mProducer.admitPrepared(generation, requestId);
+    }
+
+    public synchronized TerminalReservation reservePreparedRejection(
+        long generation, String requestId) {
+      return mProducer.reservePreparedRejection(generation, requestId);
+    }
+
+    public synchronized Terminal rejectPrepared(long generation, String requestId) {
+      return mProducer.rejectPrepared(generation, requestId);
+    }
+
+    public synchronized Terminal supersede(long generation, String requestId) {
+      return mProducer.supersede(generation, requestId);
+    }
+
+    public synchronized TerminalReservation reserveSupersede(
+        long generation, String requestId) {
+      return mProducer.reserveSupersede(generation, requestId);
+    }
+
+    public synchronized TerminalReservation reserveFinish(
+        long generation,
+        String requestId,
+        long positionMs,
+        long durationMs,
+        boolean completed,
+        boolean exitProcess) {
+      return mProducer.reserveFinish(
+          generation, requestId, positionMs, durationMs, completed, exitProcess);
+    }
+
+    public synchronized Terminal finish(
+        long generation,
+        String requestId,
+        long positionMs,
+        long durationMs,
+        boolean completed,
+        boolean exitProcess) {
+      return mProducer.finish(
+          generation, requestId, positionMs, durationMs, completed, exitProcess);
+    }
+
+    public synchronized boolean cancelEarlyBack() {
+      String preparedRequestId = mProducer.preparedRequestId();
+      if (isValidRequestId(preparedRequestId)
+          && mProducer.cancelPrepared(preparedRequestId)) return true;
+      return mProducer.activeGeneration() > 0
+          && mProducer.cancelOwner(mProducer.activeGeneration(), mProducer.activeRequestId());
+    }
+
+    public synchronized boolean cancelOwner(long generation, String requestId) {
+      return mProducer.cancelOwner(generation, requestId);
+    }
+
+    public synchronized boolean isOwnerCanceled(long generation, String requestId) {
+      return mProducer.isOwnerCanceled(generation, requestId);
+    }
+
+    public synchronized boolean confirmCallerResult(long generation, String requestId) {
+      return mProducer.confirmCallerResult(generation, requestId);
+    }
+
+    public synchronized boolean isCallerResultAcknowledged(long generation, String requestId) {
+      return mProducer.isCallerResultAcknowledged(generation, requestId);
+    }
+
+    public synchronized boolean acknowledgeExit(long generation, String requestId) {
+      return mProducer.acknowledgeExit(generation, requestId);
+    }
+
+    public synchronized boolean claimProcessExit(long generation, String requestId) {
+      return mProducer.claimProcessExit(generation, requestId);
+    }
+
+    public synchronized boolean shouldExitProcess(long generation, String requestId) {
+      return mProducer.shouldExitProcess(generation, requestId);
+    }
+
+    public synchronized void clear(long generation, String requestId) {
+      mProducer.clear(generation, requestId);
+    }
+
+    public synchronized long activeGeneration() {
+      return mProducer.activeGeneration();
+    }
+
+    public synchronized String activeRequestId() {
+      return mProducer.activeRequestId();
+    }
+
+    public synchronized String preparedRequestId() {
+      return mProducer.preparedRequestId();
+    }
+  }
+
+  public static final class Owner {
+    private final String mRequestId;
+    private boolean mLaunchForwarded;
+    private long mExpectedGeneration;
+    private boolean mCompleted;
+    private boolean mCanceled;
+
+    public Owner(
+        String requestId,
+        boolean launchForwarded,
+        long expectedGeneration,
+        boolean completed,
+        boolean canceled) {
+      if (!isValidRequestId(requestId)
+          || expectedGeneration < 0
+          || (expectedGeneration > 0 && !launchForwarded)
+          || (canceled && !completed))
+        throw new IllegalArgumentException("Invalid external-player result owner");
+
+      mRequestId = requestId;
+      mLaunchForwarded = launchForwarded;
+      mExpectedGeneration = expectedGeneration;
+      mCompleted = completed;
+      mCanceled = canceled;
+    }
+
+    public synchronized boolean markLaunchForwarded() {
+      if (mCompleted || mLaunchForwarded) return false;
+
+      mLaunchForwarded = true;
+      return true;
+    }
+
+    public synchronized boolean rollbackLaunchForwarded() {
+      if (mCompleted || !mLaunchForwarded || mExpectedGeneration != 0) return false;
+
+      mLaunchForwarded = false;
+      return true;
+    }
+
+    public synchronized boolean bind(long generation, String requestId) {
+      if (!mLaunchForwarded
+          || generation <= 0
+          || !mRequestId.equals(requestId)
+          || (mExpectedGeneration != 0 && mExpectedGeneration != generation)) return false;
+
+      mExpectedGeneration = generation;
+      return true;
+    }
+
+    public synchronized boolean claim(Terminal terminal) {
+      if (mCompleted || !matches(terminal)) return false;
+
+      mCompleted = true;
+      return true;
+    }
+
+    public synchronized boolean cancelBeforeAdmission() {
+      if (mCompleted || mExpectedGeneration != 0) return false;
+
+      mCompleted = true;
+      mCanceled = true;
+      return true;
+    }
+
+    public synchronized boolean cancel(long generation, String requestId) {
+      if (mCompleted
+          || generation <= 0
+          || generation != mExpectedGeneration
+          || !mRequestId.equals(requestId)) return false;
+
+      mCompleted = true;
+      mCanceled = true;
+      return true;
+    }
+
+    public synchronized boolean matches(Terminal terminal) {
+      return terminal != null
+          && mExpectedGeneration > 0
+          && mExpectedGeneration == terminal.generation
+          && mRequestId.equals(terminal.requestId);
+    }
+
+    public synchronized Owner copy() {
+      return new Owner(mRequestId, mLaunchForwarded, mExpectedGeneration, mCompleted, mCanceled);
+    }
+
+    public String requestId() {
+      return mRequestId;
+    }
+
+    public synchronized boolean wasLaunchForwarded() {
+      return mLaunchForwarded;
+    }
+
+    public synchronized long expectedGeneration() {
+      return mExpectedGeneration;
+    }
+
+    public synchronized boolean wasCompleted() {
+      return mCompleted;
+    }
+
+    public synchronized boolean wasCanceled() {
+      return mCanceled;
+    }
+  }
+}

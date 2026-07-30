@@ -9,17 +9,19 @@ import android.util.Log;
 
 public class XBMCSettingsContentObserver extends ContentObserver
 {
-  native void _onVolumeChanged(int newVolume);
+  native void _onVolumeChanged(long lifecycleToken, int newVolume);
 
   private static final String TAG = "@APP_NAME@";
 
   int previousVolume;
   Context context;
+  private final long mLifecycleToken;
 
-  public XBMCSettingsContentObserver(Context c, Handler handler)
+  public XBMCSettingsContentObserver(Context c, Handler handler, long lifecycleToken)
   {
     super(handler);
     context = c;
+    mLifecycleToken = lifecycleToken;
 
     AudioManager audio = (AudioManager) context.getSystemService(Context.AUDIO_SERVICE);
     previousVolume = audio.getStreamVolume(AudioManager.STREAM_MUSIC);
@@ -54,7 +56,7 @@ public class XBMCSettingsContentObserver extends ContentObserver
       {
         try
         {
-          _onVolumeChanged(currentVolume);
+          _onVolumeChanged(mLifecycleToken, currentVolume);
           previousVolume = currentVolume;
         }
         catch (UnsatisfiedLinkError e)

@@ -11,6 +11,7 @@
 #include "ServiceBroker.h"
 #include "cores/DataCacheCore.h"
 #include "cores/IPlayer.h"
+#include "cores/PlayerOpenPublication.h"
 #include "cores/VideoPlayer/VideoPlayer.h"
 #include "cores/playercorefactory/PlayerCoreFactory.h"
 #include "guilib/GUIComponent.h"
@@ -20,6 +21,7 @@
 #include "video/VideoFileItemClassify.h"
 
 #include <mutex>
+#include <utility>
 
 using namespace KODI;
 using namespace std::chrono_literals;
@@ -38,7 +40,7 @@ std::shared_ptr<IPlayer> CApplicationPlayer::GetInternal()
 
 void CApplicationPlayer::ClosePlayer()
 {
-  m_nextItem.pItem.reset();
+  CancelNextItem();
   std::shared_ptr<IPlayer> player = GetInternal();
   if (player)
   {
@@ -87,6 +89,19 @@ bool CApplicationPlayer::OpenFile(const CFileItem& item, const CPlayerOptions& o
                                   const CPlayerCoreFactory &factory,
                                   const std::string &playerName, IPlayerCallback& callback)
 {
+  return OpenFileInternal(item, options, factory, playerName, callback, true);
+}
+
+bool CApplicationPlayer::OpenFileInternal(const CFileItem& item,
+                                          const CPlayerOptions& options,
+                                          const CPlayerCoreFactory& factory,
+                                          const std::string& playerName,
+                                          IPlayerCallback& callback,
+                                          bool notifyOpening)
+{
+  if (notifyOpening)
+    CancelNextItem();
+
   // get player type
   std::string newPlayer;
   if (!playerName.empty())
@@ -112,6 +127,8 @@ bool CApplicationPlayer::OpenFile(const CFileItem& item, const CPlayerOptions& o
 
     if (needToClose)
     {
+      if (notifyOpening)
+        callback.OnPlayBackOpening(item, true);
       m_nextItem.pItem = std::make_shared<CFileItem>(item);
       m_nextItem.options = options;
       m_nextItem.playerName = newPlayer;
@@ -136,17 +153,23 @@ bool CApplicationPlayer::OpenFile(const CFileItem& item, const CPlayerOptions& o
     }
   }
 
+  if (notifyOpening)
+    callback.OnPlayBackOpening(item);
+
   if (!player)
   {
     CreatePlayer(factory, newPlayer, callback);
     player = GetInternal();
     if (!player)
+    {
+      callback.OnPlayBackOpenFailed(item);
       return false;
+    }
   }
 
   bool ret = player->OpenFile(item, options);
-
-  m_nextItem.pItem.reset();
+  if (!ret)
+    callback.OnPlayBackOpenFailed(item);
 
   // reset caching timers
   m_audioStreamUpdate.SetExpired();
@@ -156,15 +179,33 @@ bool CApplicationPlayer::OpenFile(const CFileItem& item, const CPlayerOptions& o
   return ret;
 }
 
-void CApplicationPlayer::OpenNext(const CPlayerCoreFactory &factory)
+CApplicationPlayer::OpenNextResult CApplicationPlayer::OpenNext(const CPlayerCoreFactory& factory)
 {
-  if (m_nextItem.pItem)
-  {
-    OpenFile(*m_nextItem.pItem, m_nextItem.options,
-             factory,
-             m_nextItem.playerName, *m_nextItem.callback);
-    m_nextItem.pItem.reset();
-  }
+  if (!m_nextItem.pItem)
+    return OpenNextResult::NoItem;
+
+  SNextItem nextItem = std::move(m_nextItem);
+  m_nextItem = {};
+  if (!nextItem.callback)
+    return OpenNextResult::Failed;
+
+  return KODI::PLAYER::BeginDeferredOpenAndOpen(
+             [&] { nextItem.callback->OnPlayBackOpenNext(*nextItem.pItem); },
+             [&]
+             {
+               return OpenFileInternal(*nextItem.pItem, nextItem.options, factory,
+                                       nextItem.playerName, *nextItem.callback, false);
+             })
+             ? OpenNextResult::Opened
+             : OpenNextResult::Failed;
+}
+
+void CApplicationPlayer::CancelNextItem()
+{
+  SNextItem nextItem = std::move(m_nextItem);
+  m_nextItem = {};
+  if (nextItem.pItem && nextItem.callback)
+    nextItem.callback->OnPlayBackOpenFailed(*nextItem.pItem);
 }
 
 bool CApplicationPlayer::HasPlayer() const

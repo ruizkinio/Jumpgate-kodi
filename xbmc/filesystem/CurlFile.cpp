@@ -16,7 +16,6 @@
 #include "settings/AdvancedSettings.h"
 #include "settings/Settings.h"
 #include "settings/SettingsComponent.h"
-#include "threads/SystemClock.h"
 #include "utils/Base64.h"
 #include "utils/Map.h"
 #include "utils/XTimeUtils.h"
@@ -24,6 +23,8 @@
 #include <algorithm>
 #include <cassert>
 #include <climits>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 #ifdef TARGET_POSIX
@@ -41,8 +42,6 @@
 using namespace XFILE;
 using namespace XCURL;
 
-using namespace std::chrono_literals;
-
 #define FITS_INT(a) (((a) <= INT_MAX) && ((a) >= INT_MIN))
 
 namespace
@@ -58,44 +57,159 @@ constexpr auto proxyType2CUrlProxyType{make_map<XFILE::CCurlFile::ProxyType, lon
 
 std::vector<uint8_t> cachedCaCertsBlob; // cached CA certs file
 
+bool EqualsNoCaseAscii(std::string_view value, std::string_view expected) noexcept
+{
+  return value.size() == expected.size() &&
+         std::equal(value.begin(), value.end(), expected.begin(),
+                    [](char left, char right)
+                    {
+                      if (left >= 'A' && left <= 'Z')
+                        left = static_cast<char>(left - 'A' + 'a');
+                      if (right >= 'A' && right <= 'Z')
+                        right = static_cast<char>(right - 'A' + 'a');
+                      return left == right;
+                    });
+}
+
+bool ContainsNoCaseAscii(std::string_view value, std::string_view expected) noexcept
+{
+  return std::search(value.begin(), value.end(), expected.begin(), expected.end(),
+                     [](char left, char right)
+                     {
+                       if (left >= 'A' && left <= 'Z')
+                         left = static_cast<char>(left - 'A' + 'a');
+                       if (right >= 'A' && right <= 'Z')
+                         right = static_cast<char>(right - 'A' + 'a');
+                       return left == right;
+                     }) != value.end();
+}
+
+bool IsSensitiveHeaderName(std::string_view name) noexcept
+{
+  return ContainsNoCaseAscii(name, "authorization") ||
+         ContainsNoCaseAscii(name, "authentication") || ContainsNoCaseAscii(name, "cookie") ||
+         ContainsNoCaseAscii(name, "token") || ContainsNoCaseAscii(name, "secret") ||
+         ContainsNoCaseAscii(name, "credential") || ContainsNoCaseAscii(name, "signature") ||
+         ContainsNoCaseAscii(name, "api-key") || ContainsNoCaseAscii(name, "apikey") ||
+         EqualsNoCaseAscii(name, "location") || EqualsNoCaseAscii(name, "content-location") ||
+         EqualsNoCaseAscii(name, "referer") || EqualsNoCaseAscii(name, "referrer") ||
+         EqualsNoCaseAscii(name, "link");
+}
+
+std::string GetRedactedUrl(const CURL& url)
+{
+  return RedactCurlUrlForLogging(url);
+}
+
+std::string GetRedactedUrl(const std::string& url)
+{
+  return GetRedactedUrl(CURL{url});
+}
+
 } // unnamed namespace
+
+std::string XFILE::RedactCurlUrlForLogging(const CURL& url)
+{
+  CURL sanitizedUrl{url};
+  sanitizedUrl.SetUserName("");
+  sanitizedUrl.SetPassword("");
+  sanitizedUrl.SetOptions("");
+  sanitizedUrl.SetProtocolOptions("");
+  if (!sanitizedUrl.GetFileName().empty())
+    sanitizedUrl.SetFileName("[REDACTED]");
+  return sanitizedUrl.GetRedacted();
+}
+
+std::string XFILE::RedactCurlHeaderForLogging(std::string_view line, bool& redactContinuation)
+{
+  if (!line.empty() && (line.front() == ' ' || line.front() == '\t'))
+  {
+    if (!redactContinuation)
+      return std::string{line};
+
+    const std::size_t valueStart = line.find_first_not_of(" \t");
+    return std::string{line.substr(0, valueStart)} + "[REDACTED]";
+  }
+
+  redactContinuation = false;
+
+  const std::size_t requestTarget = line.find(' ');
+  const std::size_t protocol = line.rfind(" HTTP/");
+  if (requestTarget != std::string_view::npos && protocol != std::string_view::npos &&
+      requestTarget < protocol && requestTarget >= 3 && requestTarget <= 16 &&
+      std::all_of(line.begin(), line.begin() + requestTarget,
+                  [](char value) { return value >= 'A' && value <= 'Z'; }))
+  {
+    return std::string{line.substr(0, requestTarget)} + " [REDACTED]" +
+           std::string{line.substr(protocol)};
+  }
+
+  const std::size_t colon = line.find(':');
+  if (colon == std::string_view::npos)
+    return std::string{line};
+
+  std::string_view name = line.substr(0, colon);
+  const std::size_t nameStart = name.find_first_not_of(" \t");
+  if (nameStart == std::string_view::npos)
+    return std::string{line};
+  name.remove_prefix(nameStart);
+  const std::size_t nameEnd = name.find_last_not_of(" \t");
+  name = name.substr(0, nameEnd + 1);
+
+  if (!IsSensitiveHeaderName(name))
+    return std::string{line};
+
+  redactContinuation = true;
+  return std::string{line.substr(0, colon + 1)} + " [REDACTED]";
+}
 
 #define FILLBUFFER_OK         0
 #define FILLBUFFER_NO_DATA    1
 #define FILLBUFFER_FAIL       2
 
 // curl calls this routine to debug
-extern "C" int debug_callback(CURL_HANDLE *handle, curl_infotype info, char *output, size_t size, void *data)
+extern "C" int debug_callback(
+    CURL_HANDLE*, curl_infotype info, char* output, size_t size, void* data)
 {
-  if (info == CURLINFO_DATA_IN || info == CURLINFO_DATA_OUT)
+  // Curl text diagnostics and payload/TLS blocks may contain request URLs or credentials.
+  if (info != CURLINFO_HEADER_IN && info != CURLINFO_HEADER_OUT)
     return 0;
 
   if (!CServiceBroker::GetLogging().CanLogComponent(LOGCURL))
     return 0;
 
-  std::string strLine;
-  strLine.append(output, size);
-  std::vector<std::string> vecLines;
-  StringUtils::Tokenize(strLine, vecLines, "\r\n");
-  std::vector<std::string>::const_iterator it = vecLines.begin();
+  const char* infotype = info == CURLINFO_HEADER_IN ? "HEADER_IN: " : "HEADER_OUT: ";
 
-  const char *infotype;
-  switch(info)
-  {
-    case CURLINFO_TEXT         : infotype = "TEXT: "; break;
-    case CURLINFO_HEADER_IN    : infotype = "HEADER_IN: "; break;
-    case CURLINFO_HEADER_OUT   : infotype = "HEADER_OUT: "; break;
-    case CURLINFO_SSL_DATA_IN  : infotype = "SSL_DATA_IN: "; break;
-    case CURLINFO_SSL_DATA_OUT : infotype = "SSL_DATA_OUT: "; break;
-    case CURLINFO_END          : infotype = "END: "; break;
-    default                    : infotype = ""; break;
-  }
+  auto* state = static_cast<CCurlFile::CReadState*>(data);
+  bool localContinuation = false;
+  bool* redactContinuation = &localContinuation;
+  if (state && info == CURLINFO_HEADER_IN)
+    redactContinuation = &state->m_debugHeaderInSensitive;
+  else if (state && info == CURLINFO_HEADER_OUT)
+    redactContinuation = &state->m_debugHeaderOutSensitive;
 
-  while (it != vecLines.end())
+  const std::string_view block{output, size};
+  std::size_t lineStart = 0;
+  do
   {
-    CLog::Log(LOGDEBUG, "Curl::Debug - {}{}", infotype, (*it));
-    ++it;
-  }
+    std::size_t lineEnd = block.find('\n', lineStart);
+    if (lineEnd == std::string_view::npos)
+      lineEnd = block.size();
+
+    std::string_view line = block.substr(lineStart, lineEnd - lineStart);
+    if (!line.empty() && line.back() == '\r')
+      line.remove_suffix(1);
+
+    const std::string logLine = (info == CURLINFO_HEADER_IN || info == CURLINFO_HEADER_OUT)
+                                    ? RedactCurlHeaderForLogging(line, *redactContinuation)
+                                    : std::string{line};
+    CLog::Log(LOGDEBUG, "Curl::Debug - {}{}", infotype, logLine);
+
+    if (lineEnd == block.size())
+      break;
+    lineStart = lineEnd + 1;
+  } while (lineStart < block.size());
+
   return 0;
 }
 
@@ -128,18 +242,21 @@ extern "C" size_t header_callback(void *ptr, size_t size, size_t nmemb, void *st
   return state->HeaderCallback(ptr, size, nmemb);
 }
 
-/* used only by CCurlFile::Stat to bail out of unwanted transfers */
-extern "C" int transfer_abort_callback(void *clientp,
-               curl_off_t dltotal,
-               curl_off_t dlnow,
-               curl_off_t ultotal,
-               curl_off_t ulnow)
+extern "C" int transfer_progress_callback(
+    void* clientp, curl_off_t, curl_off_t dlnow, curl_off_t, curl_off_t)
 {
-  if(dlnow > 0)
-    return 1;
-  else
-    return 0;
+  auto* state = static_cast<CCurlFile::CReadState*>(clientp);
+  return state && (state->IsCancelled() || (state->m_abortAfterData && dlnow > 0)) ? 1 : 0;
 }
+
+#if LIBCURL_VERSION_NUM < 0x072000
+extern "C" int transfer_progress_callback_legacy(
+    void* clientp, double, double dlnow, double, double)
+{
+  auto* state = static_cast<CCurlFile::CReadState*>(clientp);
+  return state && (state->IsCancelled() || (state->m_abortAfterData && dlnow > 0)) ? 1 : 0;
+}
+#endif
 
 /* fix for silly behavior of realloc */
 static inline void* realloc_simple(void *ptr, size_t size)
@@ -253,8 +370,16 @@ size_t CCurlFile::CReadState::WriteCallback(char *buffer, size_t size, size_t ni
   return size * nitems;
 }
 
-CCurlFile::CReadState::CReadState()
+CCurlFile::CReadState::CReadState() : CReadState(std::make_shared<std::atomic_bool>(false))
 {
+}
+
+CCurlFile::CReadState::CReadState(std::shared_ptr<std::atomic_bool> cancellationState)
+  : m_cancellationState(std::move(cancellationState))
+{
+  if (!m_cancellationState)
+    m_cancellationState = std::make_shared<std::atomic_bool>(false);
+
   m_easyHandle = NULL;
   m_multiHandle = NULL;
   m_overflowBuffer = NULL;
@@ -263,7 +388,6 @@ CCurlFile::CReadState::CReadState()
   m_filePos = 0;
   m_fileSize = 0;
   m_bufferSize = 0;
-  m_cancelled = false;
   m_bFirstLoop = true;
   m_sendRange = true;
   m_bLastError = false;
@@ -280,6 +404,11 @@ CCurlFile::CReadState::~CReadState()
 
   if(m_easyHandle)
     g_curlInterface.easy_release(&m_easyHandle, &m_multiHandle);
+}
+
+bool CCurlFile::CReadState::IsCancelled() const noexcept
+{
+  return m_cancellationState->load(std::memory_order_acquire);
 }
 
 bool CCurlFile::CReadState::Seek(int64_t pos)
@@ -430,7 +559,10 @@ CCurlFile::~CCurlFile()
 }
 
 CCurlFile::CCurlFile()
- : m_overflowBuffer(NULL)
+  : m_cancellationState(std::make_shared<std::atomic_bool>(false)),
+    m_state(new CReadState(m_cancellationState)),
+    m_oldState(NULL),
+    m_overflowBuffer(NULL)
 {
   m_opened = false;
   m_forWrite = false;
@@ -438,13 +570,12 @@ CCurlFile::CCurlFile()
   m_multisession  = true;
   m_seekable = true;
   m_connecttimeout = 0;
+  m_totaltimeout = 0;
   m_redirectlimit = 5;
   m_lowspeedtime = 0;
   m_ftppasvip = false;
   m_bufferSize = 32768;
   m_postdataset = false;
-  m_state = new CReadState();
-  m_oldState = NULL;
   m_skipshout = false;
   m_httpresponse = -1;
   m_acceptCharset = "UTF-8,*;q=0.8"; /* prefer UTF-8 if available */
@@ -487,6 +618,21 @@ void CCurlFile::SetCommonOptions(CReadState* state, bool failOnError /* = true *
   g_curlInterface.easy_reset(h);
 
   g_curlInterface.easy_setopt(h, CURLOPT_DEBUGFUNCTION, debug_callback);
+  g_curlInterface.easy_setopt(h, CURLOPT_DEBUGDATA, state);
+  state->m_debugHeaderInSensitive = false;
+  state->m_debugHeaderOutSensitive = false;
+
+  state->m_abortAfterData = false;
+  state->m_bFirstLoop = true;
+  state->m_bLastError = false;
+#if LIBCURL_VERSION_NUM >= 0x072000
+  g_curlInterface.easy_setopt(h, CURLOPT_XFERINFOFUNCTION, transfer_progress_callback);
+  g_curlInterface.easy_setopt(h, CURLOPT_XFERINFODATA, state);
+#else
+  g_curlInterface.easy_setopt(h, CURLOPT_PROGRESSFUNCTION, transfer_progress_callback_legacy);
+  g_curlInterface.easy_setopt(h, CURLOPT_PROGRESSDATA, state);
+#endif
+  g_curlInterface.easy_setopt(h, CURLOPT_NOPROGRESS, CURL_OFF);
 
   if( CServiceBroker::GetSettingsComponent()->GetAdvancedSettings()->m_logLevel >= LOG_LEVEL_DEBUG )
     g_curlInterface.easy_setopt(h, CURLOPT_VERBOSE, CURL_ON);
@@ -545,8 +691,8 @@ void CCurlFile::SetCommonOptions(CReadState* state, bool failOnError /* = true *
   if (!m_verifyPeer)
     g_curlInterface.easy_setopt(h, CURLOPT_SSL_VERIFYPEER, 0);
 
-  g_curlInterface.easy_setopt(m_state->m_easyHandle, CURLOPT_URL, m_url.c_str());
-  g_curlInterface.easy_setopt(m_state->m_easyHandle, CURLOPT_TRANSFERTEXT, CURL_OFF);
+  g_curlInterface.easy_setopt(h, CURLOPT_URL, m_url.c_str());
+  g_curlInterface.easy_setopt(h, CURLOPT_TRANSFERTEXT, CURL_OFF);
 
   // setup POST data if it is set (and it may be empty)
   if (m_postdataset)
@@ -665,6 +811,8 @@ void CCurlFile::SetCommonOptions(CReadState* state, bool failOnError /* = true *
 
   // set our timeouts, we abort connection after m_timeout, and reads after no data for m_timeout seconds
   g_curlInterface.easy_setopt(h, CURLOPT_CONNECTTIMEOUT, m_connecttimeout);
+  if (m_totaltimeout > 0)
+    g_curlInterface.easy_setopt(h, CURLOPT_TIMEOUT, m_totaltimeout);
 
   // We abort in case we transfer less than 1byte/second
   g_curlInterface.easy_setopt(h, CURLOPT_LOW_SPEED_LIMIT, 1);
@@ -721,13 +869,20 @@ void CCurlFile::SetRequestHeaders(CReadState* state)
 
   for (const auto& it : m_requestheaders)
   {
-    std::string buffer = it.first + ": " + it.second;
+    const bool suppressRange = it.second.empty() && EqualsNoCaseAscii(it.first, "range");
+    std::string buffer = it.first + (suppressRange ? ":" : ": " + it.second);
     state->m_curlHeaderList = g_curlInterface.slist_append(state->m_curlHeaderList, buffer.c_str());
   }
 
   // add user defined headers
   if (state->m_easyHandle)
     g_curlInterface.easy_setopt(state->m_easyHandle, CURLOPT_HTTPHEADER, state->m_curlHeaderList);
+}
+
+bool CCurlFile::UseAutomaticRange() const
+{
+  return std::none_of(m_requestheaders.begin(), m_requestheaders.end(),
+                      [](const auto& header) { return EqualsNoCaseAscii(header.first, "range"); });
 }
 
 void CCurlFile::SetCorrectHeaders(CReadState* state)
@@ -796,7 +951,7 @@ void CCurlFile::ParseAndCorrectUrl(CURL &url2)
                 "CCurlFile::{} - <{}> FTP url option is deprecated, please switch to use protocol "
                 "option (change "
                 "'?' to '|')",
-                __FUNCTION__, url2.GetRedacted());
+                __FUNCTION__, GetRedactedUrl(url2));
       url2.SetProtocolOptions(url2.GetOptions().substr(1));
       /* ftp has no options */
       url2.SetOptions("");
@@ -871,7 +1026,7 @@ void CCurlFile::ParseAndCorrectUrl(CURL &url2)
       m_proxyport = s->GetInt(CSettings::SETTING_NETWORK_HTTPPROXYPORT);
       m_proxyuser = s->GetString(CSettings::SETTING_NETWORK_HTTPPROXYUSERNAME);
       m_proxypassword = s->GetString(CSettings::SETTING_NETWORK_HTTPPROXYPASSWORD);
-      CLog::LogFC(LOGDEBUG, LOGCURL, "<{}> Using proxy {}, type {}", url2.GetRedacted(),
+      CLog::LogFC(LOGDEBUG, LOGCURL, "<{}> Using proxy {}, type {}", GetRedactedUrl(url2),
                   m_proxyhost, proxyType2CUrlProxyType.at(m_proxytype));
     }
 
@@ -944,17 +1099,17 @@ void CCurlFile::ParseAndCorrectUrl(CURL &url2)
           {
             SetRequestHeader(it.first.substr(1), value);
             CLog::LogFC(LOGDEBUG, LOGCURL, "<{}> Adding custom header option '{}: ***********'",
-                        url2.GetRedacted(), it.first.substr(1));
+                        GetRedactedUrl(url2), it.first.substr(1));
           }
           else
           {
             SetRequestHeader(it.first, value);
-            if (name == "authorization")
+            if (IsSensitiveHeaderName(name))
               CLog::LogFC(LOGDEBUG, LOGCURL, "<{}> Adding custom header option '{}: ***********'",
-                          url2.GetRedacted(), it.first);
+                          GetRedactedUrl(url2), it.first);
             else
               CLog::LogFC(LOGDEBUG, LOGCURL, "<{}> Adding custom header option '{}: {}'",
-                          url2.GetRedacted(), it.first, value);
+                          GetRedactedUrl(url2), it.first, value);
           }
         }
       }
@@ -1009,15 +1164,14 @@ bool CCurlFile::ReadData(std::string& strHTML)
     buffer[size_read] = 0;
     strHTML.append(buffer, size_read);
   }
-  if (m_state->m_cancelled)
+  if (m_state->IsCancelled())
     return false;
   return true;
 }
 
 bool CCurlFile::Download(const std::string& strURL, const std::string& strFileName, unsigned int* pdwSize)
 {
-  CLog::Log(LOGINFO, "CCurlFile::{} - {}->{}", __FUNCTION__, CURL::GetRedacted(strURL),
-            strFileName);
+  CLog::Log(LOGINFO, "CCurlFile::{} - {}->{}", __FUNCTION__, GetRedactedUrl(strURL), strFileName);
 
   std::string strData;
   if (!Get(strURL, strData))
@@ -1027,7 +1181,7 @@ bool CCurlFile::Download(const std::string& strURL, const std::string& strFileNa
   if (!file.OpenForWrite(strFileName, true))
   {
     CLog::Log(LOGERROR, "CCurlFile::{} - <{}> Unable to open file for write: {} ({})", __FUNCTION__,
-              CURL::GetRedacted(strURL), strFileName, GetLastError());
+              GetRedactedUrl(strURL), strFileName, GetLastError());
     return false;
   }
   ssize_t written = 0;
@@ -1059,14 +1213,12 @@ bool CCurlFile::IsInternet()
 
 void CCurlFile::Cancel()
 {
-  m_state->m_cancelled = true;
-  while (m_opened)
-    KODI::TIME::Sleep(1ms);
+  m_cancellationState->store(true, std::memory_order_release);
 }
 
 void CCurlFile::Reset()
 {
-  m_state->m_cancelled = false;
+  m_cancellationState->store(false, std::memory_order_release);
 }
 
 void CCurlFile::SetProxy(const std::string &type, const std::string &host,
@@ -1087,7 +1239,7 @@ void CCurlFile::SetProxy(const std::string &type, const std::string &host,
     m_proxytype = CCurlFile::ProxyType::SOCKS5_REMOTE;
   else
     CLog::Log(LOGERROR, "CCurFile::{} - <{}> Invalid proxy type \"{}\"", __FUNCTION__,
-              CURL::GetRedacted(m_url), type);
+              GetRedactedUrl(m_url), type);
   m_proxyhost = host;
   m_proxyport = port;
   m_proxyuser = user;
@@ -1096,13 +1248,15 @@ void CCurlFile::SetProxy(const std::string &type, const std::string &host,
 
 bool CCurlFile::Open(const CURL& url)
 {
-  m_opened = true;
+  if (m_opened || m_state->IsCancelled())
+    return false;
+
   m_seekable = true;
 
   CURL url2(url);
   ParseAndCorrectUrl(url2);
 
-  std::string redactPath = CURL::GetRedacted(m_url);
+  std::string redactPath = GetRedactedUrl(m_url);
   CLog::Log(LOGDEBUG, "CurlFile::{} - <{}>", __FUNCTION__, redactPath);
 
   assert(!(!m_state->m_easyHandle ^ !m_state->m_multiHandle));
@@ -1116,10 +1270,16 @@ bool CCurlFile::Open(const CURL& url)
   SetCommonOptions(m_state,
                    m_failOnError && !CServiceBroker::GetLogging().CanLogComponent(LOGCURL));
   SetRequestHeaders(m_state);
-  m_state->m_sendRange = m_seekable;
+  m_state->m_sendRange = m_seekable && UseAutomaticRange();
   m_state->m_bRetry = m_allowRetry;
 
   m_httpresponse = m_state->Connect(m_bufferSize);
+
+  if (m_state->IsCancelled())
+  {
+    Close();
+    return false;
+  }
 
   long hte = 0;
 
@@ -1131,16 +1291,10 @@ bool CCurlFile::Open(const CURL& url)
 
   if (m_httpresponse <= hte || (m_failOnError && m_httpresponse >= 400))
   {
-    std::string error;
-    if (m_httpresponse >= 400 && CServiceBroker::GetLogging().CanLogComponent(LOGCURL))
-    {
-      error.resize(4096);
-      ReadLine(error.data(), 4095);
-    }
+    CLog::Log(LOGERROR, "CCurlFile::{} - <{}> Failed with code {}", __FUNCTION__, redactPath,
+              m_httpresponse);
 
-    CLog::Log(LOGERROR, "CCurlFile::{} - <{}> Failed with code {}:\n{}", __FUNCTION__,
-              redactPath, m_httpresponse, error);
-
+    Close();
     return false;
   }
 
@@ -1197,28 +1351,31 @@ bool CCurlFile::Open(const CURL& url)
   {
     if (m_url != efurl)
     {
-      std::string redactEfpath = CURL::GetRedacted(efurl);
+      std::string redactEfpath = GetRedactedUrl(efurl);
       CLog::Log(LOGDEBUG, "CCurlFile::{} - <{}> Effective URL is {}", __FUNCTION__, redactPath,
                 redactEfpath);
     }
     m_url = efurl;
   }
 
+  m_opened = true;
   return true;
 }
 
 bool CCurlFile::OpenForWrite(const CURL& url, bool bOverWrite)
 {
-  if(m_opened)
+  if (m_opened || m_state->IsCancelled())
     return false;
 
   if (Exists(url) && !bOverWrite)
+    return false;
+  if (m_state->IsCancelled())
     return false;
 
   CURL url2(url);
   ParseAndCorrectUrl(url2);
 
-  CLog::Log(LOGDEBUG, "CCurlFile::{} - Opening {}", __FUNCTION__, CURL::GetRedacted(m_url));
+  CLog::Log(LOGDEBUG, "CCurlFile::{} - Opening {}", __FUNCTION__, GetRedactedUrl(m_url));
 
   assert(m_state->m_easyHandle == NULL);
   g_curlInterface.easy_acquire(url2.GetProtocol().c_str(),
@@ -1252,7 +1409,7 @@ bool CCurlFile::OpenForWrite(const CURL& url, bool bOverWrite)
 
 ssize_t CCurlFile::Write(const void* lpBuf, size_t uiBufSize)
 {
-  if (!(m_opened && m_forWrite) || m_inError)
+  if (!(m_opened && m_forWrite) || m_inError || m_state->IsCancelled())
     return -1;
 
   assert(m_state->m_multiHandle);
@@ -1266,6 +1423,12 @@ ssize_t CCurlFile::Write(const void* lpBuf, size_t uiBufSize)
   m_stillRunning = 1;
   while (m_stillRunning && !m_state->m_isPaused)
   {
+    if (m_state->IsCancelled())
+    {
+      m_inError = true;
+      return -1;
+    }
+
     while ((result = g_curlInterface.multi_perform(m_state->m_multiHandle, &m_stillRunning)) == CURLM_CALL_MULTI_PERFORM);
 
     if (!m_stillRunning)
@@ -1276,10 +1439,36 @@ ssize_t CCurlFile::Write(const void* lpBuf, size_t uiBufSize)
       long code;
       if(g_curlInterface.easy_getinfo(m_state->m_easyHandle, CURLINFO_RESPONSE_CODE, &code) == CURLE_OK )
         CLog::Log(LOGERROR, "CCurlFile::{} - <{}> Unable to write curl resource with code {}",
-                  __FUNCTION__, CURL::GetRedacted(m_url), code);
+                  __FUNCTION__, GetRedactedUrl(m_url), code);
       m_inError = true;
       return -1;
     }
+
+    if (!m_state->m_isPaused && !m_state->WaitForActivity())
+    {
+      m_inError = true;
+      return -1;
+    }
+  }
+
+  if (m_state->IsCancelled())
+  {
+    m_inError = true;
+    return -1;
+  }
+
+  int messages = 0;
+  while (CURLMsg* message = g_curlInterface.multi_info_read(m_state->m_multiHandle, &messages))
+  {
+    if (message->msg != CURLMSG_DONE || message->data.result == CURLE_OK)
+      continue;
+
+    if (message->data.result != CURLE_ABORTED_BY_CALLBACK)
+      CLog::Log(LOGERROR, "CCurlFile::{} - <{}> Upload failed: {}({})", __FUNCTION__,
+                GetRedactedUrl(m_url), g_curlInterface.easy_strerror(message->data.result),
+                message->data.result);
+    m_inError = true;
+    return -1;
   }
 
   m_writeOffset += m_state->m_filePos;
@@ -1340,11 +1529,14 @@ bool CCurlFile::ReOpen(const CURL& url)
 
 bool CCurlFile::Exists(const CURL& url)
 {
+  if (m_state->IsCancelled())
+    return false;
+
   // if file is already running, get info from it
   if( m_opened )
   {
     CLog::Log(LOGWARNING, "CCurlFile::{} - <{}> Exist called on open file", __FUNCTION__,
-              url.GetRedacted());
+              GetRedactedUrl(url));
     return true;
   }
 
@@ -1374,6 +1566,12 @@ bool CCurlFile::Exists(const CURL& url)
 
   CURLcode result = g_curlInterface.easy_perform(m_state->m_easyHandle);
 
+  if (m_state->IsCancelled())
+  {
+    g_curlInterface.easy_release(&m_state->m_easyHandle, NULL);
+    return false;
+  }
+
   if (result == CURLE_WRITE_ERROR || result == CURLE_OK)
   {
     g_curlInterface.easy_release(&m_state->m_easyHandle, NULL);
@@ -1385,21 +1583,26 @@ bool CCurlFile::Exists(const CURL& url)
     long code;
     if(g_curlInterface.easy_getinfo(m_state->m_easyHandle, CURLINFO_RESPONSE_CODE, &code) == CURLE_OK && code != 404 )
     {
-      if (code == 405)
+      if (code == 405 && m_allowRetry)
       {
         // If we get a Method Not Allowed response, retry with a GET Request
         g_curlInterface.easy_setopt(m_state->m_easyHandle, CURLOPT_NOBODY, 0);
 
         g_curlInterface.easy_setopt(m_state->m_easyHandle, CURLOPT_FILETIME, 1);
-        g_curlInterface.easy_setopt(m_state->m_easyHandle, CURLOPT_XFERINFOFUNCTION, transfer_abort_callback);
-        g_curlInterface.easy_setopt(m_state->m_easyHandle, CURLOPT_NOPROGRESS, 0);
+        m_state->m_abortAfterData = true;
 
         curl_slist *list = NULL;
         list = g_curlInterface.slist_append(list, "Range: bytes=0-1"); /* try to only request 1 byte */
         g_curlInterface.easy_setopt(m_state->m_easyHandle, CURLOPT_HTTPHEADER, list);
 
-        CURLcode result = g_curlInterface.easy_perform(m_state->m_easyHandle);
+        result = g_curlInterface.easy_perform(m_state->m_easyHandle);
         g_curlInterface.slist_free_all(list);
+
+        if (m_state->IsCancelled())
+        {
+          g_curlInterface.easy_release(&m_state->m_easyHandle, NULL);
+          return false;
+        }
 
         if (result == CURLE_WRITE_ERROR || result == CURLE_OK)
         {
@@ -1411,17 +1614,18 @@ bool CCurlFile::Exists(const CURL& url)
         {
           if (g_curlInterface.easy_getinfo(m_state->m_easyHandle, CURLINFO_RESPONSE_CODE, &code) == CURLE_OK && code != 404 )
             CLog::Log(LOGERROR, "CCurlFile::{} - <{}> Failed: HTTP returned error {}", __FUNCTION__,
-                      url.GetRedacted(), code);
+                      GetRedactedUrl(url), code);
         }
       }
       else
         CLog::Log(LOGERROR, "CCurlFile::{} - <{}> Failed: HTTP returned error {}", __FUNCTION__,
-                  url.GetRedacted(), code);
+                  GetRedactedUrl(url), code);
     }
   }
-  else if (result != CURLE_REMOTE_FILE_NOT_FOUND && result != CURLE_FTP_COULDNT_RETR_FILE)
+  else if (result != CURLE_ABORTED_BY_CALLBACK && result != CURLE_REMOTE_FILE_NOT_FOUND &&
+           result != CURLE_FTP_COULDNT_RETR_FILE)
   {
-    CLog::Log(LOGERROR, "CCurlFile::{} - <{}> Failed: {}({})", __FUNCTION__, url.GetRedacted(),
+    CLog::Log(LOGERROR, "CCurlFile::{} - <{}> Failed: {}({})", __FUNCTION__, GetRedactedUrl(url),
               g_curlInterface.easy_strerror(result), result);
   }
 
@@ -1432,6 +1636,9 @@ bool CCurlFile::Exists(const CURL& url)
 
 int64_t CCurlFile::Seek(int64_t iFilePosition, int iWhence)
 {
+  if (m_state->IsCancelled())
+    return -1;
+
   int64_t nextPos = m_state->m_filePos;
 
   if(!m_seekable)
@@ -1467,7 +1674,7 @@ int64_t CCurlFile::Seek(int64_t iFilePosition, int iWhence)
     {
       CURL url(m_url);
       m_oldState          = m_state;
-      m_state             = new CReadState();
+      m_state = new CReadState(m_cancellationState);
       m_state->m_fileSize = m_oldState->m_fileSize;
       g_curlInterface.easy_acquire(url.GetProtocol().c_str(),
                                   url.GetHostName().c_str(),
@@ -1498,13 +1705,16 @@ int64_t CCurlFile::Seek(int64_t iFilePosition, int iWhence)
   SetRequestHeaders(m_state);
 
   m_state->m_filePos = nextPos;
-  m_state->m_sendRange = true;
+  m_state->m_sendRange = UseAutomaticRange();
   m_state->m_bRetry = m_allowRetry;
 
   long response = m_state->Connect(m_bufferSize);
+  if (m_state->IsCancelled())
+    return -1;
+
   if(response < 0 && (m_state->m_fileSize == 0 || m_state->m_fileSize != m_state->m_filePos))
   {
-    if(m_multisession)
+    if (m_multisession && m_allowRetry && !m_state->IsCancelled())
     {
       if (m_oldState)
       {
@@ -1542,11 +1752,14 @@ int64_t CCurlFile::GetPosition()
 
 int CCurlFile::Stat(const CURL& url, struct __stat64* buffer)
 {
+  if (m_state->IsCancelled())
+    return -1;
+
   // if file is already running, get info from it
   if( m_opened )
   {
     CLog::Log(LOGWARNING, "CCurlFile::{} - <{}> Stat called on open file", __FUNCTION__,
-              url.GetRedacted());
+              GetRedactedUrl(url));
     if (buffer)
     {
       *buffer = {};
@@ -1581,6 +1794,12 @@ int CCurlFile::Stat(const CURL& url, struct __stat64* buffer)
 
   CURLcode result = g_curlInterface.easy_perform(m_state->m_easyHandle);
 
+  if (m_state->IsCancelled())
+  {
+    g_curlInterface.easy_release(&m_state->m_easyHandle, NULL);
+    return -1;
+  }
+
   if(result == CURLE_HTTP_RETURNED_ERROR)
   {
     long code;
@@ -1592,9 +1811,8 @@ int CCurlFile::Stat(const CURL& url, struct __stat64* buffer)
     }
   }
 
-  if(result == CURLE_GOT_NOTHING
-  || result == CURLE_HTTP_RETURNED_ERROR
-  || result == CURLE_RECV_ERROR /* some silly shoutcast servers */ )
+  if (m_allowRetry && (result == CURLE_GOT_NOTHING || result == CURLE_HTTP_RETURNED_ERROR ||
+                       result == CURLE_RECV_ERROR /* some silly shoutcast servers */))
   {
     /* some http servers and shoutcast servers don't give us any data on a head request */
     /* request normal and just bail out via progress meter callback after we received data */
@@ -1603,22 +1821,22 @@ int CCurlFile::Stat(const CURL& url, struct __stat64* buffer)
     SetRequestHeaders(m_state);
     g_curlInterface.easy_setopt(m_state->m_easyHandle, CURLOPT_TIMEOUT, CServiceBroker::GetSettingsComponent()->GetAdvancedSettings()->m_curlconnecttimeout);
     g_curlInterface.easy_setopt(m_state->m_easyHandle, CURLOPT_FILETIME, 1);
-#if LIBCURL_VERSION_NUM >= 0x072000 // 0.7.32
-    g_curlInterface.easy_setopt(m_state->m_easyHandle, CURLOPT_XFERINFOFUNCTION, transfer_abort_callback);
-#else
-    g_curlInterface.easy_setopt(m_state->m_easyHandle, CURLOPT_PROGRESSFUNCTION, transfer_abort_callback);
-#endif
-    g_curlInterface.easy_setopt(m_state->m_easyHandle, CURLOPT_NOPROGRESS, 0);
+    m_state->m_abortAfterData = true;
 
     result = g_curlInterface.easy_perform(m_state->m_easyHandle);
 
+    if (m_state->IsCancelled())
+    {
+      g_curlInterface.easy_release(&m_state->m_easyHandle, NULL);
+      return -1;
+    }
   }
 
   if( result != CURLE_ABORTED_BY_CALLBACK && result != CURLE_OK )
   {
     g_curlInterface.easy_release(&m_state->m_easyHandle, NULL);
     errno = ENOENT;
-    CLog::Log(LOGERROR, "CCurlFile::{} - <{}> Failed: {}({})", __FUNCTION__, url.GetRedacted(),
+    CLog::Log(LOGERROR, "CCurlFile::{} - <{}> Failed: {}({})", __FUNCTION__, GetRedactedUrl(url),
               g_curlInterface.easy_strerror(result), result);
     return -1;
   }
@@ -1637,7 +1855,7 @@ int CCurlFile::Stat(const CURL& url, struct __stat64* buffer)
     {
       g_curlInterface.easy_release(&m_state->m_easyHandle, NULL);
       CLog::Log(LOGINFO, "CCurlFile::{} - <{}> Content length failed: {}({})", __FUNCTION__,
-                url.GetRedacted(), g_curlInterface.easy_strerror(result), result);
+                GetRedactedUrl(url), g_curlInterface.easy_strerror(result), result);
       errno = ENOENT;
       return -1;
     }
@@ -1669,7 +1887,7 @@ int CCurlFile::Stat(const CURL& url, struct __stat64* buffer)
     if (result != CURLE_OK)
     {
       CLog::Log(LOGINFO, "CCurlFile::{} - <{}> Filetime failed: {}({})", __FUNCTION__,
-                url.GetRedacted(), g_curlInterface.easy_strerror(result), result);
+                GetRedactedUrl(url), g_curlInterface.easy_strerror(result), result);
     }
     else
     {
@@ -1717,19 +1935,77 @@ ssize_t CCurlFile::CReadState::Read(void* lpBuf, size_t uiBufSize)
   return 0;
 }
 
+bool CCurlFile::CReadState::WaitForActivity()
+{
+  if (IsCancelled())
+    return true;
+
+  fd_set fdread;
+  fd_set fdwrite;
+  fd_set fdexcep;
+  FD_ZERO(&fdread);
+  FD_ZERO(&fdwrite);
+  FD_ZERO(&fdexcep);
+
+  int maxfd = -1;
+  if (g_curlInterface.multi_fdset(m_multiHandle, &fdread, &fdwrite, &fdexcep, &maxfd) != CURLM_OK)
+    return false;
+
+  constexpr long MAX_CANCEL_LATENCY_MS = 50;
+  long timeout = MAX_CANCEL_LATENCY_MS;
+  long curlTimeout = -1;
+  if (g_curlInterface.multi_timeout(m_multiHandle, &curlTimeout) == CURLM_OK && curlTimeout >= 0)
+    timeout = std::min(curlTimeout, MAX_CANCEL_LATENCY_MS);
+
+  if (timeout <= 0)
+    return true;
+
+  int result = 0;
+  if (maxfd == -1)
+  {
+#ifdef TARGET_WINDOWS
+    KODI::TIME::Sleep(std::chrono::milliseconds(timeout));
+#else
+    struct timeval wait = {static_cast<int>(timeout / 1000),
+                           static_cast<int>((timeout % 1000) * 1000)};
+    result = select(0, NULL, NULL, NULL, &wait);
+#endif
+  }
+  else
+  {
+    struct timeval wait = {static_cast<int>(timeout / 1000),
+                           static_cast<int>((timeout % 1000) * 1000)};
+    result = select(maxfd + 1, &fdread, &fdwrite, &fdexcep, &wait);
+  }
+
+  if (result != SOCKET_ERROR)
+    return true;
+
+#ifdef TARGET_WINDOWS
+  if (WSAGetLastError() == WSAEINTR)
+    return true;
+  char error[256];
+  strerror_s(error, sizeof(error), WSAGetLastError());
+#else
+  if (errno == EINTR)
+    return true;
+  const char* error = strerror(errno);
+#endif
+  CLog::Log(LOGERROR, "CCurlFile::CReadState::{} - ({}) Failed with socket error: {}", __FUNCTION__,
+            fmt::ptr(this), error);
+  return false;
+}
+
 /* use to attempt to fill the read buffer up to requested number of bytes */
 int8_t CCurlFile::CReadState::FillBuffer(unsigned int want)
 {
   int retry = 0;
-  fd_set fdread;
-  fd_set fdwrite;
-  fd_set fdexcep;
 
   // only attempt to fill buffer if transactions still running and buffer
   // doesn't exceed required size already
   while (m_buffer.getMaxReadSize() < want && m_buffer.getMaxWriteSize() > 0 )
   {
-    if (m_cancelled)
+    if (IsCancelled())
       return FILLBUFFER_NO_DATA;
 
     /* if there is data in overflow buffer, try to use that first */
@@ -1748,6 +2024,9 @@ int8_t CCurlFile::CReadState::FillBuffer(unsigned int want)
     }
 
     CURLMcode result = g_curlInterface.multi_perform(m_multiHandle, &m_stillRunning);
+    if (IsCancelled())
+      return FILLBUFFER_NO_DATA;
+
     if (!m_stillRunning)
     {
       if (result == CURLM_OK)
@@ -1767,6 +2046,9 @@ int8_t CCurlFile::CReadState::FillBuffer(unsigned int want)
           {
             if (msg->data.result == CURLE_OK)
               return FILLBUFFER_OK;
+
+            if (msg->data.result == CURLE_ABORTED_BY_CALLBACK && IsCancelled())
+              return FILLBUFFER_NO_DATA;
 
             long httpCode = 0;
             if (msg->data.result == CURLE_HTTP_RETURNED_ERROR)
@@ -1832,7 +2114,9 @@ int8_t CCurlFile::CReadState::FillBuffer(unsigned int want)
         m_bLastError = true; // Flag error for the next run
 
         // Retry immediately or leave it up to the caller?
-        if ((m_bRetry && retry < CServiceBroker::GetSettingsComponent()->GetAdvancedSettings()->m_curlretries) || (bRetryNow && retry == 0))
+        if (m_bRetry &&
+            (retry < CServiceBroker::GetSettingsComponent()->GetAdvancedSettings()->m_curlretries ||
+             (bRetryNow && retry == 0)))
         {
           retry++;
 
@@ -1863,71 +2147,8 @@ int8_t CCurlFile::CReadState::FillBuffer(unsigned int want)
     {
       case CURLM_OK:
       {
-        int maxfd = -1;
-        FD_ZERO(&fdread);
-        FD_ZERO(&fdwrite);
-        FD_ZERO(&fdexcep);
-
-        // get file descriptors from the transfers
-        g_curlInterface.multi_fdset(m_multiHandle, &fdread, &fdwrite, &fdexcep, &maxfd);
-
-        long timeout = 0;
-        if (CURLM_OK != g_curlInterface.multi_timeout(m_multiHandle, &timeout) || timeout == -1 || timeout < 200)
-          timeout = 200;
-
-        XbmcThreads::EndTime<> endTime{std::chrono::milliseconds(timeout)};
-        int rc;
-
-        do
-        {
-          /* On success the value of maxfd is guaranteed to be >= -1. We call
-           * select(maxfd + 1, ...); specially in case of (maxfd == -1) there are
-           * no fds ready yet so we call select(0, ...) --or Sleep() on Windows--
-           * to sleep 100ms, which is the minimum suggested value in the
-           * curl_multi_fdset() doc.
-           */
-          if (maxfd == -1)
-          {
-#ifdef TARGET_WINDOWS
-            /* Windows does not support using select() for sleeping without a dummy
-             * socket. Instead use Windows' Sleep() and sleep for 100ms which is the
-             * minimum suggested value in the curl_multi_fdset() doc.
-             */
-            KODI::TIME::Sleep(100ms);
-            rc = 0;
-#else
-            /* Portable sleep for platforms other than Windows. */
-            struct timeval wait = { 0, 100 * 1000 }; /* 100ms */
-            rc = select(0, NULL, NULL, NULL, &wait);
-#endif
-          }
-          else
-          {
-            unsigned int time_left = endTime.GetTimeLeft().count();
-            struct timeval wait = { (int)time_left / 1000, ((int)time_left % 1000) * 1000 };
-            rc = select(maxfd + 1, &fdread, &fdwrite, &fdexcep, &wait);
-          }
-#ifdef TARGET_WINDOWS
-        } while(rc == SOCKET_ERROR && WSAGetLastError() == WSAEINTR);
-#else
-        } while(rc == SOCKET_ERROR && errno == EINTR);
-#endif
-
-        if(rc == SOCKET_ERROR)
-        {
-#ifdef TARGET_WINDOWS
-          char buf[256];
-          strerror_s(buf, 256, WSAGetLastError());
-          CLog::Log(LOGERROR, "CCurlFile::CReadState::{} - ({}) Failed with socket error:{}",
-                    __FUNCTION__, fmt::ptr(this), buf);
-#else
-          char const * str = strerror(errno);
-          CLog::Log(LOGERROR, "CCurlFile::CReadState::{} - ({}) Failed with socket error:{}",
-                    __FUNCTION__, fmt::ptr(this), str);
-#endif
-
+        if (!WaitForActivity())
           return FILLBUFFER_FAIL;
-        }
       }
       break;
       case CURLM_CALL_MULTI_PERFORM:
@@ -1986,7 +2207,7 @@ std::string CCurlFile::GetInfoString(int infoType)
   {
     CLog::Log(LOGERROR,
               "CCurlFile::{} - <{}> Info string request for type {} failed with result code {}",
-              __FUNCTION__, CURL::GetRedacted(m_url), infoType, result);
+              __FUNCTION__, GetRedactedUrl(m_url), infoType, result);
     return "";
   }
   return (info ? info : "");
@@ -2008,7 +2229,7 @@ bool CCurlFile::GetHttpHeader(const CURL &url, CHttpHeader &headers)
   catch(...)
   {
     CLog::Log(LOGERROR, "CCurlFile::{} - <{}> Exception thrown while trying to retrieve header",
-              __FUNCTION__, url.GetRedacted());
+              __FUNCTION__, GetRedactedUrl(url));
     return false;
   }
 }
@@ -2020,7 +2241,7 @@ bool CCurlFile::GetMimeType(const CURL &url, std::string &content, const std::st
     file.SetUserAgent(useragent);
 
   struct __stat64 buffer;
-  std::string redactUrl = url.GetRedacted();
+  std::string redactUrl = GetRedactedUrl(url);
   if( file.Stat(url, &buffer) == 0 )
   {
     if (buffer.st_mode == _S_IFDIR)
@@ -2042,7 +2263,7 @@ bool CCurlFile::GetContentType(const CURL &url, std::string &content, const std:
     file.SetUserAgent(useragent);
 
   struct __stat64 buffer;
-  std::string redactUrl = url.GetRedacted();
+  std::string redactUrl = GetRedactedUrl(url);
   if (file.Stat(url, &buffer) == 0)
   {
     if (buffer.st_mode == _S_IFDIR)
@@ -2081,8 +2302,8 @@ bool CCurlFile::GetCookies(const CURL &url, std::string &cookies)
       // ensure the length is valid
       if (valuesVec.size() < 7)
       {
-        CLog::Log(LOGERROR, "CCurlFile::{} - <{}> Invalid cookie: '{}'", __FUNCTION__,
-                  url.GetRedacted(), curlCookieIter->data);
+        CLog::Log(LOGERROR, "CCurlFile::{} - <{}> Invalid cookie entry", __FUNCTION__,
+                  GetRedactedUrl(url));
         curlCookieIter = curlCookieIter->next;
         continue;
       }
@@ -2126,7 +2347,7 @@ int CCurlFile::IoControl(IOControl request, void* param)
 
   if (request == IOControl::SET_RETRY)
   {
-    m_allowRetry = *(bool*) param;
+    SetRetry(*static_cast<bool*>(param));
     return 0;
   }
 

@@ -66,6 +66,7 @@ CWinSystemAndroid::~CWinSystemAndroid()
 
 bool CWinSystemAndroid::InitWindowSystem()
 {
+  m_jumpgateBackLifecycleToken = CXBMCApp::Get().GetJumpgateBackLifecycleToken();
   m_nativeDisplay = EGL_DEFAULT_DISPLAY;
 
   m_android = new CAndroidUtils();
@@ -93,6 +94,8 @@ bool CWinSystemAndroid::InitWindowSystem()
 bool CWinSystemAndroid::DestroyWindowSystem()
 {
   CLog::Log(LOGINFO, "CWinSystemAndroid::{}", __FUNCTION__);
+  jni::CJNIMainActivity::GetJumpgateBackDispatcher().SetWindowReady(m_jumpgateBackLifecycleToken,
+                                                                    false);
 
   delete m_android;
   m_android = nullptr;
@@ -130,12 +133,16 @@ bool CWinSystemAndroid::CreateNewWindow(const std::string& name,
   m_android->SetNativeResolution(res);
 
   m_bWindowCreated = true;
+  jni::CJNIMainActivity::GetJumpgateBackDispatcher().SetWindowReady(m_jumpgateBackLifecycleToken,
+                                                                    true);
   return true;
 }
 
 bool CWinSystemAndroid::DestroyWindow()
 {
   CLog::Log(LOGINFO, "CWinSystemAndroid::{}", __FUNCTION__);
+  jni::CJNIMainActivity::GetJumpgateBackDispatcher().SetWindowReady(m_jumpgateBackLifecycleToken,
+                                                                    false);
   m_nativeWindow.reset();
   m_bWindowCreated = false;
   return true;

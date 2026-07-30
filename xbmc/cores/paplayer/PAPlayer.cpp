@@ -242,6 +242,7 @@ bool PAPlayer::OpenFile(const CFileItem& file, const CPlayerOptions &options)
   // OnPlayBackStarted to be made only once. Callback processing may be slower than player process
   // so clear signal flag first otherwise async stream processing could also make callback
   m_signalStarted = false;
+  SetCallbackFile(file);
   m_callback.OnPlayBackStarted(file);
 
   return true;
@@ -732,7 +733,10 @@ inline bool PAPlayer::ProcessStream(StreamInfo *si, double &freeBufferTime)
       si->m_stream->Resume();
     si->m_stream->FadeVolume(0.0f, 1.0f, m_upcomingCrossfadeMS);
     if (m_signalStarted)
+    {
+      SetCallbackFile(*si->m_fileItem);
       m_callback.OnPlayBackStarted(*si->m_fileItem);
+    }
     m_signalStarted = true;
     if (m_fullScreen)
     {
@@ -824,7 +828,10 @@ inline bool PAPlayer::ProcessStream(StreamInfo *si, double &freeBufferTime)
 
       UpdateGUIData(si);
       if (m_signalStarted)
+      {
+        SetCallbackFile(*si->m_fileItem);
         m_callback.OnPlayBackStarted(*si->m_fileItem);
+      }
       m_signalStarted = true;
       m_callback.OnAVStarted(*si->m_fileItem);
     }
@@ -914,11 +921,22 @@ bool PAPlayer::QueueData(StreamInfo *si)
 
 void PAPlayer::OnExit()
 {
+  const auto fileItem = GetCallbackFile();
   //@todo signal OnPlayBackError if there was an error on last stream
   if (m_isFinished && !m_bStop)
-    m_callback.OnPlayBackEnded();
+  {
+    if (fileItem)
+      m_callback.OnPlayBackEndedWithItem(*fileItem);
+    else
+      m_callback.OnPlayBackEnded();
+  }
   else
-    m_callback.OnPlayBackStopped();
+  {
+    if (fileItem)
+      m_callback.OnPlayBackStoppedWithItem(*fileItem);
+    else
+      m_callback.OnPlayBackStopped();
+  }
 }
 
 void PAPlayer::OnNothingToQueueNotify()
@@ -1176,7 +1194,22 @@ void PAPlayer::CloseFileCB(StreamInfo &si)
 void PAPlayer::AdvancePlaylistOnError(CFileItem &fileItem)
 {
   if (m_signalStarted)
+  {
+    SetCallbackFile(fileItem);
     m_callback.OnPlayBackStarted(fileItem);
+  }
   m_signalStarted = true;
   m_callback.OnAVStarted(fileItem);
+}
+
+void PAPlayer::SetCallbackFile(const CFileItem& fileItem)
+{
+  std::lock_guard<std::mutex> lock(m_callbackFileMutex);
+  m_callbackFileItem = std::make_unique<CFileItem>(fileItem);
+}
+
+std::unique_ptr<CFileItem> PAPlayer::GetCallbackFile() const
+{
+  std::lock_guard<std::mutex> lock(m_callbackFileMutex);
+  return m_callbackFileItem ? std::make_unique<CFileItem>(*m_callbackFileItem) : nullptr;
 }

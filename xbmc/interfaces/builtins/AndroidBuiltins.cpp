@@ -10,6 +10,7 @@
 
 #include "ServiceBroker.h"
 #include "messaging/ApplicationMessenger.h"
+#include "platform/android/activity/XBMCApp.h"
 
 /*! \brief Launch an android system activity.
  *  \param params The parameters.
@@ -28,6 +29,15 @@ static int LaunchAndroidActivity(const std::vector<std::string>& params)
   CServiceBroker::GetAppMessenger()->PostMsg(TMSG_START_ANDROID_ACTIVITY, -1, -1, nullptr, "",
                                              params);
 
+  return 0;
+}
+
+/*! \brief Open the native Jumpgate profile manager.
+ *  All profile mutations remain behind foreground native confirmation UI.
+ */
+static int OpenJumpgateManager(const std::vector<std::string>&)
+{
+  CXBMCApp::Get().ShowJumpgateProfileManager();
   return 0;
 }
 
@@ -66,8 +76,10 @@ static int LaunchAndroidActivity(const std::vector<std::string>& params)
 
 CBuiltins::CommandMap CAndroidBuiltins::GetOperations() const
 {
-  return {{"startandroidactivity",
-           {"Launch an Android native app with the given package name.  Optional parms (in order): "
-            "intent, dataType, dataURI, flags, extras, action, category, className.",
-            1, LaunchAndroidActivity}}};
+  return {
+      {"jumpgatemanager", {"Open the native Jumpgate profile manager", 0, OpenJumpgateManager}},
+      {"startandroidactivity",
+       {"Launch an Android native app with the given package name.  Optional parms (in order): "
+        "intent, dataType, dataURI, flags, extras, action, category, className.",
+        1, LaunchAndroidActivity}}};
 }
