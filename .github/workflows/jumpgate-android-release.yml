@@ -1975,6 +1975,55 @@ jobs:
               }
             }
 
+            function assertObservedReleaseAsset(asset, expected, assetId) {
+              if (
+                !asset
+                || asset.id !== assetId
+                || asset.name !== expected.name
+                || asset.size !== expected.size
+                || asset.content_type !== assetContentType
+                || !['open', 'uploaded'].includes(asset.state)
+                || (asset.digest != null && asset.digest !== expected.digest)
+              ) {
+                throw new Error('GitHub returned an unexpected finalized asset binding: ' + expected.name);
+              }
+            }
+
+            async function waitForFinalizedReleaseAsset(assetId, expected) {
+              const retryableStatuses = new Set([404, 409, 422, 500, 502, 503, 504]);
+              const attempts = 7;
+              for (let attempt = 0; attempt < attempts; attempt += 1) {
+                let asset;
+                try {
+                  const response = await github.rest.repos.getReleaseAsset({
+                    owner,
+                    repo,
+                    asset_id: assetId,
+                  });
+                  asset = response.data;
+                } catch (error) {
+                  if (attempt + 1 >= attempts || !retryableStatuses.has(error.status)) {
+                    throw new Error('Unable to verify uploaded release asset: ' + expected.name);
+                  }
+                  const delayMs = Math.min(250 * (2 ** attempt), 2000);
+                  await new Promise((resolve) => setTimeout(resolve, delayMs));
+                  continue;
+                }
+
+                assertObservedReleaseAsset(asset, expected, assetId);
+                if (asset.state === 'uploaded' && asset.digest === expected.digest) {
+                  return asset;
+                }
+                if (attempt + 1 < attempts) {
+                  const delayMs = Math.min(250 * (2 ** attempt), 2000);
+                  await new Promise((resolve) => setTimeout(resolve, delayMs));
+                }
+              }
+              throw new Error(
+                'Release asset did not finalize with an exact digest binding: ' + expected.name,
+              );
+            }
+
             async function assertFinalReleaseState(originalRelease, expectedAssets) {
               let observed;
               try {
@@ -2373,15 +2422,14 @@ jobs:
                     || uploaded.id <= 0
                     || uploadedAssetIds.has(uploaded.id)
                     || uploaded.name !== name
-                    || uploaded.size !== expected.size
-                    || uploaded.content_type !== assetContentType
-                    || uploaded.state !== 'uploaded'
+                    || !['open', 'uploaded'].includes(uploaded.state)
                     || (uploaded.digest != null && uploaded.digest !== expected.digest)
                   ) {
                     throw new Error('GitHub returned an unexpected immutable asset binding: ' + name);
                   }
-                  uploadedAssetIds.add(uploaded.id);
-                  expectedAssets.set(name, {...expected, id: uploaded.id});
+                  const finalized = await waitForFinalizedReleaseAsset(uploaded.id, expected);
+                  uploadedAssetIds.add(finalized.id);
+                  expectedAssets.set(name, {...expected, id: finalized.id});
                 }
               } catch (error) {
                 try {
