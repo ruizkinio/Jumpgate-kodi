@@ -1,8 +1,54 @@
 # Jumpgate
 
-> **Pre-release:** Jumpgate is a pre-release Android Kodi fork used as a source-aware external player for Stremio. Normal standalone Kodi behavior remains available. Release APKs must come only from coordinated [Jumpgate releases](https://github.com/ruizkinio/Jumpgate); current development builds are not public releases.
+Jumpgate is an Android Kodi fork built to be a source-aware external player for
+Stremio. It keeps Kodi's playback engine, settings, skins, local history, subtitle
+controls, and installed subtitle addons while a private Bridge carries the exact
+source context selected in Stremio.
 
-Jumpgate is an independent project and is not affiliated with or endorsed by Kodi, Stremio, or Trakt. The Kodi upstream README is retained below for attribution, licensing, project links, and build documentation.
+> **Pre-release:** the source-backed overhaul is still completing stable signing,
+> physical Android UAT, and coordinated release packaging. Development APKs are not
+> public releases.
+
+## What This Fork Adds
+
+- Android external-player lifecycle handling that returns a result to the correct
+  Stremio task without changing normal standalone Kodi navigation.
+- Paired, isolated profiles and source claims from the actual Stremio provider result,
+  without IP, filename, URL, artwork, or hash-based identity guessing.
+- Local resume/history for canonical and local-only playback, with optional Trakt sync
+  only when an exact canonical claim exists.
+- Private delivery of Stremio text, ASS/SSA, and integrity-checked VobSub subtitles
+  while preserving Kodi's subtitle picker, delay, styling, skins, and subtitle addons.
+- Jumpgate Manager for pairing and profile management, plus a source-aware loading
+  overlay and bounded metadata artwork cache.
+
+Jumpgate does not provide media, a catalog, a debrid service, or stream sources. It is
+designed to use the Stremio stream and subtitle addons selected by the user, subject to
+the provider returning a valid Stremio resource and a transport Kodi can play.
+
+## Install And Support
+
+Use only APKs attached to a coordinated
+[Jumpgate release](https://github.com/ruizkinio/Jumpgate/releases). Each release lists
+the APK SHA-256, package, ABI, signer fingerprint, Bridge version, and public UAT
+evidence. The package ID is `io.github.ruizkinio.jumpgate`, so a release build can
+coexist with official Kodi.
+
+Read the central [setup guide](https://github.com/ruizkinio/Jumpgate#setup),
+[support policy](https://github.com/ruizkinio/Jumpgate/blob/main/SUPPORT.md), and
+[device UAT protocol](https://github.com/ruizkinio/Jumpgate/blob/main/docs/UAT.md).
+Issues are centralized in the
+[Jumpgate repository](https://github.com/ruizkinio/Jumpgate/issues).
+
+Never post a configured addon URL, install link, management link, pairing code,
+profile/device token, provider URL, credential, or raw private log. These values can
+grant access even when they look encrypted or short-lived.
+
+## Upstream Kodi
+
+Jumpgate is independent and is not affiliated with or endorsed by Kodi, Stremio,
+Trakt, or TMDB. This fork remains GPL-2.0-or-later and preserves Kodi's notices,
+history, build documentation, and attribution. The original Kodi README follows.
 
 ---
 
