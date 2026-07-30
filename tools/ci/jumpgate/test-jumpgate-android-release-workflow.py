@@ -710,11 +710,13 @@ publish_script = str(publish_step.get("with", {}).get("script", ""))
 publish_text = "\n".join(value for _, value in strings(jobs["publish_draft_release"]))
 for required_create_only_token in (
     "getReleaseByTag",
+    "getReleaseAsset",
     "getRef",
     "createTag",
     "createRef",
     "createRelease",
     "uploadReleaseAsset",
+    "waitForFinalizedReleaseAsset",
     "draft: true",
     "prerelease: false",
     "refusing to overwrite",
@@ -821,6 +823,7 @@ require(
         "repos.createRelease",
         "repos.deleteRelease",
         "repos.get",
+        "repos.getReleaseAsset",
         "repos.getReleaseByTag",
         "repos.getRepoRuleset",
         "repos.getRepoRulesets",
@@ -927,7 +930,9 @@ const releaseRoot = process.argv[3];
 const scenarios = process.argv.slice(4);
 const script = fs.readFileSync(scriptPath, 'utf8');
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
-const execute = new AsyncFunction('github', 'context', 'core', 'require', 'process', script);
+const execute = new AsyncFunction(
+  'github', 'context', 'core', 'require', 'process', 'setTimeout', script,
+);
 
 const SOURCE = 'c'.repeat(40);
 const PRIOR_OBJECT = 'a'.repeat(40);
@@ -1036,6 +1041,7 @@ async function runScenario(scenario) {
     deleteRef: 0,
     deleteRelease: 0,
     getReleaseByTag: 0,
+    getReleaseAsset: 0,
     getRepoRuleset: 0,
     listMatchingRefs: 0,
     listReleases: 0,
@@ -1147,6 +1153,23 @@ async function runScenario(scenario) {
       if (release === null) throw apiError(404, 'release not found');
       return {data: clone(release)};
     },
+    async getReleaseAsset({asset_id: assetId}) {
+      calls.getReleaseAsset += 1;
+      if (scenario === 'asset_finalization_lookup_failure') {
+        throw apiError(502, 'simulated finalized-asset lookup failure');
+      }
+      if (release === null) throw apiError(404, 'release not found');
+      const asset = release.assets.find((candidate) => candidate.id === assetId);
+      if (!asset) throw apiError(404, 'asset not found');
+      const observed = clone(asset);
+      if (scenario === 'asset_finalization_never_completes') {
+        observed.state = 'open';
+        observed.digest = null;
+      } else if (scenario === 'asset_finalization_digest_mismatch') {
+        observed.digest = 'sha256:' + '0'.repeat(64);
+      }
+      return {data: observed};
+    },
     async getRepoRulesets(params) {
       calls.rulesets += 1;
       if (params.targets !== 'tag' || params.includes_parents !== true) {
@@ -1226,7 +1249,14 @@ async function runScenario(scenario) {
     },
     async uploadReleaseAsset(params) {
       calls.uploadReleaseAsset += 1;
-      if (scenario.startsWith('asset_')) {
+      if ([
+        'asset_delete_failure',
+        'asset_delete_ambiguous',
+        'asset_release_still_visible',
+        'asset_release_recreated',
+        'asset_recreated_same_target_tag',
+        'asset_cleanup_success_preserves_tag',
+      ].includes(scenario)) {
         throw apiError(502, 'simulated asset upload failure');
       }
       if (
@@ -1240,7 +1270,10 @@ async function runScenario(scenario) {
       }
       const uploaded = releaseAsset(1000 + calls.uploadReleaseAsset, params.name, params.data);
       release.assets.push(uploaded);
-      return {data: clone(uploaded)};
+      const accepted = clone(uploaded);
+      accepted.state = 'open';
+      accepted.digest = null;
+      return {data: accepted};
     },
     async deleteRelease() {
       calls.deleteRelease += 1;
@@ -1380,7 +1413,10 @@ async function runScenario(scenario) {
   let ok = false;
   let error = null;
   try {
-    await execute(github, context, core, require, process);
+    await execute(github, context, core, require, process, (callback) => {
+      callback();
+      return 0;
+    });
     ok = true;
   } catch (caught) {
     error = caught && caught.message ? caught.message : String(caught);
@@ -1475,6 +1511,9 @@ publication_scenarios = [
     "post_upload_asset_state_mutated",
     "post_upload_asset_extra",
     "post_upload_asset_missing",
+    "asset_finalization_digest_mismatch",
+    "asset_finalization_never_completes",
+    "asset_finalization_lookup_failure",
     "asset_delete_failure",
     "asset_delete_ambiguous",
     "asset_release_still_visible",
@@ -1491,6 +1530,8 @@ for stable_scenario in ("stable", "ambiguous_create_ref"):
             f"{stable_scenario} did not create one annotated tag and release")
     require(result["calls"]["uploadReleaseAsset"] == 7,
             f"{stable_scenario} did not upload the exact release payload")
+    require(result["calls"]["getReleaseAsset"] == 7,
+            f"{stable_scenario} did not finalize every accepted release asset")
     require(
         result["calls"]["repositoryMetadata"] == 3
         and result["calls"]["defaultHead"] == 3
@@ -1556,6 +1597,9 @@ expected_publication_failures = {
     "post_upload_asset_state_mutated": "Final release asset binding changed after upload",
     "post_upload_asset_extra": "Final release asset set changed after upload",
     "post_upload_asset_missing": "Final release asset set changed after upload",
+    "asset_finalization_digest_mismatch": "GitHub returned an unexpected finalized asset binding",
+    "asset_finalization_never_completes": "Release asset did not finalize with an exact digest binding",
+    "asset_finalization_lookup_failure": "Unable to verify uploaded release asset",
     "asset_delete_failure": "simulated asset upload failure",
     "asset_delete_ambiguous": "simulated asset upload failure",
     "asset_release_still_visible": "simulated asset upload failure",
@@ -1568,6 +1612,22 @@ for scenario, error_fragment in expected_publication_failures.items():
     require(not result["ok"], f"adversarial publication scenario unexpectedly passed: {scenario}")
     require(error_fragment in (result["error"] or ""),
             f"{scenario} failed outside its sealed guard: {result['error']}")
+
+asset_finalization_failures = {
+    "asset_finalization_digest_mismatch": 1,
+    "asset_finalization_never_completes": 7,
+    "asset_finalization_lookup_failure": 7,
+}
+for scenario, expected_reads in asset_finalization_failures.items():
+    result = publication_results[scenario]
+    require(result["calls"]["uploadReleaseAsset"] == 1,
+            f"{scenario} continued uploading after the first unverified asset")
+    require(result["calls"]["getReleaseAsset"] == expected_reads,
+            f"{scenario} did not enforce its bounded finalization reads")
+    require(result["calls"]["deleteRelease"] == 1 and not result["releaseExists"],
+            f"{scenario} did not confirm cleanup of its incomplete draft")
+    require(result["tagObjectSha"] == "d" * 40,
+            f"{scenario} removed or replaced the owned annotated tag")
 
 for scenario, result in publication_results.items():
     require(result["calls"]["deleteRef"] == 0,
@@ -1603,6 +1663,9 @@ manual_reconciliation_reasons = {
     "post_upload_asset_state_mutated": "post-upload-revalidation",
     "post_upload_asset_extra": "post-upload-revalidation",
     "post_upload_asset_missing": "post-upload-revalidation",
+    "asset_finalization_digest_mismatch": "release-asset-or-cleanup-failure",
+    "asset_finalization_never_completes": "release-asset-or-cleanup-failure",
+    "asset_finalization_lookup_failure": "release-asset-or-cleanup-failure",
     "asset_delete_failure": "release-asset-or-cleanup-failure",
     "asset_delete_ambiguous": "release-asset-or-cleanup-failure",
     "asset_release_still_visible": "release-asset-or-cleanup-failure",
