@@ -1878,12 +1878,39 @@ jobs:
                 .digest('hex');
             }
 
+            const retryableReadStatuses = new Set([404, 409, 422, 500, 502, 503, 504]);
+
+            async function retryGitHubRead(label, operation, retryNotFound = false) {
+              const attempts = 7;
+              for (let attempt = 0; attempt < attempts; attempt += 1) {
+                try {
+                  return await operation();
+                } catch (error) {
+                  const retryable = retryableReadStatuses.has(error.status)
+                    && (error.status !== 404 || retryNotFound);
+                  if (attempt + 1 >= attempts || !retryable) {
+                    throw new Error(label);
+                  }
+                  const delayMs = Math.min(250 * (2 ** attempt), 2000);
+                  await new Promise((resolve) => setTimeout(resolve, delayMs));
+                }
+              }
+              throw new Error(label);
+            }
+
+            async function listAllReleases() {
+              return await retryGitHubRead(
+                'Unable to enumerate the complete GitHub release inventory',
+                async () => await github.paginate(github.rest.repos.listReleases, {
+                  owner,
+                  repo,
+                  per_page: 100,
+                }),
+              );
+            }
+
             async function loadCanonicalHistory() {
-              const releases = await github.paginate(github.rest.repos.listReleases, {
-                owner,
-                repo,
-                per_page: 100,
-              });
+              const releases = await listAllReleases();
               const refs = await github.paginate(github.rest.git.listMatchingRefs, {
                 owner,
                 repo,
@@ -1922,16 +1949,6 @@ jobs:
                 tagRefs.set(refTag, {sha: objectSha, type: objectType});
               }
               return {releaseTags: [...releaseTags].sort(), tagRefs};
-            }
-
-            async function getReleaseByTagOrNull() {
-              try {
-                const response = await github.rest.repos.getReleaseByTag({owner, repo, tag});
-                return response.data;
-              } catch (error) {
-                if (error.status === 404) return null;
-                throw error;
-              }
             }
 
             function assertExpectedReleaseIdentity(releaseState) {
@@ -1980,6 +1997,100 @@ jobs:
               if (!sameStrings([...seenNames].sort(), [...expectedAssets.keys()].sort())) {
                 throw new Error('Final release asset names changed after upload');
               }
+            }
+
+            function assertOriginalReleaseBinding(observed, originalRelease) {
+              assertExpectedReleaseIdentity(observed);
+              if (
+                observed.id !== originalRelease.id
+                || observed.html_url !== originalRelease.html_url
+              ) {
+                throw new Error('Original draft release was deleted or replaced after asset upload');
+              }
+            }
+
+            async function waitForOriginalReleaseInventory(originalRelease) {
+              const attempts = 7;
+              for (let attempt = 0; attempt < attempts; attempt += 1) {
+                const releases = await listAllReleases();
+                const matches = releases.filter((candidate) => candidate.tag_name === tag);
+                if (matches.length > 1) {
+                  throw new Error('Duplicate target tag appeared in the complete release inventory');
+                }
+                if (matches.length === 1) {
+                  assertOriginalReleaseBinding(matches[0], originalRelease);
+                  return matches[0];
+                }
+                if (attempt + 1 < attempts) {
+                  const delayMs = Math.min(250 * (2 ** attempt), 2000);
+                  await new Promise((resolve) => setTimeout(resolve, delayMs));
+                }
+              }
+              throw new Error('Unable to revalidate the original draft release after asset upload');
+            }
+
+            async function getOriginalReleaseById(originalRelease) {
+              const observed = await retryGitHubRead(
+                'Unable to revalidate the original draft release after asset upload',
+                async () => {
+                  const response = await github.rest.repos.getRelease({
+                    owner,
+                    repo,
+                    release_id: originalRelease.id,
+                  });
+                  return response.data;
+                },
+                true,
+              );
+              assertOriginalReleaseBinding(observed, originalRelease);
+              return observed;
+            }
+
+            async function waitForReleaseDeletion(originalRelease) {
+              const attempts = 7;
+              for (let attempt = 0; attempt < attempts; attempt += 1) {
+                let observedById;
+                try {
+                  const response = await github.rest.repos.getRelease({
+                    owner,
+                    repo,
+                    release_id: originalRelease.id,
+                  });
+                  observedById = response.data;
+                } catch (error) {
+                  if (error.status === 404) {
+                    observedById = null;
+                  } else if (!retryableReadStatuses.has(error.status)) {
+                    throw error;
+                  } else {
+                    observedById = undefined;
+                  }
+                }
+
+                const releases = await listAllReleases();
+                const matches = releases.filter((candidate) => candidate.tag_name === tag);
+                if (matches.length > 1) return false;
+                if (matches.length === 1) {
+                  const candidate = matches[0];
+                  if (
+                    candidate.id !== originalRelease.id
+                    || candidate.html_url !== originalRelease.html_url
+                  ) return false;
+                }
+                if (observedById === null && matches.length === 0) return true;
+                if (observedById !== undefined && observedById !== null) {
+                  try {
+                    assertOriginalReleaseBinding(observedById, originalRelease);
+                  } catch (error) {
+                    return false;
+                  }
+                }
+                if (attempt + 1 < attempts) {
+                  const delayMs = Math.min(250 * (2 ** attempt), 2000);
+                  await new Promise((resolve) => setTimeout(resolve, delayMs));
+                }
+              }
+              return false;
             }
 
             function assertObservedReleaseAsset(asset, expected, assetId) {
@@ -2032,20 +2143,8 @@ jobs:
             }
 
             async function assertFinalReleaseState(originalRelease, expectedAssets) {
-              let observed;
-              try {
-                const response = await github.rest.repos.getReleaseByTag({owner, repo, tag});
-                observed = response.data;
-              } catch (error) {
-                throw new Error('Unable to revalidate the original draft release after asset upload');
-              }
-              assertExpectedReleaseIdentity(observed);
-              if (
-                observed.id !== originalRelease.id
-                || observed.html_url !== originalRelease.html_url
-              ) {
-                throw new Error('Original draft release was deleted or replaced after asset upload');
-              }
+              await waitForOriginalReleaseInventory(originalRelease);
+              const observed = await getOriginalReleaseById(originalRelease);
               assertExactReleaseAssets(observed.assets, expectedAssets);
               return observed;
             }
@@ -2207,7 +2306,6 @@ jobs:
               if (
                 history.releaseTags.includes(tag)
                 || history.tagRefs.has(tag)
-                || await getReleaseByTagOrNull() !== null
                 || await getReleaseTagRefOrNull() !== null
               ) {
                 throw new Error('Release or tag already exists; refusing to overwrite it');
@@ -2368,8 +2466,9 @@ jobs:
                 assertExpectedReleaseIdentity(release);
               } catch (error) {
                 try {
-                  const observed = await getReleaseByTagOrNull();
-                  if (observed !== null) {
+                  const matches = (await listAllReleases())
+                    .filter((candidate) => candidate.tag_name === tag);
+                  if (matches.length !== 0) {
                     core.error('Release creation was ambiguous and a release now exists; preserving the owned tag');
                   } else {
                     core.warning(
@@ -2441,16 +2540,23 @@ jobs:
                   expectedAssets.set(name, {...expected, id: finalized.id});
                 }
               } catch (error) {
+                let deletionError = null;
                 try {
                   await github.rest.repos.deleteRelease({owner, repo, release_id: release.id});
-                  const observed = await getReleaseByTagOrNull();
-                  if (observed === null) {
+                } catch (caught) {
+                  deletionError = caught;
+                }
+                try {
+                  if (await waitForReleaseDeletion(release)) {
                     core.warning('Draft release deletion was confirmed; preserving its owned tag');
                   } else {
                     core.error('Draft release cleanup left or recreated a release; preserving its owned tag');
                   }
                 } catch (cleanupError) {
                   core.error('Draft release cleanup failed or was ambiguous; preserving its owned tag');
+                }
+                if (deletionError !== null) {
+                  core.warning('GitHub returned an error while deleting the draft; post-delete state was inspected');
                 }
                 throw error;
               }
