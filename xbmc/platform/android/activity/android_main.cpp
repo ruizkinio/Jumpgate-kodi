@@ -91,6 +91,7 @@ extern void android_main(struct android_app* state)
     {
       eventLoop.run(theApp, inputHandler);
       theApp.Quit();
+      theApp.NotifyExternalPlayerCleanupReady();
     }
     else
       CXBMCApp::android_printf("android_main: setup failed");

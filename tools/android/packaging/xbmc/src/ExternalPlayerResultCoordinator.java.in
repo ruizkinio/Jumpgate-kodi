@@ -13,6 +13,9 @@ public final class ExternalPlayerResultCoordinator {
   public static final String EXTRA_DURATION_MS = "jumpgate_external_result_duration_ms";
   public static final String EXTRA_COMPLETED = "jumpgate_external_result_completed";
   public static final String EXTRA_EXIT_PROCESS = "jumpgate_external_result_exit_process";
+  public static final String CALLER_RESULT_ACTION = "com.mxtech.intent.result.VIEW";
+  public static final String CALLER_END_BY_COMPLETION = "playback_completion";
+  public static final String CALLER_END_BY_USER = "user";
 
   private ExternalPlayerResultCoordinator() {}
 
@@ -28,6 +31,10 @@ public final class ExternalPlayerResultCoordinator {
     } catch (IllegalArgumentException e) {
       return false;
     }
+  }
+
+  public static String callerEndReason(boolean completed) {
+    return completed ? CALLER_END_BY_COMPLETION : CALLER_END_BY_USER;
   }
 
   public static final class Terminal {
@@ -534,6 +541,7 @@ public final class ExternalPlayerResultCoordinator {
     private long mGeneration;
     private boolean mExitRequested;
     private boolean mAcknowledged;
+    private boolean mCleanupReady;
     private boolean mClaimed;
 
     public ProcessExitState() {
@@ -546,16 +554,28 @@ public final class ExternalPlayerResultCoordinator {
         boolean exitRequested,
         boolean acknowledged,
         boolean claimed) {
+      this(requestId, generation, exitRequested, acknowledged, claimed, claimed);
+    }
+
+    public ProcessExitState(
+        String requestId,
+        long generation,
+        boolean exitRequested,
+        boolean acknowledged,
+        boolean cleanupReady,
+        boolean claimed) {
       if (!isValidRequestId(requestId)
           || generation <= 0
           || (acknowledged && !exitRequested)
-          || (claimed && !acknowledged))
+          || (cleanupReady && !exitRequested)
+          || (claimed && (!acknowledged || !cleanupReady)))
         throw new IllegalArgumentException("Invalid external-player process-exit state");
 
       mRequestId = requestId;
       mGeneration = generation;
       mExitRequested = exitRequested;
       mAcknowledged = acknowledged;
+      mCleanupReady = cleanupReady;
       mClaimed = claimed;
     }
 
@@ -567,6 +587,7 @@ public final class ExternalPlayerResultCoordinator {
       mGeneration = generation;
       mExitRequested = false;
       mAcknowledged = false;
+      mCleanupReady = false;
       mClaimed = false;
       return true;
     }
@@ -585,8 +606,16 @@ public final class ExternalPlayerResultCoordinator {
       return true;
     }
 
+    public synchronized boolean markCleanupReady(long generation, String requestId) {
+      if (!matches(generation, requestId) || !mExitRequested || mCleanupReady) return false;
+
+      mCleanupReady = true;
+      return true;
+    }
+
     public synchronized boolean claim(long generation, String requestId) {
-      if (!matches(generation, requestId) || !mAcknowledged || mClaimed) return false;
+      if (!matches(generation, requestId) || !mAcknowledged || !mCleanupReady || mClaimed)
+        return false;
 
       mClaimed = true;
       return true;
@@ -599,6 +628,7 @@ public final class ExternalPlayerResultCoordinator {
       mGeneration = 0;
       mExitRequested = false;
       mAcknowledged = false;
+      mCleanupReady = false;
       mClaimed = false;
       return true;
     }
@@ -615,9 +645,14 @@ public final class ExternalPlayerResultCoordinator {
       return matches(generation, requestId) && mClaimed;
     }
 
+    public synchronized boolean isCleanupReady(long generation, String requestId) {
+      return matches(generation, requestId) && mCleanupReady;
+    }
+
     public synchronized ProcessExitState copy() {
       if (mGeneration == 0) return new ProcessExitState();
-      return new ProcessExitState(mRequestId, mGeneration, mExitRequested, mAcknowledged, mClaimed);
+      return new ProcessExitState(
+          mRequestId, mGeneration, mExitRequested, mAcknowledged, mCleanupReady, mClaimed);
     }
 
     public synchronized boolean isActive() {
@@ -638,6 +673,10 @@ public final class ExternalPlayerResultCoordinator {
 
     public synchronized boolean wasAcknowledged() {
       return mAcknowledged;
+    }
+
+    public synchronized boolean wasCleanupReady() {
+      return mCleanupReady;
     }
 
     public synchronized boolean wasClaimed() {

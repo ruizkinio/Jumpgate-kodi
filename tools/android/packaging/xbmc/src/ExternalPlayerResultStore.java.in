@@ -22,6 +22,7 @@ public final class ExternalPlayerResultStore {
   private static final String PROCESS_EXIT_GENERATION = "process_exit.generation";
   private static final String PROCESS_EXIT_REQUESTED = "process_exit.requested";
   private static final String PROCESS_EXIT_ACKNOWLEDGED = "process_exit.acknowledged";
+  private static final String PROCESS_EXIT_CLEANUP_READY = "process_exit.cleanup_ready";
   private static final String PROCESS_EXIT_CLAIMED = "process_exit.claimed";
 
   private ExternalPlayerResultStore() {}
@@ -217,6 +218,22 @@ public final class ExternalPlayerResultStore {
     return readProcessExitState(preferences(context)).isAcknowledged(generation, requestId);
   }
 
+  public static synchronized boolean markProcessCleanupReady(
+      Context context, String requestId, long generation) {
+    if (context == null
+        || !ExternalPlayerResultCoordinator.isValidRequestId(requestId)
+        || generation <= 0) return false;
+
+    SharedPreferences preferences = preferences(context);
+    ExternalPlayerResultCoordinator.ProcessExitState processExitState =
+        readProcessExitState(preferences);
+    if (!processExitState.markCleanupReady(generation, requestId)) return false;
+
+    SharedPreferences.Editor editor = preferences.edit();
+    putProcessExitState(editor, processExitState);
+    return editor.commit();
+  }
+
   public static synchronized boolean executeAcknowledgedProcessExit(
       Context context, String requestId, long generation, Runnable terminator) {
     if (context == null
@@ -276,12 +293,12 @@ public final class ExternalPlayerResultStore {
   }
 
   public static Intent toCallerResult(ExternalPlayerResultCoordinator.Terminal terminal) {
-    Intent result = new Intent("org.videolan.vlc.player.result");
+    Intent result = new Intent(ExternalPlayerResultCoordinator.CALLER_RESULT_ACTION);
     result.putExtra("extra_position", terminal.positionMs);
     result.putExtra("extra_duration", terminal.durationMs);
     result.putExtra("position", (int) terminal.positionMs);
     result.putExtra("duration", (int) terminal.durationMs);
-    result.putExtra("end_by", terminal.completed ? "playback_completion" : "user");
+    result.putExtra("end_by", ExternalPlayerResultCoordinator.callerEndReason(terminal.completed));
     result.putExtra("jumpgate_failed_to_start", terminal.failedToStart());
     return result;
   }
@@ -344,6 +361,7 @@ public final class ExternalPlayerResultStore {
           preferences.getLong(PROCESS_EXIT_GENERATION, 0),
           preferences.getBoolean(PROCESS_EXIT_REQUESTED, false),
           preferences.getBoolean(PROCESS_EXIT_ACKNOWLEDGED, false),
+          preferences.getBoolean(PROCESS_EXIT_CLEANUP_READY, false),
           preferences.getBoolean(PROCESS_EXIT_CLAIMED, false));
     } catch (IllegalArgumentException e) {
       return new ExternalPlayerResultCoordinator.ProcessExitState();
@@ -360,6 +378,7 @@ public final class ExternalPlayerResultStore {
           .remove(PROCESS_EXIT_GENERATION)
           .remove(PROCESS_EXIT_REQUESTED)
           .remove(PROCESS_EXIT_ACKNOWLEDGED)
+          .remove(PROCESS_EXIT_CLEANUP_READY)
           .remove(PROCESS_EXIT_CLAIMED);
       return;
     }
@@ -369,6 +388,7 @@ public final class ExternalPlayerResultStore {
         .putLong(PROCESS_EXIT_GENERATION, processExitState.generation())
         .putBoolean(PROCESS_EXIT_REQUESTED, processExitState.wasExitRequested())
         .putBoolean(PROCESS_EXIT_ACKNOWLEDGED, processExitState.wasAcknowledged())
+        .putBoolean(PROCESS_EXIT_CLEANUP_READY, processExitState.wasCleanupReady())
         .putBoolean(PROCESS_EXIT_CLAIMED, processExitState.wasClaimed())
         .putBoolean(PROCESS_EXIT_READY, true);
   }

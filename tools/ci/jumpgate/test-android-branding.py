@@ -54,6 +54,15 @@ ANDROID_MANIFEST = (
 MAIN_ACTIVITY = (
     ROOT / "tools" / "android" / "packaging" / "xbmc" / "src" / "Main.java.in"
 )
+EXTERNAL_RESULT_SOURCE = (
+    ROOT
+    / "tools"
+    / "android"
+    / "packaging"
+    / "xbmc"
+    / "src"
+    / "ExternalPlayerResultCoordinator.java.in"
+)
 ANDROID_APP_GRADLE = (
     ROOT / "tools" / "android" / "packaging" / "xbmc" / "build.gradle.in"
 )
@@ -1814,7 +1823,9 @@ def verify_warm_task_handoff_contract(
 
     warm_exit_end = post_commit_exit.find(warm_exit) + len(warm_exit)
     cold_exit = extract_braced_block(post_commit_exit[warm_exit_end:], "else")
-    require_in_order(cold_exit, "mExternalPlayerMode = false", "finish()")
+    require_in_order(
+        cold_exit, "mExternalPlayerMode = false", "finishColdExternalPlayerTask()"
+    )
     if "moveTaskToBack(" in cold_exit or "handoffWarmExternalPlayerTask(" in cold_exit:
         raise AssertionError("cold external exit must finish Main instead of retaining its task")
 
@@ -1837,7 +1848,7 @@ def verify_warm_task_handoff_contract(
     require_in_order(
         pending_delivery,
         "const bool wasStandalone",
-        "ExitExternalPlayerMode(*result, lifecycleOperation)",
+        "ExitExternalPlayerMode(*result, lifecycleOperation, deferPlayerCleanup)",
         "m_playbackResultState.Reset(lifecycleOperation, result->generation)",
         "if (exited && reset && wasStandalone)",
         "HandoffWarmExternalPlayerTask(result->generation, result->requestId)",
@@ -2218,6 +2229,8 @@ def verify_warm_task_handoff_contract(
         "warmTaskNewerLaunchFencesQueuedControllerCallback()",
         "warmTaskRetryCannotAttachToNewerSameLifecycleLaunch()",
         "warmTaskDuplicateCallbacksAndNewerLaunchStayFenced()",
+        "processExitRequiresCallerAndNativeCleanup()",
+        "callerResultCompletionContractMatchesStremio()",
     ):
         if executable_tests.count(test) < 2:
             raise AssertionError(f"external result host test is not invoked: {test}")
@@ -2326,6 +2339,96 @@ def verify_native_back_wiring():
         raise AssertionError(
             "the native app cannot obtain the token from its exact Activity"
         )
+
+    for forbidden_delay in (
+        "mExternalPlayerMode ? 2000",
+        "new DelayedIntent(\n              new Intent(intent),\n              500",
+    ):
+        if forbidden_delay in main_activity:
+            raise AssertionError("external playback intent still uses an arbitrary startup delay")
+    require_in_order(
+        extract_braced_block(main_activity, "public void onNativeIntentReady("),
+        "lifecycleToken != mBackLifecycleToken",
+        "mNativeIntentReady = true",
+        "dispatchPendingNativeIntents();",
+    )
+    require_in_order(
+        extract_braced_block(main_activity, "private void dispatchPendingNativeIntents()"),
+        "mPaused || !mNativeIntentReady",
+        "mDelayedIntents.clear();",
+        "_onNewIntent(",
+    )
+
+    app_source = APP_SOURCE.read_text(encoding="utf-8")
+    initialize = extract_braced_block(app_source, "void CXBMCApp::Initialize()")
+    if 'call_method<void>(m_context, "onNativeIntentReady"' not in initialize:
+        raise AssertionError("native application readiness does not release queued intents")
+    external_back = extract_braced_block(
+        app_source, "bool CXBMCApp::ExecuteQueuedBackCommand("
+    )
+    require_in_order(
+        external_back,
+        "if (nestedKodiUiVisible)",
+        "return ExecuteKodiBackCommand(false)",
+        "if (osdVisible)",
+        "CancelPendingExternalPlaybackFromBack()",
+        "ExitExternalPlaybackForBack(payload.playbackToken)",
+        "g_application.OnAction(CAction(ACTION_STOP))",
+    )
+    external_exit = extract_braced_block(
+        app_source, "bool CXBMCApp::ExitExternalPlayerMode("
+    )
+    require_in_order(
+        external_exit,
+        "const bool wasStandalone",
+        "const bool deferNativeCleanup = deferPlayerCleanup || !wasStandalone",
+        "if (!deferNativeCleanup)",
+        'call_method<void>(m_context, "exitExternalPlayerMode"',
+    )
+    finish_cold = extract_braced_block(
+        main_activity, "private void finishColdExternalPlayerTask()"
+    )
+    require_in_order(
+        finish_cold,
+        "mMainView.setVisibility(View.INVISIBLE)",
+        "mDecorView.setBackgroundColor(Color.BLACK)",
+        "isTaskRoot()",
+        "finishAndRemoveTask()",
+        "finish()",
+    )
+
+    result_store = (
+        ROOT
+        / "tools"
+        / "android"
+        / "packaging"
+        / "xbmc"
+        / "src"
+        / "ExternalPlayerResultStore.java.in"
+    ).read_text(encoding="utf-8")
+    for cleanup_contract in (
+        "PROCESS_EXIT_CLEANUP_READY",
+        "markProcessCleanupReady(",
+        "processExitState.markCleanupReady(",
+        "processExitState.wasCleanupReady()",
+    ):
+        if cleanup_contract not in result_store:
+            raise AssertionError(
+                f"process exit can preempt native cleanup: {cleanup_contract!r}"
+            )
+
+    result_coordinator = EXTERNAL_RESULT_SOURCE.read_text(encoding="utf-8")
+    for completion_contract in (
+        'CALLER_RESULT_ACTION = "com.mxtech.intent.result.VIEW"',
+        'CALLER_END_BY_COMPLETION = "playback_completion"',
+        "callerEndReason(terminal.completed)",
+    ):
+        if completion_contract not in result_coordinator + result_store:
+            raise AssertionError(
+                f"Stremio completion result contract is missing: {completion_contract!r}"
+            )
+    if "org.videolan.vlc.player.result" in result_store:
+        raise AssertionError("VLC-style result cannot signal nonzero-duration completion to Stremio")
 
     jni_header = JNI_MAIN_HEADER.read_text(encoding="utf-8")
     jni_source = JNI_MAIN_SOURCE.read_text(encoding="utf-8")
