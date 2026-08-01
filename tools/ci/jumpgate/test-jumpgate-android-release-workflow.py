@@ -736,6 +736,8 @@ for required_create_only_token in (
     "const annotatedTagMessage = [",
     "sha: ownedTagObjectSha",
     "assertPostCreationHistory(initialHistory)",
+    "Owned annotated tag did not become visible in canonical history",
+    "Math.min(250 * (2 ** attempt), 5000)",
     "assertReviewedRefBinding('immediately before release creation')",
     "current_user_can_bypass === 'always'",
     "getRepoRuleset",
@@ -855,8 +857,8 @@ require(publish_script.count("await assertRequiredTagRuleset();") == 3,
         "tag ruleset must be revalidated before tag creation, release creation, and success")
 require(publish_script.count("await assertRepositorySource();") == 3,
         "default/source head must be revalidated before tag creation, release creation, and success")
-require(publish_script.count("await assertOwnedTag();") == 3,
-        "owned tag checks must cover createRef ambiguity, release creation, and final success")
+require(publish_script.count("await assertOwnedTag();") == 4,
+        "owned tag checks must cover listing convergence, createRef ambiguity, release creation, and final success")
 require(publish_script.count("github.rest.repos.getReleaseByTag({") == 1,
         "tag lookup must be limited to initial absence and recovery helpers")
 require(publish_script.count("github.rest.repos.getRelease({") == 1,
@@ -1332,8 +1334,19 @@ async function runScenario(scenario) {
         : PRIOR_OBJECT;
       const data = [{ref: 'refs/tags/' + PRIOR_TAG, object: {type: 'tag', sha: priorObject}}];
       if (calls.listMatchingRefs >= 2) {
-        if (scenario === 'owned_tag_replaced_after_tag') releaseTagRef = replacementRef();
-        if (releaseTagRef) data.push(clone(releaseTagRef));
+        if ([
+          'owned_tag_replaced_after_tag',
+          'post_create_tag_listing_missing_exact_ref_replaced',
+        ].includes(scenario)) releaseTagRef = replacementRef();
+        const releaseTagVisible = ![
+          'post_create_tag_listing_never_converges',
+          'post_create_tag_listing_missing_exact_ref_replaced',
+        ].includes(scenario)
+          && !(
+            scenario === 'post_create_tag_listing_transient'
+            && calls.listMatchingRefs < 4
+          );
+        if (releaseTagRef && releaseTagVisible) data.push(clone(releaseTagRef));
         if (scenario === 'history_changed_after_tag') {
           data.push({ref: 'refs/tags/' + EXTRA_TAG, object: {type: 'tag', sha: EXTRA_OBJECT}});
         }
@@ -1504,6 +1517,9 @@ async function runScenario(scenario) {
 publication_scenarios = [
     "stable",
     "ambiguous_create_ref",
+    "post_create_tag_listing_transient",
+    "post_create_tag_listing_never_converges",
+    "post_create_tag_listing_missing_exact_ref_replaced",
     "default_head_moved_after_tag",
     "history_changed_after_tag",
     "prior_tag_moved_after_tag",
@@ -1559,11 +1575,19 @@ publication_results = run_publication_scenarios(publication_scenarios)
 for stable_scenario in (
     "stable",
     "ambiguous_create_ref",
+    "post_create_tag_listing_transient",
     "post_upload_release_lookup_transient",
 ):
     result = publication_results[stable_scenario]
     expected_release_reads = 3 if stable_scenario == "post_upload_release_lookup_transient" else 1
-    expected_retry_delays = [250, 500] if stable_scenario == "post_upload_release_lookup_transient" else []
+    expected_retry_delays = (
+        [250, 500]
+        if stable_scenario in {
+            "post_create_tag_listing_transient",
+            "post_upload_release_lookup_transient",
+        }
+        else []
+    )
     require(result["ok"], f"{stable_scenario} publication failed: {result['error']}")
     require(result["calls"]["createTag"] == 1 and result["calls"]["createRelease"] == 1,
             f"{stable_scenario} did not create one annotated tag and release")
@@ -1583,9 +1607,15 @@ for stable_scenario in (
     )
     require(result["retryDelays"] == expected_retry_delays,
             f"{stable_scenario} release lookup retry schedule drifted")
-    expected_release_ref_reads = 4 if stable_scenario == "ambiguous_create_ref" else 3
+    expected_release_ref_reads = {
+        "ambiguous_create_ref": 4,
+        "post_create_tag_listing_transient": 5,
+    }.get(stable_scenario, 3)
     require(result["calls"]["releaseTagRef"] == expected_release_ref_reads,
             f"{stable_scenario} release-tag ownership call count drifted")
+    expected_history_reads = 4 if stable_scenario == "post_create_tag_listing_transient" else 2
+    require(result["calls"]["listMatchingRefs"] == expected_history_reads,
+            f"{stable_scenario} canonical tag-list read count drifted")
     require(result["calls"]["deleteRelease"] == 0,
             f"{stable_scenario} unexpectedly entered release cleanup")
     require(result["calls"]["deleteRef"] == 0,
@@ -1603,6 +1633,12 @@ for stable_scenario in (
             f"{stable_scenario} final release asset set drifted")
 
 expected_publication_failures = {
+    "post_create_tag_listing_never_converges": (
+        "Owned annotated tag did not become visible in canonical history"
+    ),
+    "post_create_tag_listing_missing_exact_ref_replaced": (
+        "Release tag is absent or no longer points to the exact owned annotated tag object"
+    ),
     "default_head_moved_after_tag": "Repository default-branch head changed after source validation",
     "history_changed_after_tag": "Canonical release set changed after annotated-tag creation",
     "prior_tag_moved_after_tag": "Canonical tag moved after annotated-tag creation",
@@ -1658,6 +1694,37 @@ for scenario, error_fragment in expected_publication_failures.items():
     require(error_fragment in (result["error"] or ""),
             f"{scenario} failed outside its sealed guard: {result['error']}")
 
+post_create_visibility_failure = publication_results["post_create_tag_listing_never_converges"]
+require(post_create_visibility_failure["calls"]["listMatchingRefs"] == 11,
+        "non-convergent tag listing escaped its bounded ten-read limit")
+require(post_create_visibility_failure["calls"]["releaseTagRef"] == 11,
+        "non-convergent tag listing did not revalidate exact ownership on every read")
+require(
+    post_create_visibility_failure["retryDelays"]
+    == [250, 500, 1000, 2000, 4000, 5000, 5000, 5000, 5000],
+    "non-convergent tag listing retry schedule drifted",
+)
+require(post_create_visibility_failure["calls"]["createRelease"] == 0
+        and post_create_visibility_failure["calls"]["uploadReleaseAsset"] == 0
+        and not post_create_visibility_failure["releaseExists"],
+        "non-convergent tag listing advanced into release creation")
+require(post_create_visibility_failure["tagObjectSha"] == "d" * 40,
+        "non-convergent tag listing did not preserve the exact owned tag")
+
+post_create_replacement = publication_results[
+    "post_create_tag_listing_missing_exact_ref_replaced"
+]
+require(post_create_replacement["calls"]["listMatchingRefs"] == 2
+        and post_create_replacement["calls"]["releaseTagRef"] == 2,
+        "stale listing did not fail immediately on exact-ref replacement")
+require(not post_create_replacement["retryDelays"],
+        "exact-ref replacement was retried as harmless listing lag")
+require(post_create_replacement["calls"]["createRelease"] == 0
+        and post_create_replacement["calls"]["uploadReleaseAsset"] == 0,
+        "exact-ref replacement advanced into release creation")
+require(post_create_replacement["tagObjectSha"] == "f" * 40,
+        "exact-ref replacement fixture did not retain the hostile replacement")
+
 asset_finalization_failures = {
     "asset_finalization_digest_mismatch": 1,
     "asset_finalization_never_completes": 7,
@@ -1684,6 +1751,8 @@ require("9007199254740992" not in json.dumps(
         ), "malformed protected release App ID was logged")
 
 manual_reconciliation_reasons = {
+    "post_create_tag_listing_never_converges": "post-create-revalidation",
+    "post_create_tag_listing_missing_exact_ref_replaced": "post-create-revalidation",
     "default_head_moved_after_tag": "post-create-revalidation",
     "history_changed_after_tag": "post-create-revalidation",
     "prior_tag_moved_after_tag": "post-create-revalidation",

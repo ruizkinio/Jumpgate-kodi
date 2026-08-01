@@ -2267,30 +2267,44 @@ jobs:
             }
 
             async function assertPostCreationHistory(initialHistory) {
-              const history = await loadCanonicalHistory();
-              if (!sameStrings(history.releaseTags, initialHistory.releaseTags)) {
-                throw new Error('Canonical release set changed after annotated-tag creation');
-              }
-              const current = history.tagRefs.get(tag);
-              if (!current || current.type !== 'tag' || current.sha !== ownedTagObjectSha) {
-                throw new Error('Owned annotated tag is missing or replaced in canonical history');
-              }
-              const priorRefs = new Map(history.tagRefs);
-              priorRefs.delete(tag);
-              const priorNames = [...priorRefs.keys()].sort();
-              const expectedNames = [...initialHistory.tagRefs.keys()].sort();
-              if (!sameStrings(priorNames, expectedNames)) {
-                throw new Error('Canonical tag set changed after annotated-tag creation');
-              }
-              for (const priorTag of expectedNames) {
-                const before = initialHistory.tagRefs.get(priorTag);
-                const after = priorRefs.get(priorTag);
-                if (!after || before.sha !== after.sha || before.type !== after.type) {
-                  throw new Error('Canonical tag moved after annotated-tag creation: ' + priorTag);
+              const attempts = 10;
+              for (let attempt = 0; attempt < attempts; attempt += 1) {
+                const history = await loadCanonicalHistory();
+                if (!sameStrings(history.releaseTags, initialHistory.releaseTags)) {
+                  throw new Error('Canonical release set changed after annotated-tag creation');
                 }
-              }
-              if (historyFingerprint(history.releaseTags, priorRefs) !== expectedHistoryFingerprint) {
-                throw new Error('Canonical release history changed after annotated-tag creation');
+                const current = history.tagRefs.get(tag);
+                const priorRefs = new Map(history.tagRefs);
+                priorRefs.delete(tag);
+                const priorNames = [...priorRefs.keys()].sort();
+                const expectedNames = [...initialHistory.tagRefs.keys()].sort();
+                if (!sameStrings(priorNames, expectedNames)) {
+                  throw new Error('Canonical tag set changed after annotated-tag creation');
+                }
+                for (const priorTag of expectedNames) {
+                  const before = initialHistory.tagRefs.get(priorTag);
+                  const after = priorRefs.get(priorTag);
+                  if (!after || before.sha !== after.sha || before.type !== after.type) {
+                    throw new Error('Canonical tag moved after annotated-tag creation: ' + priorTag);
+                  }
+                }
+                if (historyFingerprint(history.releaseTags, priorRefs) !== expectedHistoryFingerprint) {
+                  throw new Error('Canonical release history changed after annotated-tag creation');
+                }
+                if (current) {
+                  if (current.type !== 'tag' || current.sha !== ownedTagObjectSha) {
+                    throw new Error('Owned annotated tag is missing or replaced in canonical history');
+                  }
+                  return;
+                }
+
+                // The exact-ref endpoint is authoritative while the canonical listing converges.
+                await assertOwnedTag();
+                if (attempt + 1 >= attempts) {
+                  throw new Error('Owned annotated tag did not become visible in canonical history');
+                }
+                const delayMs = Math.min(250 * (2 ** attempt), 5000);
+                await new Promise((resolve) => setTimeout(resolve, delayMs));
               }
             }
 
