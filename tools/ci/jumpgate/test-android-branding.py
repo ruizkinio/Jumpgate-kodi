@@ -2430,6 +2430,23 @@ def verify_native_back_wiring():
     if "org.videolan.vlc.player.result" in result_store:
         raise AssertionError("VLC-style result cannot signal nonzero-duration completion to Stremio")
 
+    subtitle_transport = (
+        ROOT
+        / "xbmc"
+        / "platform"
+        / "android"
+        / "activity"
+        / "AndroidJumpgateSubtitleTransport.cpp"
+    ).read_text(encoding="utf-8")
+    subtitle_process = extract_braced_block(
+        subtitle_transport, "void CAndroidJumpgateSubtitleController::Process("
+    )
+    require_in_order(
+        subtitle_process,
+        "appPlayer->AddSubtitle(path)",
+        "appPlayer->SetSubtitleVisible(true)",
+    )
+
     jni_header = JNI_MAIN_HEADER.read_text(encoding="utf-8")
     jni_source = JNI_MAIN_SOURCE.read_text(encoding="utf-8")
     for contract in (
