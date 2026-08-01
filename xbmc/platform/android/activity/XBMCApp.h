@@ -253,6 +253,7 @@ public:
   void CommitExternalPlaybackTerminal(bool completed, uint64_t token, bool started);
   void QueuePendingExternalPlayerResult();
   void DeliverPendingExternalPlayerResult();
+  void NotifyExternalPlayerCleanupReady();
   std::optional<uint64_t> BeginExternalPlaybackContinuation();
   bool IsLatestExternalPlaybackAdmission(uint64_t token);
 
@@ -359,7 +360,8 @@ private:
       std::string resultRequestId,
       KODI::JUMPGATE::CJumpgatePlaybackResultState::LifecycleOperation& lifecycleOperation);
   void DeliverPendingExternalPlayerResult(
-      KODI::JUMPGATE::CJumpgatePlaybackResultState::LifecycleOperation& lifecycleOperation);
+      KODI::JUMPGATE::CJumpgatePlaybackResultState::LifecycleOperation& lifecycleOperation,
+      bool deferPlayerCleanup = false);
   void ProcessPlaybackSourceClaim();
   void QueueJumpgateSubtitles(uint64_t generation);
   void ProcessJumpgateSubtitles();
@@ -370,7 +372,8 @@ private:
   void StopPlaybackClaimCoordinator(bool drainRelease);
   bool ExitExternalPlayerMode(
       const KODI::JUMPGATE::JumpgatePlaybackResult& result,
-      KODI::JUMPGATE::CJumpgatePlaybackResultState::LifecycleOperation& lifecycleOperation);
+      KODI::JUMPGATE::CJumpgatePlaybackResultState::LifecycleOperation& lifecycleOperation,
+      bool deferPlayerCleanup);
   std::optional<KODI::JUMPGATE::CJumpgatePlaybackAuthority::Token>
   BeginJumpgateProfileAuthorityTransition(std::string& error);
   void PrepareJumpgateProfileAuthorityTransition();
@@ -430,6 +433,7 @@ private:
                                     const std::string& requestId,
                                     bool wasStandalone);
   void HandoffWarmExternalPlayerTask(uint64_t generation, const std::string& requestId);
+  void ExitExternalPlaybackForBack(uint64_t playbackToken);
   bool CancelPendingExternalPlaybackFromBack();
   bool ExecuteExternalBackCommand();
   bool ExecuteKodiBackCommand(bool longPress);
@@ -485,6 +489,9 @@ private:
   std::atomic<bool> m_wasStandalone{false}; // true when entered ext player mode from standalone
   std::atomic<int64_t> m_lastPlaybackTimeMs{0}; // F-003: atomic prevents torn reads on ARM32
   std::atomic<int64_t> m_lastPlaybackDurationMs{0}; // F-003: atomic prevents torn reads on ARM32
+  mutable std::mutex m_externalProcessExitMutex;
+  uint64_t m_externalProcessExitGeneration{0};
+  std::string m_externalProcessExitRequestId;
   std::atomic<int64_t> m_resumePositionMs{0};
   std::atomic<bool> m_resumeApplied{false}; // Prevents double-seek from content-ID resume
   std::atomic<uint64_t> m_externalPlaybackStartedGeneration{0};

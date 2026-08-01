@@ -665,6 +665,12 @@ void CXBMCApp::Announce(ANNOUNCEMENT::AnnouncementFlag flag,
     {
       m_mediaSessionUpdated = false;
       UpdateSessionState();
+      if (m_externalPlayerMode.load(std::memory_order_relaxed) && !m_overlayHidden)
+      {
+        call_method<void>(m_context, "hideLoadingOverlay", "()V");
+        m_overlayHidden = true;
+        CLog::Log(LOGINFO, "CXBMCApp: Loading overlay hidden at first AV start");
+      }
     }
   }
   else if (flag & Info)
@@ -1016,6 +1022,9 @@ void CXBMCApp::Initialize()
     }
     active.ClearSecrets();
   }
+
+  call_method<void>(m_context, "onNativeIntentReady", "(J)V",
+                    static_cast<jlong>(m_jumpgateBackLifecycleToken));
 }
 
 void CXBMCApp::Deinitialize()
@@ -1671,15 +1680,23 @@ void CXBMCApp::DeliverPendingExternalPlayerResult()
   QueuePendingExternalPlayerResult();
 }
 
+void CXBMCApp::ExitExternalPlaybackForBack(uint64_t playbackToken)
+{
+  CommitExternalPlaybackTerminal(false, playbackToken, true);
+  auto lifecycleOperation = m_playbackResultState.BeginLifecycleOperation();
+  DeliverPendingExternalPlayerResult(lifecycleOperation, true);
+}
+
 void CXBMCApp::DeliverPendingExternalPlayerResult(
-    KODI::JUMPGATE::CJumpgatePlaybackResultState::LifecycleOperation& lifecycleOperation)
+    KODI::JUMPGATE::CJumpgatePlaybackResultState::LifecycleOperation& lifecycleOperation,
+    bool deferPlayerCleanup)
 {
   const auto result = m_playbackResultState.TakeFinished(lifecycleOperation);
   if (!result)
     return;
 
   const bool wasStandalone = m_wasStandalone.load(std::memory_order_relaxed);
-  const bool exited = ExitExternalPlayerMode(*result, lifecycleOperation);
+  const bool exited = ExitExternalPlayerMode(*result, lifecycleOperation, deferPlayerCleanup);
   const bool reset = m_playbackResultState.Reset(lifecycleOperation, result->generation);
   if (exited && reset && wasStandalone)
     HandoffWarmExternalPlayerTask(result->generation, result->requestId);
@@ -1687,7 +1704,8 @@ void CXBMCApp::DeliverPendingExternalPlayerResult(
 
 bool CXBMCApp::ExitExternalPlayerMode(
     const KODI::JUMPGATE::JumpgatePlaybackResult& result,
-    KODI::JUMPGATE::CJumpgatePlaybackResultState::LifecycleOperation& lifecycleOperation)
+    KODI::JUMPGATE::CJumpgatePlaybackResultState::LifecycleOperation& lifecycleOperation,
+    bool deferPlayerCleanup)
 {
   // The terminal announcement captured this generation's last stable position.
   // Do not query ApplicationPlayer here because it may already be shutting down.
@@ -1703,13 +1721,17 @@ bool CXBMCApp::ExitExternalPlayerMode(
   CLog::Log(LOGINFO, "CXBMCApp: Exiting external player mode (completed={}, pos={}, dur={})",
             result.completed, posMs, durMs);
 
+  const bool wasStandalone = m_wasStandalone.load(std::memory_order_relaxed);
+  const bool deferNativeCleanup = deferPlayerCleanup || !wasStandalone;
+
   // Save resume position before exiting
   SaveResumePosition(result.completed);
-  StopJumpgateSubtitleController(false, false);
-  ReleasePlaybackSourceClaim(result.completed);
-  StopPlaybackClaimCoordinator(false);
-
-  bool wasStandalone = m_wasStandalone.load(std::memory_order_relaxed);
+  if (!deferNativeCleanup)
+  {
+    StopJumpgateSubtitleController(false, false);
+    ReleasePlaybackSourceClaim(result.completed);
+    StopPlaybackClaimCoordinator(false);
+  }
 
   if (wasStandalone)
   {
@@ -1733,6 +1755,12 @@ bool CXBMCApp::ExitExternalPlayerMode(
     m_playbackResultState.CloseAdmissions();
     SetExternalPlayerMode(false); // prevent re-entry
 
+    {
+      std::lock_guard lock(m_externalProcessExitMutex);
+      m_externalProcessExitGeneration = result.generation;
+      m_externalProcessExitRequestId = result.requestId;
+    }
+
     // Call Java-side with wasStandalone=false (cold launch: finish + killProcess)
     call_method<void>(m_context, "exitExternalPlayerMode", "(JLjava/lang/String;JJZZ)V",
                       static_cast<jlong>(result.generation), jcast<jhstring>(result.requestId),
@@ -1740,6 +1768,24 @@ bool CXBMCApp::ExitExternalPlayerMode(
                       static_cast<jboolean>(result.completed), static_cast<jboolean>(false));
   }
   return true;
+}
+
+void CXBMCApp::NotifyExternalPlayerCleanupReady()
+{
+  uint64_t generation = 0;
+  std::string requestId;
+  {
+    std::lock_guard lock(m_externalProcessExitMutex);
+    generation = m_externalProcessExitGeneration;
+    requestId = m_externalProcessExitRequestId;
+    m_externalProcessExitGeneration = 0;
+    m_externalProcessExitRequestId.clear();
+  }
+  if (generation == 0 || requestId.empty())
+    return;
+
+  call_method<void>(m_context, "markExternalPlayerCleanupReady", "(JLjava/lang/String;)V",
+                    static_cast<jlong>(generation), jcast<jhstring>(requestId));
 }
 
 void CXBMCApp::SetExternalPlayerMode(bool mode)
@@ -4764,15 +4810,25 @@ bool CXBMCApp::ExecuteQueuedBackCommand(QueuedBackCommand& payload)
   if (gui == nullptr)
     return false;
 
-  CGUIDialog* videoOsd = gui->GetWindowManager().GetDialog(WINDOW_DIALOG_VIDEO_OSD);
+  auto& windowManager = gui->GetWindowManager();
+  CGUIDialog* videoOsd = windowManager.GetDialog(WINDOW_DIALOG_VIDEO_OSD);
   const bool osdVisible = videoOsd != nullptr && videoOsd->IsDialogRunning();
+  const int topmostDialog = windowManager.GetTopmostDialog(true);
+  const bool nestedKodiUiVisible =
+      windowManager.GetActiveWindow() != WINDOW_FULLSCREEN_VIDEO ||
+      (topmostDialog != WINDOW_INVALID && topmostDialog != WINDOW_DIALOG_VIDEO_OSD);
+  if (nestedKodiUiVisible)
+    return ExecuteKodiBackCommand(false);
+
   if (osdVisible)
   {
     videoOsd->Close(true);
     return true;
   }
+
   if (CancelPendingExternalPlaybackFromBack())
     return true;
+  ExitExternalPlaybackForBack(payload.playbackToken);
   g_application.OnAction(CAction(ACTION_STOP));
   return true;
 }

@@ -1161,6 +1161,12 @@ public final class ExternalPlayerResultCoordinatorTest {
     require(recoveredHost.processExitQueue.size() == 1, "activity fallback posted without Main");
     require(recoveredHost.processExitCalls == 0, "fallback waits for delivery callback boundary");
     recoveredHost.processExitQueue.runNext();
+    require(recoveredHost.processExitCalls == 0, "caller result cannot preempt native cleanup");
+    require(
+        recoveredHost.processExitState.markCleanupReady(41, OLD_REQUEST_ID),
+        "native teardown marks the exact process ready");
+    recoveredHost.postProcessExit(terminal);
+    recoveredHost.processExitQueue.runNext();
     require(recoveredHost.processExitCalls == 1, "fallback terminates the orphaned process");
     require(
         recoveredHost.processExitState.isClaimed(41, OLD_REQUEST_ID),
@@ -1190,6 +1196,7 @@ public final class ExternalPlayerResultCoordinatorTest {
     require(processExit.activate(44, OLD_REQUEST_ID), "queued old exit active");
     require(processExit.requestExit(44, OLD_REQUEST_ID), "queued old exit requested");
     require(processExit.acknowledge(44, OLD_REQUEST_ID), "queued old exit acknowledged");
+    require(processExit.markCleanupReady(44, OLD_REQUEST_ID), "queued old cleanup ready");
     queue.post(
         () -> {
           if (processExit.claim(44, OLD_REQUEST_ID)) processExits.incrementAndGet();
@@ -1200,8 +1207,40 @@ public final class ExternalPlayerResultCoordinatorTest {
     require(processExit.acknowledge(45, NEW_REQUEST_ID), "newer playback acknowledges exactly");
     queue.runNext();
     require(processExits.get() == 0, "queued stale exit cannot kill newer playback");
+    require(processExit.markCleanupReady(45, NEW_REQUEST_ID), "newer cleanup completes exactly");
     require(processExit.claim(45, NEW_REQUEST_ID), "newer exact pair remains claimable");
     require(!processExit.claim(45, NEW_REQUEST_ID), "newer process exit claims once");
+  }
+
+  private static void processExitRequiresCallerAndNativeCleanup() {
+    ExternalPlayerResultCoordinator.ProcessExitState state =
+        new ExternalPlayerResultCoordinator.ProcessExitState();
+    require(state.activate(46, OLD_REQUEST_ID), "caller-first exit active");
+    require(state.requestExit(46, OLD_REQUEST_ID), "caller-first exit requested");
+    require(state.acknowledge(46, OLD_REQUEST_ID), "caller result acknowledged");
+    require(!state.claim(46, OLD_REQUEST_ID), "caller acknowledgement cannot skip cleanup");
+    require(state.markCleanupReady(46, OLD_REQUEST_ID), "caller-first cleanup ready");
+    require(state.claim(46, OLD_REQUEST_ID), "caller-first exit claims after both gates");
+
+    require(state.activate(47, NEW_REQUEST_ID), "cleanup-first exit active");
+    require(state.requestExit(47, NEW_REQUEST_ID), "cleanup-first exit requested");
+    require(state.markCleanupReady(47, NEW_REQUEST_ID), "cleanup can finish before caller result");
+    require(!state.claim(47, NEW_REQUEST_ID), "cleanup cannot skip caller acknowledgement");
+    require(state.acknowledge(47, NEW_REQUEST_ID), "cleanup-first caller acknowledged");
+    require(state.claim(47, NEW_REQUEST_ID), "cleanup-first exit claims after both gates");
+  }
+
+  private static void callerResultCompletionContractMatchesStremio() {
+    require(
+        "com.mxtech.intent.result.VIEW".equals(
+            ExternalPlayerResultCoordinator.CALLER_RESULT_ACTION),
+        "Stremio completion uses its explicit MX-style result contract");
+    require(
+        "playback_completion".equals(ExternalPlayerResultCoordinator.callerEndReason(true)),
+        "natural completion advances Stremio's next-video flow");
+    require(
+        "user".equals(ExternalPlayerResultCoordinator.callerEndReason(false)),
+        "manual Back returns without advancing");
   }
 
   private static void duplicateTerminalRaceIsOneShot() throws Exception {
@@ -1294,6 +1333,8 @@ public final class ExternalPlayerResultCoordinatorTest {
     warmTaskNewerLaunchFencesQueuedControllerCallback();
     warmTaskRetryCannotAttachToNewerSameLifecycleLaunch();
     warmTaskDuplicateCallbacksAndNewerLaunchStayFenced();
+    processExitRequiresCallerAndNativeCleanup();
+    callerResultCompletionContractMatchesStremio();
     for (int i = 0; i < 5000; ++i) {
       recreationPreservesForwardingAndExactBinding();
       processDeathRotatesOwnerWithoutStaleReplay();

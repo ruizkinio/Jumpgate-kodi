@@ -2351,13 +2351,15 @@ TEST(TestJumpgateBackCoordinator, Api24Through35RawAndApi36CallbackRawRoutesDisp
   EXPECT_EQ(api36.OnApi36BackInvoked(), Action::CONSUME);
 }
 
-TEST(TestJumpgateBackCoordinator, ExternalBackDecisionIsOsdFirstThenCancelThenStop)
+TEST(TestJumpgateBackCoordinator, ExternalBackDecisionUnwindsKodiUiBeforeCancelOrStop)
 {
   using Decision = JumpgateExternalBackDecision;
-  EXPECT_EQ(SelectJumpgateExternalBackDecision(true, true), Decision::DISMISS_OSD);
-  EXPECT_EQ(SelectJumpgateExternalBackDecision(true, false), Decision::DISMISS_OSD);
-  EXPECT_EQ(SelectJumpgateExternalBackDecision(false, true), Decision::CANCEL_PENDING);
-  EXPECT_EQ(SelectJumpgateExternalBackDecision(false, false), Decision::STOP_PLAYBACK);
+  EXPECT_EQ(SelectJumpgateExternalBackDecision(true, true, true), Decision::NAVIGATE_KODI_UI);
+  EXPECT_EQ(SelectJumpgateExternalBackDecision(true, true, false), Decision::NAVIGATE_KODI_UI);
+  EXPECT_EQ(SelectJumpgateExternalBackDecision(false, true, true), Decision::DISMISS_OSD);
+  EXPECT_EQ(SelectJumpgateExternalBackDecision(false, true, false), Decision::DISMISS_OSD);
+  EXPECT_EQ(SelectJumpgateExternalBackDecision(false, false, true), Decision::CANCEL_PENDING);
+  EXPECT_EQ(SelectJumpgateExternalBackDecision(false, false, false), Decision::STOP_PLAYBACK);
 }
 
 TEST(TestJumpgateBackCoordinator, StandaloneApi36ButtonEmitsOneExplicitLongpressCommand)

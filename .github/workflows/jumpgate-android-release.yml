@@ -2032,12 +2032,27 @@ jobs:
             }
 
             async function assertFinalReleaseState(originalRelease, expectedAssets) {
+              const retryableStatuses = new Set([404, 409, 500, 502, 503, 504]);
+              const attempts = 7;
               let observed;
-              try {
-                const response = await github.rest.repos.getReleaseByTag({owner, repo, tag});
-                observed = response.data;
-              } catch (error) {
-                throw new Error('Unable to revalidate the original draft release after asset upload');
+              for (let attempt = 0; attempt < attempts; attempt += 1) {
+                try {
+                  const response = await github.rest.repos.getRelease({
+                    owner,
+                    repo,
+                    release_id: originalRelease.id,
+                  });
+                  observed = response.data;
+                  break;
+                } catch (error) {
+                  if (attempt + 1 >= attempts || !retryableStatuses.has(error.status)) {
+                    throw new Error(
+                      'Unable to revalidate the original draft release after asset upload',
+                    );
+                  }
+                  const delayMs = Math.min(250 * (2 ** attempt), 2000);
+                  await new Promise((resolve) => setTimeout(resolve, delayMs));
+                }
               }
               assertExpectedReleaseIdentity(observed);
               if (

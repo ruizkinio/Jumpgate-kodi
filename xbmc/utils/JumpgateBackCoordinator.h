@@ -107,13 +107,17 @@ private:
 enum class JumpgateExternalBackDecision
 {
   DISMISS_OSD,
+  NAVIGATE_KODI_UI,
   CANCEL_PENDING,
   STOP_PLAYBACK,
 };
 
-constexpr JumpgateExternalBackDecision SelectJumpgateExternalBackDecision(bool osdVisible,
+constexpr JumpgateExternalBackDecision SelectJumpgateExternalBackDecision(bool nestedKodiUiVisible,
+                                                                          bool osdVisible,
                                                                           bool playbackPending)
 {
+  if (nestedKodiUiVisible)
+    return JumpgateExternalBackDecision::NAVIGATE_KODI_UI;
   if (osdVisible)
     return JumpgateExternalBackDecision::DISMISS_OSD;
   return playbackPending ? JumpgateExternalBackDecision::CANCEL_PENDING

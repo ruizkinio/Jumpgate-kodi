@@ -143,19 +143,17 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
   private class DelayedIntent
   {
     public final Intent mIntent;
-    public final int mDelay;
     public final long mLifecycleToken;
     public final String mPreparedRequestId;
 
-    public DelayedIntent(
-        Intent intent, int delay, long lifecycleToken, String preparedRequestId) {
+    public DelayedIntent(Intent intent, long lifecycleToken, String preparedRequestId) {
       mIntent = intent;
-      mDelay = delay;
       mLifecycleToken = lifecycleToken;
       mPreparedRequestId = preparedRequestId == null ? "" : preparedRequestId;
     }
   }
   private ArrayList<DelayedIntent> mDelayedIntents = new ArrayList<>();
+  private boolean mNativeIntentReady = false;
   private boolean mPaused = true;
   private static boolean mActivityRunning = false;
 
@@ -331,14 +329,12 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
         new XBMCSettingsContentObserver(this, handler, mBackLifecycleToken);
     getApplicationContext().getContentResolver().registerContentObserver(android.provider.Settings.System.CONTENT_URI, true, mSettingsContentObserver);
 
-    // Delayed Intent — wait for native engine to initialize before dispatching media URL
-    // External player mode skips addon migration/library scan, so it initializes faster
+    // Native publishes readiness after Kodi's application and messenger are initialized.
     if (getIntent().getData() != null)
     {
-      int delay = mExternalPlayerMode ? 2000 : 5000;
       mDelayedIntents.add(
           new DelayedIntent(
-              new Intent(getIntent()), delay, mBackLifecycleToken, initialRequestId));
+              new Intent(getIntent()), mBackLifecycleToken, initialRequestId));
       getIntent().setData(null);
     }
 
@@ -453,8 +449,8 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
       Log.d(TAG, "Main: Loading overlay shown (warm transition)");
     }
 
-    // Delay until after Resume
-    if (mPaused)
+    // Queue until both Android resume and native application readiness are proven.
+    if (mPaused || !mNativeIntentReady)
     {
       Log.d(TAG, "Main: onNewIntent (delayed)");
       if (isActionView && !wasAlreadyExternal)
@@ -464,7 +460,6 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
       mDelayedIntents.add(
           new DelayedIntent(
               new Intent(intent),
-              500,
               mBackLifecycleToken,
               isActionView ? externalRequestId : ""));
     }
@@ -532,29 +527,34 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
       mPendingWasStandalone = false;
       Log.d(TAG, "Main: Warm transition to external player mode (delayed, standalone was running)");
     }
-    for (final DelayedIntent delayedIntent : mDelayedIntents)
-    {
-      handler.postDelayed(new Runnable()
-      {
-        @Override
-        public void run()
-        {
-          try
-          {
-            _onNewIntent(
-                delayedIntent.mLifecycleToken,
-                delayedIntent.mIntent,
-                delayedIntent.mPreparedRequestId);
-          }
-          catch (UnsatisfiedLinkError e)
-          {
-            Log.e(TAG, "Main: Native not registered");
-          }
-        }
-      }, delayedIntent.mDelay);
-    }
-    mDelayedIntents.clear();
     mPaused = false;
+    dispatchPendingNativeIntents();
+  }
+
+  /** Called by native after the application messenger can accept exact playback work. */
+  public void onNativeIntentReady(long lifecycleToken) {
+    runOnUiThread(
+        () -> {
+          if (lifecycleToken == 0 || lifecycleToken != mBackLifecycleToken || isFinishing()) return;
+          mNativeIntentReady = true;
+          dispatchPendingNativeIntents();
+        });
+  }
+
+  private void dispatchPendingNativeIntents() {
+    if (mPaused || !mNativeIntentReady || mDelayedIntents.isEmpty()) return;
+
+    ArrayList<DelayedIntent> ready = new ArrayList<>(mDelayedIntents);
+    mDelayedIntents.clear();
+    for (DelayedIntent pending : ready) {
+      try {
+        _onNewIntent(pending.mLifecycleToken, pending.mIntent, pending.mPreparedRequestId);
+      } catch (UnsatisfiedLinkError e) {
+        Log.e(TAG, "Main: Native intent target disappeared", e);
+        postDeferredExternalPlayerRejection(
+            pending.mLifecycleToken, pending.mPreparedRequestId);
+      }
+    }
   }
 
   @Override
@@ -1025,7 +1025,7 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
       // requested finish. Until that exact acknowledgement, keep the process alive so recreation
       // can consume the durable terminal.
       mExternalPlayerMode = false;
-      finish();
+      finishColdExternalPlayerTask();
       if (callerAlreadyCanceled && canceledExitAcknowledged)
         scheduleExternalPlayerProcessExit(generation, requestId);
     }
@@ -1124,6 +1124,37 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
                 android.os.Process.killProcess(android.os.Process.myPid());
               });
         });
+  }
+
+  private void finishColdExternalPlayerTask() {
+    runOnUiThread(
+        () -> {
+          if (mMainView != null) mMainView.setVisibility(View.INVISIBLE);
+          if (mDecorView != null) mDecorView.setBackgroundColor(Color.BLACK);
+          if (isTaskRoot()) finishAndRemoveTask();
+          else finish();
+        });
+  }
+
+  /** Called only after the native event loop and decoder teardown have completed. */
+  public void markExternalPlayerCleanupReady(long generation, String requestId) {
+    if (!ExternalPlayerResultStore.markProcessCleanupReady(this, requestId, generation)) return;
+    scheduleAcknowledgedProcessExit(generation, requestId);
+  }
+
+  private void scheduleAcknowledgedProcessExit(long generation, String requestId) {
+    final long exactGeneration = generation;
+    final String exactRequestId = requestId;
+    handler.post(
+        () ->
+            ExternalPlayerResultStore.executeAcknowledgedProcessExit(
+                Main.this,
+                exactRequestId,
+                exactGeneration,
+                () -> {
+                  Log.d(TAG, "Main: Killing process after native cleanup and caller result");
+                  android.os.Process.killProcess(android.os.Process.myPid());
+                }));
   }
 
   /**

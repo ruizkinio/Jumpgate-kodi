@@ -573,7 +573,11 @@ void CAndroidJumpgateSubtitleController::Process(const JumpgateSubtitleBinding& 
     const auto appPlayer = CServiceBroker::GetAppComponents().GetComponent<CApplicationPlayer>();
     if (!appPlayer)
       return;
-    injector = [appPlayer](const std::string& path) { appPlayer->AddSubtitle(path); };
+    injector = [appPlayer](const std::string& path)
+    {
+      appPlayer->AddSubtitle(path);
+      appPlayer->SetSubtitleVisible(true);
+    };
   }
 
   std::optional<AndroidJumpgateStagedArtifact> injection;
