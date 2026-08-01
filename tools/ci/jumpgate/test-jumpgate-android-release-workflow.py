@@ -709,6 +709,7 @@ for name, expected in (
 publish_script = str(publish_step.get("with", {}).get("script", ""))
 publish_text = "\n".join(value for _, value in strings(jobs["publish_draft_release"]))
 for required_create_only_token in (
+    "github.rest.repos.getRelease({",
     "getReleaseByTag",
     "getReleaseAsset",
     "getRef",
@@ -753,6 +754,7 @@ for required_create_only_token in (
     "publicationPhase = 'post-upload-revalidation'",
     "assertReviewedRefBinding('after final asset upload')",
     "assertFinalReleaseState(release, expectedAssets)",
+    "release_id: originalRelease.id",
     "observed.id !== originalRelease.id",
     "observed.html_url !== originalRelease.html_url",
     "releaseState.tag_name !== tag",
@@ -823,6 +825,7 @@ require(
         "repos.createRelease",
         "repos.deleteRelease",
         "repos.get",
+        "repos.getRelease",
         "repos.getReleaseAsset",
         "repos.getReleaseByTag",
         "repos.getRepoRuleset",
@@ -854,8 +857,10 @@ require(publish_script.count("await assertRepositorySource();") == 3,
         "default/source head must be revalidated before tag creation, release creation, and success")
 require(publish_script.count("await assertOwnedTag();") == 3,
         "owned tag checks must cover createRef ambiguity, release creation, and final success")
-require(publish_script.count("github.rest.repos.getReleaseByTag") == 2,
-        "release lookup must cover initial absence and one terminal identity/asset snapshot")
+require(publish_script.count("github.rest.repos.getReleaseByTag({") == 1,
+        "tag lookup must be limited to initial absence and recovery helpers")
+require(publish_script.count("github.rest.repos.getRelease({") == 1,
+        "terminal identity and asset validation must use one exact release-ID lookup")
 
 create_tag_index = publish_script.index("const tagObjectResponse = await github.rest.git.createTag({")
 create_ref_index = publish_script.index("await github.rest.git.createRef({", create_tag_index)
@@ -1040,6 +1045,7 @@ async function runScenario(scenario) {
     defaultHead: 0,
     deleteRef: 0,
     deleteRelease: 0,
+    getRelease: 0,
     getReleaseByTag: 0,
     getReleaseAsset: 0,
     getRepoRuleset: 0,
@@ -1053,6 +1059,7 @@ async function runScenario(scenario) {
   };
   const logs = {error: [], warning: []};
   const outputs = {};
+  const retryDelays = [];
   let release = null;
   let releaseTagRef = null;
   let ownedMessage = null;
@@ -1151,8 +1158,26 @@ async function runScenario(scenario) {
     },
     async getReleaseByTag() {
       calls.getReleaseByTag += 1;
-      applyPostUploadReleaseMutation();
       if (release === null) throw apiError(404, 'release not found');
+      return {data: clone(release)};
+    },
+    async getRelease({release_id: releaseId}) {
+      calls.getRelease += 1;
+      applyPostUploadReleaseMutation();
+      if (scenario === 'post_upload_release_lookup_transient') {
+        if (calls.getRelease === 1) throw apiError(404, 'simulated transient release absence');
+        if (calls.getRelease === 2) throw apiError(502, 'simulated transient release lookup');
+      } else if (scenario === 'post_upload_release_lookup_failure') {
+        throw apiError(502, 'simulated persistent release lookup failure');
+      } else if (scenario === 'post_upload_release_lookup_forbidden') {
+        throw apiError(403, 'simulated non-retryable release lookup failure');
+      } else if (scenario === 'post_upload_release_id_mismatch') {
+        const observed = protectedRelease(88, 'https://example.invalid/recreated', release.assets);
+        return {data: observed};
+      }
+      if (release === null || release.id !== releaseId) {
+        throw apiError(404, 'release not found');
+      }
       return {data: clone(release)};
     },
     async getReleaseAsset({asset_id: assetId}) {
@@ -1415,7 +1440,8 @@ async function runScenario(scenario) {
   let ok = false;
   let error = null;
   try {
-    await execute(github, context, core, require, process, (callback) => {
+    await execute(github, context, core, require, process, (callback, delay) => {
+      retryDelays.push(delay);
       callback();
       return 0;
     });
@@ -1430,6 +1456,7 @@ async function runScenario(scenario) {
     calls,
     logs,
     outputs,
+    retryDelays,
     releaseExists: release !== null,
     releaseDraft: release && release.draft,
     releaseId: release && release.id,
@@ -1506,6 +1533,10 @@ publication_scenarios = [
     "post_upload_release_recreated",
     "post_upload_release_draft_mutated",
     "post_upload_release_state_mutated",
+    "post_upload_release_lookup_transient",
+    "post_upload_release_lookup_failure",
+    "post_upload_release_lookup_forbidden",
+    "post_upload_release_id_mismatch",
     "post_upload_asset_id_replaced",
     "post_upload_asset_size_mutated",
     "post_upload_asset_digest_mutated",
@@ -1525,8 +1556,14 @@ publication_scenarios = [
 ]
 publication_results = run_publication_scenarios(publication_scenarios)
 
-for stable_scenario in ("stable", "ambiguous_create_ref"):
+for stable_scenario in (
+    "stable",
+    "ambiguous_create_ref",
+    "post_upload_release_lookup_transient",
+):
     result = publication_results[stable_scenario]
+    expected_release_reads = 3 if stable_scenario == "post_upload_release_lookup_transient" else 1
+    expected_retry_delays = [250, 500] if stable_scenario == "post_upload_release_lookup_transient" else []
     require(result["ok"], f"{stable_scenario} publication failed: {result['error']}")
     require(result["calls"]["createTag"] == 1 and result["calls"]["createRelease"] == 1,
             f"{stable_scenario} did not create one annotated tag and release")
@@ -1540,9 +1577,12 @@ for stable_scenario in ("stable", "ambiguous_create_ref"):
         and result["calls"]["rulesets"] == 3
         and result["calls"]["getRepoRuleset"] == 3
         and result["calls"]["reviewedRef"] == 3
-        and result["calls"]["getReleaseByTag"] == 2,
+        and result["calls"]["getReleaseByTag"] == 1
+        and result["calls"]["getRelease"] == expected_release_reads,
         f"{stable_scenario} did not execute every terminal revalidation exactly once",
     )
+    require(result["retryDelays"] == expected_retry_delays,
+            f"{stable_scenario} release lookup retry schedule drifted")
     expected_release_ref_reads = 4 if stable_scenario == "ambiguous_create_ref" else 3
     require(result["calls"]["releaseTagRef"] == expected_release_ref_reads,
             f"{stable_scenario} release-tag ownership call count drifted")
@@ -1589,9 +1629,12 @@ expected_publication_failures = {
     "post_upload_reviewed_tag_replaced": "Reviewed tag moved after final asset upload",
     "post_upload_ruleset_mutated": "Dedicated release App ruleset drifted",
     "post_upload_release_deleted": "Unable to revalidate the original draft release after asset upload",
-    "post_upload_release_recreated": "Original draft release was deleted or replaced after asset upload",
+    "post_upload_release_recreated": "Unable to revalidate the original draft release after asset upload",
     "post_upload_release_draft_mutated": "GitHub returned an unexpected protected draft release identity or state",
     "post_upload_release_state_mutated": "GitHub returned an unexpected protected draft release identity or state",
+    "post_upload_release_lookup_failure": "Unable to revalidate the original draft release after asset upload",
+    "post_upload_release_lookup_forbidden": "Unable to revalidate the original draft release after asset upload",
+    "post_upload_release_id_mismatch": "Original draft release was deleted or replaced after asset upload",
     "post_upload_asset_id_replaced": "Final release asset binding changed after upload",
     "post_upload_asset_size_mutated": "Final release asset binding changed after upload",
     "post_upload_asset_digest_mutated": "Final release asset binding changed after upload",
@@ -1658,6 +1701,9 @@ manual_reconciliation_reasons = {
     "post_upload_release_recreated": "post-upload-revalidation",
     "post_upload_release_draft_mutated": "post-upload-revalidation",
     "post_upload_release_state_mutated": "post-upload-revalidation",
+    "post_upload_release_lookup_failure": "post-upload-revalidation",
+    "post_upload_release_lookup_forbidden": "post-upload-revalidation",
+    "post_upload_release_id_mismatch": "post-upload-revalidation",
     "post_upload_asset_id_replaced": "post-upload-revalidation",
     "post_upload_asset_size_mutated": "post-upload-revalidation",
     "post_upload_asset_digest_mutated": "post-upload-revalidation",
@@ -1701,6 +1747,9 @@ post_upload_failures = {
     "post_upload_release_recreated",
     "post_upload_release_draft_mutated",
     "post_upload_release_state_mutated",
+    "post_upload_release_lookup_failure",
+    "post_upload_release_lookup_forbidden",
+    "post_upload_release_id_mismatch",
     "post_upload_asset_id_replaced",
     "post_upload_asset_size_mutated",
     "post_upload_asset_digest_mutated",
@@ -1725,21 +1774,40 @@ require(publication_results["post_upload_owned_tag_replaced"]["calls"]["releaseT
         "post-upload owned-tag fixture missed the terminal ownership check")
 require(publication_results["post_upload_reviewed_tag_replaced"]["calls"]["reviewedRef"] == 3,
         "post-upload reviewed-ref fixture missed the terminal binding check")
+terminal_release_read_counts = {
+    "post_upload_release_deleted": 7,
+    "post_upload_release_recreated": 7,
+    "post_upload_release_draft_mutated": 1,
+    "post_upload_release_state_mutated": 1,
+    "post_upload_release_lookup_failure": 7,
+    "post_upload_release_lookup_forbidden": 1,
+    "post_upload_release_id_mismatch": 1,
+    "post_upload_asset_id_replaced": 1,
+    "post_upload_asset_size_mutated": 1,
+    "post_upload_asset_digest_mutated": 1,
+    "post_upload_asset_content_type_mutated": 1,
+    "post_upload_asset_state_mutated": 1,
+    "post_upload_asset_extra": 1,
+    "post_upload_asset_missing": 1,
+}
+for scenario, expected_reads in terminal_release_read_counts.items():
+    result = publication_results[scenario]
+    require(result["calls"]["getReleaseByTag"] == 1,
+            f"{scenario} repeated a tag-based release lookup after creation")
+    require(result["calls"]["getRelease"] == expected_reads,
+            f"{scenario} missed its bounded exact-ID terminal release snapshot")
+
+full_release_retry_delays = [250, 500, 1000, 2000, 2000, 2000]
 for scenario in (
     "post_upload_release_deleted",
     "post_upload_release_recreated",
-    "post_upload_release_draft_mutated",
-    "post_upload_release_state_mutated",
-    "post_upload_asset_id_replaced",
-    "post_upload_asset_size_mutated",
-    "post_upload_asset_digest_mutated",
-    "post_upload_asset_content_type_mutated",
-    "post_upload_asset_state_mutated",
-    "post_upload_asset_extra",
-    "post_upload_asset_missing",
+    "post_upload_release_lookup_failure",
 ):
-    require(publication_results[scenario]["calls"]["getReleaseByTag"] == 2,
-            f"{scenario} missed the terminal release snapshot")
+    require(publication_results[scenario]["retryDelays"] == full_release_retry_delays,
+            f"{scenario} exact-ID retry schedule drifted")
+for scenario in ("post_upload_release_lookup_forbidden", "post_upload_release_id_mismatch"):
+    require(not publication_results[scenario]["retryDelays"],
+            f"{scenario} retried a non-retryable terminal result")
 require(publication_results["post_upload_owned_tag_replaced"]["tagObjectSha"] == "f" * 40,
         "post-upload replacement tag was not preserved")
 for scenario in post_upload_failures - {
