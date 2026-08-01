@@ -129,6 +129,9 @@ GTEST_DECLARATION = re.compile(
 )
 CMAKE_VARIABLE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 MANAGER_MANIFEST = ROOT / "addons" / "script.jumpgate.manager" / "addon.xml"
+ESTUARY_HOME = ROOT / "addons" / "skin.estuary" / "xml" / "Home.xml"
+ESTUARY_TIMERS = ROOT / "addons" / "skin.estuary" / "xml" / "Timers.xml"
+ESTUARY_VARIABLES = ROOT / "addons" / "skin.estuary" / "xml" / "Variables.xml"
 RELEASE_POLICY_FILES = (
     (ROOT / ".github" / "workflows" / "jumpgate-android-release.yml", False),
     (
@@ -143,6 +146,67 @@ RELEASE_POLICY_FILES = (
     (ROOT / "tools" / "ci" / "jumpgate" / "verify-android-release.sh", True),
     (ROOT / "tools" / "ci" / "jumpgate" / "test-verify-android-release.sh", True),
 )
+
+
+def verify_estuary_osd_defaults():
+    marker_condition = "!Skin.HasSetting(JumpgateOSDDefaultsInitialized)"
+    expected_onloads = (
+        "Skin.SetBool(OSDAutoClose,true)",
+        "Skin.SetString(OSDAutoCloseTime,5)",
+        "Skin.SetBool(JumpgateOSDDefaultsInitialized,true)",
+    )
+    home = ET.parse(ESTUARY_HOME).getroot()
+    guarded_onloads = [
+        (node.text or "").strip()
+        for node in home.findall("onload")
+        if node.get("condition") == marker_condition
+    ]
+    if guarded_onloads != list(expected_onloads):
+        raise AssertionError(
+            "Estuary must initialize the five-second OSD default once, then fence user overrides"
+        )
+
+    timers = ET.parse(ESTUARY_TIMERS).getroot()
+    osd_timer = next(
+        (
+            timer
+            for timer in timers.findall("timer")
+            if (timer.findtext("name") or "").strip() == "autoclosevideoosd"
+        ),
+        None,
+    )
+    if osd_timer is None:
+        raise AssertionError("Estuary video OSD auto-close timer is missing")
+    stop_condition = (osd_timer.findtext("stop") or "").strip()
+    if (
+        "String.IsEmpty(Skin.String(OSDAutoCloseTime))"
+        " + Integer.IsGreaterOrEqual(Skin.TimerElapsedSecs(autoclosevideoosd), 5)"
+        not in stop_condition
+    ):
+        raise AssertionError("Estuary OSD timer fallback is not five seconds")
+
+    variables = ET.parse(ESTUARY_VARIABLES).getroot()
+    osd_variable = next(
+        (
+            variable
+            for variable in variables.findall("variable")
+            if variable.get("name") == "SkinSettingOSDAutoCloseTime"
+        ),
+        None,
+    )
+    if osd_variable is None:
+        raise AssertionError("Estuary OSD timeout display variable is missing")
+    empty_default = next(
+        (
+            (value.text or "").strip()
+            for value in osd_variable.findall("value")
+            if value.get("condition")
+            == "String.IsEmpty(Skin.String(OSDAutoCloseTime))"
+        ),
+        None,
+    )
+    if empty_default != "5":
+        raise AssertionError("Estuary OSD timeout display default is not five seconds")
 
 
 def derive_android_version_code(source):
@@ -3121,6 +3185,7 @@ def main(arguments):
 
     verify_release_policy_spdx()
     verify_version_code_boundaries()
+    verify_estuary_osd_defaults()
     verify_identity()
     verify_package_derivation()
     verify_libandroidjni_intent_patch_contract()

@@ -1,5 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <window>
+	<onload condition="!Skin.HasSetting(JumpgateOSDDefaultsInitialized)">Skin.SetBool(OSDAutoClose,true)</onload>
+	<onload condition="!Skin.HasSetting(JumpgateOSDDefaultsInitialized)">Skin.SetString(OSDAutoCloseTime,5)</onload>
+	<onload condition="!Skin.HasSetting(JumpgateOSDDefaultsInitialized)">Skin.SetBool(JumpgateOSDDefaultsInitialized,true)</onload>
 	<defaultcontrol>9000</defaultcontrol>
 	<backgroundcolor>background</backgroundcolor>
 	<controls>
