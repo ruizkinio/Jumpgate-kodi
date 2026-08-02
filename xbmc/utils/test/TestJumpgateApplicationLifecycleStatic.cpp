@@ -398,6 +398,10 @@ TEST(TestJumpgateApplicationLifecycleStatic,
   EXPECT_NE(show.find("overlay.setElevation("), std::string::npos);
   EXPECT_NE(show.find("overlay.bringToFront()"), std::string::npos);
   EXPECT_NE(show.find("resumeLoadingOverlayAnimations"), std::string::npos);
+  EXPECT_NE(main.find("LoadingPortalSurfaceView extends SurfaceView"), std::string::npos);
+  EXPECT_NE(main.find("setZOrderOnTop(true)"), std::string::npos);
+  EXPECT_NE(main.find("getHolder().lockHardwareCanvas()"), std::string::npos);
+  EXPECT_NE(main.find("scene.draw(canvas)"), std::string::npos);
   EXPECT_EQ(show.find("WindowManager"), std::string::npos);
   EXPECT_EQ(main.find("mWindowManager"), std::string::npos);
   EXPECT_NE(hide.find("parent instanceof ViewGroup"), std::string::npos);

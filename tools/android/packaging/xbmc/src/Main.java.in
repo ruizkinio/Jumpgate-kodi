@@ -11,6 +11,8 @@ import android.content.Intent;
 import android.content.pm.ResolveInfo;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.graphics.Canvas;
+import android.graphics.PixelFormat;
 import android.graphics.Rect;
 import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.GradientDrawable;
@@ -29,6 +31,8 @@ import android.util.TypedValue;
 import android.graphics.Color;
 import android.view.Choreographer;
 import android.view.Gravity;
+import android.view.SurfaceHolder;
+import android.view.SurfaceView;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.ViewParent;
@@ -70,6 +74,7 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
   private static final int OVERLAY_ARTWORK_MAX_DIMENSION = 4096;
   private static final long OVERLAY_ARTWORK_MAX_PIXELS = 16L * 1024L * 1024L;
   private static final int OVERLAY_ARTWORK_MAX_REDIRECTS = 2;
+  private static final long OVERLAY_SURFACE_FRAME_MS = 33L;
   private static final LruCache<String, Bitmap> sOverlayArtworkCache =
       new LruCache<String, Bitmap>(OVERLAY_ARTWORK_CACHE_KB) {
     @Override
@@ -125,8 +130,10 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
   // Pending flag for delayed intents: set to true so when delayed intent fires, mWasStandalone is set.
   private boolean mPendingWasStandalone = false;
 
-  // Loading overlay: one activity window, composited above XBMCMainView's SurfaceView.
+  // Loading overlay: one activity window with a child surface above Kodi's GUI surface.
   private View mLoadingOverlay = null;
+  private FrameLayout mLoadingPortalScene = null;
+  private LoadingPortalSurfaceView mLoadingPortalSurface = null;
   private ImageView mOverlayBackdropView = null;
   private View mOverlayLogoPulseContainer = null;
   private View mOverlayProgressFill = null;
@@ -1166,6 +1173,105 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
   }
 
   /**
+   * Mirrors the ordinary Android portal scene into a child SurfaceView. Kodi's GUI SurfaceView is
+   * intentionally above the activity window so it can composite OSD over video; ordinary sibling
+   * views therefore cannot cover it. This surface stays in the same activity/window while giving
+   * the transition an explicit compositor layer above Kodi.
+   */
+  private final class LoadingPortalSurfaceView extends SurfaceView
+      implements SurfaceHolder.Callback {
+    private boolean mSurfaceReady = false;
+    private boolean mRendering = false;
+    private final Runnable mRenderFrame = new Runnable() {
+      @Override
+      public void run() {
+        if (!mRendering || !mSurfaceReady || mLoadingPortalSurface != LoadingPortalSurfaceView.this)
+          return;
+
+        drawPortalFrame();
+        handler.postDelayed(this, OVERLAY_SURFACE_FRAME_MS);
+      }
+    };
+
+    LoadingPortalSurfaceView() {
+      super(Main.this);
+      setZOrderOnTop(true);
+      setElevation(mMainView != null ? mMainView.getElevation() + 2f : 3f);
+      getHolder().setFormat(PixelFormat.OPAQUE);
+      getHolder().addCallback(this);
+    }
+
+    void startRendering() {
+      if (mRendering)
+        return;
+
+      mRendering = true;
+      handler.removeCallbacks(mRenderFrame);
+      handler.post(mRenderFrame);
+    }
+
+    void stopRendering() {
+      mRendering = false;
+      handler.removeCallbacks(mRenderFrame);
+    }
+
+    private void drawPortalFrame() {
+      final FrameLayout scene = mLoadingPortalScene;
+      if (scene == null)
+        return;
+
+      Canvas canvas = null;
+      try {
+        canvas = Build.VERSION.SDK_INT >= VERSION_CODES.M
+            ? getHolder().lockHardwareCanvas()
+            : getHolder().lockCanvas();
+        if (canvas == null)
+          return;
+
+        final int width = canvas.getWidth();
+        final int height = canvas.getHeight();
+        if (scene.getWidth() != width || scene.getHeight() != height) {
+          final int widthSpec = View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY);
+          final int heightSpec = View.MeasureSpec.makeMeasureSpec(height, View.MeasureSpec.EXACTLY);
+          scene.measure(widthSpec, heightSpec);
+          scene.layout(0, 0, width, height);
+        }
+        canvas.drawColor(Color.BLACK);
+        scene.draw(canvas);
+      } catch (IllegalArgumentException | IllegalStateException error) {
+        Log.w(TAG, "Main: Loading portal surface frame unavailable", error);
+      } finally {
+        if (canvas != null) {
+          try {
+            getHolder().unlockCanvasAndPost(canvas);
+          } catch (IllegalArgumentException | IllegalStateException error) {
+            Log.w(TAG, "Main: Loading portal surface frame could not be posted", error);
+          }
+        }
+      }
+    }
+
+    @Override
+    public void surfaceCreated(SurfaceHolder holder) {
+      mSurfaceReady = true;
+      if (!mPaused)
+        startRendering();
+    }
+
+    @Override
+    public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
+      if (mSurfaceReady)
+        drawPortalFrame();
+    }
+
+    @Override
+    public void surfaceDestroyed(SurfaceHolder holder) {
+      mSurfaceReady = false;
+      stopRendering();
+    }
+  }
+
+  /**
    * Shows a Stremio-shaped Jumpgate transition above the SurfaceView.
    * The source claim supplies optional artwork after the black first frame is already visible.
    */
@@ -1181,13 +1287,18 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
     }
 
     FrameLayout overlay = new FrameLayout(this);
-    overlay.setBackgroundColor(Color.BLACK);
     overlay.setElevation(mMainView != null ? mMainView.getElevation() + 1f : 2f);
+
+    FrameLayout portalScene = new FrameLayout(this);
+    portalScene.setBackgroundColor(Color.BLACK);
+    overlay.addView(portalScene, new FrameLayout.LayoutParams(
+        FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+    mLoadingPortalScene = portalScene;
 
     ImageView backdropView = new ImageView(this);
     backdropView.setScaleType(ImageView.ScaleType.CENTER_CROP);
     backdropView.setAlpha(0f);
-    overlay.addView(backdropView, new FrameLayout.LayoutParams(
+    portalScene.addView(backdropView, new FrameLayout.LayoutParams(
         FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
     mOverlayBackdropView = backdropView;
 
@@ -1201,7 +1312,7 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
     FrameLayout.LayoutParams indicatorParams = new FrameLayout.LayoutParams(dp(248), dp(46));
     indicatorParams.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
     indicatorParams.topMargin = dp(24);
-    overlay.addView(portalIndicator, indicatorParams);
+    portalScene.addView(portalIndicator, indicatorParams);
 
     TextView indicatorLabel = new TextView(this);
     indicatorLabel.setText("JUMPGATE LOADING");
@@ -1244,7 +1355,7 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
     FrameLayout pulseContainer = new FrameLayout(this);
     FrameLayout.LayoutParams pulseParams = new FrameLayout.LayoutParams(dp(200), dp(80));
     pulseParams.gravity = Gravity.CENTER;
-    overlay.addView(pulseContainer, pulseParams);
+    portalScene.addView(pulseContainer, pulseParams);
     mOverlayLogoPulseContainer = pulseContainer;
 
     ImageView logoView = new ImageView(this);
@@ -1264,7 +1375,7 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
     detailsParams.leftMargin = dp(32);
     detailsParams.rightMargin = dp(32);
     details.setTranslationY(dp(104));
-    overlay.addView(details, detailsParams);
+    portalScene.addView(details, detailsParams);
 
     TextView title = new TextView(this);
     title.setTextColor(Color.WHITE);
@@ -1304,6 +1415,12 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
     setLoadingOverlayStatus("Opening selected stream...");
     setLoadingOverlayProgress(8);
 
+    LoadingPortalSurfaceView portalSurface = new LoadingPortalSurfaceView();
+    overlay.addView(portalSurface, new FrameLayout.LayoutParams(
+        FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+    portalSurface.bringToFront();
+    mLoadingPortalSurface = portalSurface;
+
     ViewGroup contentRoot = findViewById(android.R.id.content);
     if (contentRoot == null) {
       Log.e(TAG, "Main: Cannot show loading portal without an activity content root");
@@ -1327,10 +1444,15 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
     runOnUiThread(() -> {
       pauseLoadingOverlayAnimations();
       final View overlay = mLoadingOverlay;
+      final LoadingPortalSurfaceView portalSurface = mLoadingPortalSurface;
       clearLoadingOverlayReferences();
 
       if (overlay != null) {
         overlay.animate().cancel();
+        if (portalSurface != null) {
+          portalSurface.animate().cancel();
+          portalSurface.animate().alpha(0f).setDuration(140L).start();
+        }
         overlay.animate().alpha(0f).setDuration(140L).withEndAction(() -> {
           ViewParent parent = overlay.getParent();
           if (parent instanceof ViewGroup)
@@ -1343,6 +1465,8 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
 
   private void clearLoadingOverlayReferences() {
     mLoadingOverlay = null;
+    mLoadingPortalScene = null;
+    mLoadingPortalSurface = null;
     mOverlayLogoRequestId = nextOverlayArtworkRequestId();
     mOverlayBackgroundRequestId = nextOverlayArtworkRequestId();
     mOverlayBackdropView = null;
@@ -1360,11 +1484,14 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
   private void detachLoadingOverlayImmediately() {
     pauseLoadingOverlayAnimations();
     final View overlay = mLoadingOverlay;
+    final LoadingPortalSurfaceView portalSurface = mLoadingPortalSurface;
     clearLoadingOverlayReferences();
     if (overlay == null)
       return;
 
     overlay.animate().cancel();
+    if (portalSurface != null)
+      portalSurface.animate().cancel();
     ViewParent parent = overlay.getParent();
     if (parent instanceof ViewGroup)
       ((ViewGroup) parent).removeView(overlay);
@@ -1374,11 +1501,15 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
     if (mLoadingOverlay == null || mPaused || !mLoadingOverlay.isAttachedToWindow())
       return;
 
+    if (mLoadingPortalSurface != null)
+      mLoadingPortalSurface.startRendering();
     startLoadingOverlayAnimations();
     startLoadingOverlayProgressTicker();
   }
 
   private void pauseLoadingOverlayAnimations() {
+    if (mLoadingPortalSurface != null)
+      mLoadingPortalSurface.stopRendering();
     if (mOverlayProgressRunnable != null) {
       handler.removeCallbacks(mOverlayProgressRunnable);
       mOverlayProgressRunnable = null;
