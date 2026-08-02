@@ -165,6 +165,7 @@ ESTUARY_SYSTEM_INFO = ROOT / "addons" / "skin.estuary" / "xml" / "SettingsSystem
 CHORUS_ROOT = ROOT / "addons" / "webinterface.default"
 CHORUS_LOCALES = CHORUS_ROOT / "lang" / "_strings"
 CHORUS_BUNDLE = CHORUS_ROOT / "js" / "kodi-webinterface.js"
+APK_VERIFIER = ROOT / "tools" / "ci" / "jumpgate" / "verify-android-apk.sh"
 AIRPLAY_SOURCE = ROOT / "xbmc" / "network" / "AirPlayServer.cpp"
 AIRTUNES_SOURCE = ROOT / "xbmc" / "network" / "AirTunesServer.cpp"
 UPNP_SOURCE = ROOT / "xbmc" / "network" / "upnp" / "UPnP.cpp"
@@ -364,6 +365,22 @@ def verify_complete_branding():
                     f"Chorus locale retains user-facing Kodi branding: {locale_path.name}: "
                     f"{display_value!r}"
                 )
+
+    verifier = APK_VERIFIER.read_text(encoding="utf-8")
+    authenticated_catalogs = re.findall(
+        r"'(addons/webinterface\.default/lang/_strings/[^']+\.json)'\s*:\s*"
+        r"'([a-f0-9]{64})'",
+        verifier,
+    )
+    if not authenticated_catalogs:
+        raise AssertionError("APK verifier has no authenticated Chorus locale catalogs")
+    for relative_path, expected_sha256 in authenticated_catalogs:
+        actual_sha256 = hashlib.sha256((ROOT / relative_path).read_bytes()).hexdigest()
+        if actual_sha256 != expected_sha256:
+            raise AssertionError(
+                "APK verifier Chorus catalog hash drifted: "
+                f"{relative_path} expected {expected_sha256}, got {actual_sha256}"
+            )
 
     chorus_bundle = CHORUS_BUNDLE.read_text(encoding="utf-8")
     for runtime_identifier in (
