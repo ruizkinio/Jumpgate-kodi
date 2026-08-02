@@ -2571,9 +2571,18 @@ def verify_warm_task_handoff_contract(
         active_admission,
         "mExternalResultProducer.admitPrepared(generation, requestId)",
         "if (admission == null)",
-        "hideLoadingOverlay()",
+        "hideLoadingOverlayForRequest(requestId)",
         "return true;",
         "cancelPendingWarmTaskHandoff()",
+    )
+    rejection_hide = extract_braced_block(
+        main_activity, "private void hideLoadingOverlayForRequest(String requestId)"
+    )
+    require_in_order(
+        rejection_hide,
+        "ExternalPlayerResultCoordinator.isValidRequestId(requestId)",
+        "requestId.equals(mLoadingOverlayRequestId)",
+        "hideLoadingOverlay()",
     )
     destruction = extract_braced_block(main_activity, "public void onDestroy()")
     require_in_order(
