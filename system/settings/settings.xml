@@ -2220,7 +2220,7 @@
       <group id="1" label="13000">
         <setting id="services.devicename" type="string" label="1271" help="36321">
           <level>0</level>
-          <default>Kodi</default>
+          <default>Jumpgate</default>
           <control type="edit" format="string" />
         </setting>
       </group>
@@ -2273,7 +2273,7 @@
         </setting>
         <setting id="services.webserverusername" type="string" parent="services.webserver" label="1048" help="36330">
           <level>1</level>
-          <default>kodi</default>
+          <default>jumpgate</default>
           <updates>
             <update type="change" />
           </updates>
@@ -3348,7 +3348,7 @@
         </setting>
         <setting id="lookandfeel.soundskin" type="addon" label="24006" help="36110">
           <level>0</level>
-          <default>resource.uisounds.kodi</default>
+          <default>resource.uisounds.jumpgate</default>
           <dependencies>
             <dependency type="enable" setting="audiooutput.guisoundmode" operator="!is">0</dependency>
           </dependencies>

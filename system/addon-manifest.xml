@@ -36,10 +36,10 @@
   <addon>metadata.local</addon>
   <addon>metadata.themoviedb.org.python</addon>
   <addon>metadata.tvshows.themoviedb.org.python</addon>
-  <addon>repository.xbmc.org</addon>
+  <addon>repository.jumpgate.addons</addon>
   <addon>resource.images.weathericons.default</addon>
   <addon>resource.language.en_gb</addon>
-  <addon>resource.uisounds.kodi</addon>
+  <addon>resource.uisounds.jumpgate</addon>
   <addon>screensaver.xbmc.builtin.black</addon>
   <addon>screensaver.xbmc.builtin.dim</addon>
   <addon optional="true">script.jumpgate.manager</addon>
@@ -57,5 +57,4 @@
   <addon optional="true">game.shader.presets</addon>
   <addon optional="true">inputstream.adaptive</addon>
   <addon optional="true">peripheral.joystick</addon>
-  <addon optional="true">service.xbmc.versioncheck</addon>
 </addons>

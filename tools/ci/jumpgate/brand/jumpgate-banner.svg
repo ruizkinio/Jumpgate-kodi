@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="320" height="180" viewBox="0 0 320 180">
+  <defs>
+    <style>
+      @font-face {
+        font-family: "Oxanium";
+        src: url("Oxanium-Variable.ttf") format("truetype");
+        font-weight: 200 800;
+      }
+    </style>
+    <radialGradient id="space" cx="75%" cy="42%" r="82%">
+      <stop offset="0" stop-color="#244c62"/>
+      <stop offset=".5" stop-color="#111f29"/>
+      <stop offset="1" stop-color="#070b0f"/>
+    </radialGradient>
+    <linearGradient id="ice" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#a6efff"/>
+      <stop offset=".48" stop-color="#27b8e5"/>
+      <stop offset="1" stop-color="#036a94"/>
+    </linearGradient>
+  </defs>
+  <rect width="320" height="180" rx="10" fill="url(#space)"/>
+  <g transform="translate(74 90)">
+    <circle r="57" fill="#081017" stroke="#294b5e" stroke-width="6"/>
+    <circle r="48" fill="none" stroke="url(#ice)" stroke-width="5"
+            stroke-dasharray="168 52" transform="rotate(-33)"/>
+    <path d="M-48 0-16-31v17L-31 0l15 14v17zM48 0 16-31v17L31 0 16 14v17z"
+          fill="url(#ice)"/>
+    <path d="M-16-31H4L-9-14h-20zM-16 31H4L-9 14h-20z" fill="#dcf8ff"/>
+    <circle r="4" fill="#f0fdff"/>
+  </g>
+  <g font-family="Oxanium, sans-serif">
+    <text x="145" y="83" fill="#eefaff" font-size="27" font-weight="680"
+          letter-spacing="2">JUMPGATE</text>
+    <text x="147" y="108" fill="#75cde8" font-size="9" font-weight="560"
+          letter-spacing="1.6">EXTERNAL PLAYER</text>
+  </g>
+</svg>

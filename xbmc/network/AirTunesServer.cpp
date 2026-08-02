@@ -11,6 +11,7 @@
 
 #include "AirTunesServer.h"
 
+#include "CompileInfo.h"
 #include "FileItem.h"
 #include "GUIInfoManager.h"
 #include "ServiceBroker.h"
@@ -358,10 +359,10 @@ void CAirTunesServer::AudioOutputFunctions::audio_set_coverart(void *cls, void *
   CAirTunesServer::SetCoverArtFromBuffer((const char *)buffer, buflen);
 }
 
-char session[]="Kodi-AirTunes";
-
 void* CAirTunesServer::AudioOutputFunctions::audio_init(void *cls, int bits, int channels, int samplerate)
 {
+  static const std::string session =
+      StringUtils::Format("{}-AirTunes", CCompileInfo::GetAppName());
   XFILE::CPipeFile *pipe=(XFILE::CPipeFile *)cls;
   const CURL pathToUrl(XFILE::PipesManager::GetInstance().GetUniquePipeName());
   pipe->OpenForWrite(pathToUrl);
@@ -398,7 +399,7 @@ void* CAirTunesServer::AudioOutputFunctions::audio_init(void *cls, int bits, int
   CZeroconfBrowser::GetInstance()->AddServiceType(ZEROCONF_DACP_SERVICE);
   CAirTunesServer::EnableActionProcessing(true);
 
-  return session;//session
+  return const_cast<char*>(session.c_str());
 }
 
 void CAirTunesServer::AudioOutputFunctions::audio_remote_control_id(void *cls, const char *dacp_id, const char *active_remote_header)
@@ -623,7 +624,7 @@ bool CAirTunesServer::StartServer(int port, bool nonlocal, bool usePassword, con
     txt.emplace_back("vn", "3");
     txt.emplace_back("da", "true");
     txt.emplace_back("md", "0,1,2");
-    txt.emplace_back("am", "Kodi,1");
+    txt.emplace_back("am", StringUtils::Format("{},1", CCompileInfo::GetAppName()));
     txt.emplace_back("vs", "130.14");
 
     CZeroconf::GetInstance()->PublishService("servers.airtunes", "_raop._tcp", appName, port, txt);

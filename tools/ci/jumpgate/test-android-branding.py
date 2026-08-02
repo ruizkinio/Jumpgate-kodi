@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 import hashlib
+import json
 import re
 import shutil
 import subprocess
@@ -155,6 +156,233 @@ RELEASE_POLICY_FILES = (
     (ROOT / "tools" / "ci" / "jumpgate" / "verify-android-release.sh", True),
     (ROOT / "tools" / "ci" / "jumpgate" / "test-verify-android-release.sh", True),
 )
+SYSTEM_SETTINGS = ROOT / "system" / "settings" / "settings.xml"
+ADDON_MANIFEST = ROOT / "system" / "addon-manifest.xml"
+COMMON_ADDONS = ROOT / "cmake" / "installdata" / "common" / "addons.txt"
+JUMPGATE_REPOSITORY = ROOT / "addons" / "repository.jumpgate.addons" / "addon.xml"
+JUMPGATE_SOUNDS = ROOT / "addons" / "resource.uisounds.jumpgate" / "addon.xml"
+ESTUARY_SYSTEM_INFO = ROOT / "addons" / "skin.estuary" / "xml" / "SettingsSystemInfo.xml"
+CHORUS_ROOT = ROOT / "addons" / "webinterface.default"
+CHORUS_LOCALES = CHORUS_ROOT / "lang" / "_strings"
+CHORUS_BUNDLE = CHORUS_ROOT / "js" / "kodi-webinterface.js"
+AIRPLAY_SOURCE = ROOT / "xbmc" / "network" / "AirPlayServer.cpp"
+AIRTUNES_SOURCE = ROOT / "xbmc" / "network" / "AirTunesServer.cpp"
+UPNP_SOURCE = ROOT / "xbmc" / "network" / "upnp" / "UPnP.cpp"
+
+BRAND_ARTWORK = {
+    "media/splash.jpg": ((1920, 1080), "b65163bb65120f1d46332f1cf1082de491b857c222d234294b3d79cf726afe2e"),
+    "media/applaunch_screen.png": ((1920, 1080), "264f1317801862d091bb4404fcae4254aaeec97302f22a4fc4fde4e71c6ea574"),
+    "media/icon16x16.png": ((16, 16), "0f50f785d5437fd48462b92658bc048634e861221ba0e7cd04cc32f1631c6e28"),
+    "media/icon32x32.png": ((32, 32), "9e2a83f9a4f91f9e4ad332a3afb2fe6b3fd315831f2188d563156ab61b941dd8"),
+    "media/icon48x48.png": ((48, 48), "a3c938765f7c693e95f74a66da6d735423481709258fbc2c8244d5092ae3ebf6"),
+    "media/icon80x80.png": ((80, 80), "54c43f8ff83c2ae25ce07da2fdd182b9058aaeee8c6376cd69cbfdeb4ae8658a"),
+    "media/icon120x120.png": ((120, 120), "d640818922383f57cc823ac53f65504fd771235da13f6e908fab9bfdffbeeb6a"),
+    "media/icon256x256.png": ((256, 256), "14759491bd310233016a494a2c5ff5eca915c2cbacae18819ceb466aa61d1dd4"),
+    "media/vendor_icon.png": ((128, 128), "fb1aedd79e576d3b08caa422b42f7eaeec76d1010b5d813297c716e09cc0461e"),
+    "media/vendor_logo.png": ((465, 128), "3c5d5e30a59401c459d3964c4374a8f76fdc8f2b006119b9aeba89c786a024bf"),
+    "tools/android/packaging/media/mipmap-ldpi/ic_launcher.png": ((36, 36), "8818ce7f100fc0cdc717379d61ac28c86b8733dc39f50240618f10f1d8fe77e6"),
+    "tools/android/packaging/media/mipmap-mdpi/ic_launcher.png": ((48, 48), "a3c938765f7c693e95f74a66da6d735423481709258fbc2c8244d5092ae3ebf6"),
+    "tools/android/packaging/media/mipmap-hdpi/ic_launcher.png": ((72, 72), "4a9dae475231ac8a208454fe7f049388451bc788be6ae6eda403abb10b003430"),
+    "tools/android/packaging/media/mipmap-xhdpi/ic_launcher.png": ((96, 96), "67385006a9f015efb278406fad5c699ac9e056a2881327f16cc2762fc37fc113"),
+    "tools/android/packaging/media/mipmap-xhdpi/banner.png": ((320, 180), "58d96f8afbf46fa4786ff0436df1bba2661ec6f63ac36ce62c9260254ca3e3d8"),
+    "tools/android/packaging/media/mipmap-xxhdpi/ic_launcher.png": ((144, 144), "f31f1dc37b88181a21c6075a9952f65b6ee9209a3f3a9d1cd13cffed47ff94c9"),
+    "tools/android/packaging/media/mipmap-xxxhdpi/ic_launcher.png": ((192, 192), "d8cb61f54d10dee3cf9fdb1b0d95969f4d343bf230be9f98d94d5b5489b0456b"),
+    "tools/android/packaging/media/playstore.png": ((512, 512), "e14801eddb18e9993f3da0592c405cfe798b54b42e20e73f2b8015e93b8b4354"),
+    "tools/android/packaging/xbmc/res/drawable/notif_icon.png": ((36, 36), "1db0a32b4d0edccdf48d97876b4b290c5270bc06411b5cf25bc16b06c7ad0b5a"),
+    "addons/webinterface.default/favicon.png": ((32, 32), "9e2a83f9a4f91f9e4ad332a3afb2fe6b3fd315831f2188d563156ab61b941dd8"),
+    "addons/webinterface.default/icon.png": ((144, 144), "f31f1dc37b88181a21c6075a9952f65b6ee9209a3f3a9d1cd13cffed47ff94c9"),
+    "addons/webinterface.default/images/splash_hi.png": ((465, 128), "3c5d5e30a59401c459d3964c4374a8f76fdc8f2b006119b9aeba89c786a024bf"),
+    "addons/webinterface.default/themes/base/images/logo.png": ((201, 50), "4ac487dda319fef97395ffd9a47817d861ddd1120a193338b34bc24f814a6e1e"),
+    "addons/repository.jumpgate.addons/icon.png": ((256, 256), "14759491bd310233016a494a2c5ff5eca915c2cbacae18819ceb466aa61d1dd4"),
+    "addons/resource.uisounds.jumpgate/icon.png": ((256, 256), "14759491bd310233016a494a2c5ff5eca915c2cbacae18819ceb466aa61d1dd4"),
+}
+
+UPSTREAM_KODI_ARTWORK_SHA256 = {
+    "f0960989123e1528e69a5b62fdd430b9ec951d5b6791105d736d5c920ed9c2d1",
+    "b26310f9ff984010ec3051c46d555649aa8f2ae8eff73b8081403d5d40df290d",
+    "f4015994871359cb050e77a40602cc5490495392c3b2273468923a311a8c352f",
+    "c48f145474f6b49e828b4edede9ee1f749a48e03c2cbe83cd2503f64150bfe7f",
+    "3302517b2e72917b88de0e4c1f38775a7835bafefd0eca45594494fb22fbf5e9",
+    "8fe29fd3927f95b5c4282f4a731ab51a5e33a6af5ef8231ea1f6611e410a791c",
+    "127a73ffbf1150ff04a512e95d2e6b121b80e6567be843e703937626c2d39b2f",
+    "1aed71ab72a0faed6cf4ef3b640c7d857bcae77ba654c848586fb2a0f5121b1c",
+    "aa127e6d3c74878bba64ff04f78455965614e73d3da7bda2fa628c40acdaafb9",
+    "48b3e06dad40cc8036ba5a13801e086eb64749e1f5b1c3a3151547dd2a450b1e",
+    "c70ad7d3f0967045e4efb9f39c33d1b6090325906025e0ff322a3a3da77aead6",
+    "6a706fd575883c572c4b75c85bcc9702fbc2f9dae6a753b7bd26d7c5d5fa632e",
+}
+
+
+def read_raster_dimensions(path):
+    data = path.read_bytes()
+    if data.startswith(b"\x89PNG\r\n\x1a\n") and len(data) >= 24:
+        return (
+            int.from_bytes(data[16:20], "big"),
+            int.from_bytes(data[20:24], "big"),
+        )
+    if not data.startswith(b"\xff\xd8"):
+        raise AssertionError(f"unsupported brand artwork format: {path.relative_to(ROOT)}")
+
+    offset = 2
+    start_of_frame = {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}
+    while offset + 4 <= len(data):
+        if data[offset] != 0xFF:
+            offset += 1
+            continue
+        while offset < len(data) and data[offset] == 0xFF:
+            offset += 1
+        if offset >= len(data):
+            break
+        marker = data[offset]
+        offset += 1
+        if marker in {0x01, 0xD8, 0xD9} or 0xD0 <= marker <= 0xD7:
+            continue
+        if offset + 2 > len(data):
+            break
+        segment_length = int.from_bytes(data[offset : offset + 2], "big")
+        if segment_length < 2 or offset + segment_length > len(data):
+            break
+        if marker in start_of_frame and segment_length >= 7:
+            return (
+                int.from_bytes(data[offset + 5 : offset + 7], "big"),
+                int.from_bytes(data[offset + 3 : offset + 5], "big"),
+            )
+        offset += segment_length
+    raise AssertionError(f"JPEG dimensions are unreadable: {path.relative_to(ROOT)}")
+
+
+def iter_display_strings(value):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, list):
+        for item in value:
+            yield from iter_display_strings(item)
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from iter_display_strings(item)
+
+
+def verify_complete_branding():
+    for relative_path, (expected_dimensions, expected_sha256) in BRAND_ARTWORK.items():
+        path = ROOT / relative_path
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        if digest != expected_sha256:
+            raise AssertionError(
+                f"brand artwork drifted: {relative_path} expected {expected_sha256}, got {digest}"
+            )
+        if digest in UPSTREAM_KODI_ARTWORK_SHA256:
+            raise AssertionError(f"brand artwork reuses an upstream Kodi asset: {relative_path}")
+        dimensions = read_raster_dimensions(path)
+        if dimensions != expected_dimensions:
+            raise AssertionError(
+                f"brand artwork dimensions drifted: {relative_path} expected "
+                f"{expected_dimensions}, got {dimensions}"
+            )
+
+    settings = ET.parse(SYSTEM_SETTINGS).getroot()
+    expected_defaults = {
+        "services.devicename": "Jumpgate",
+        "services.webserverusername": "jumpgate",
+        "lookandfeel.soundskin": "resource.uisounds.jumpgate",
+    }
+    for setting_id, expected in expected_defaults.items():
+        setting = settings.find(f".//setting[@id='{setting_id}']")
+        actual = setting.findtext("default") if setting is not None else None
+        if actual != expected:
+            raise AssertionError(
+                f"{setting_id} default must be {expected!r}, got {actual!r}"
+            )
+
+    repository = ET.parse(JUMPGATE_REPOSITORY).getroot()
+    sounds = ET.parse(JUMPGATE_SOUNDS).getroot()
+    if repository.get("id") != "repository.jumpgate.addons":
+        raise AssertionError("bundled repository does not use the Jumpgate add-on ID")
+    if sounds.get("id") != "resource.uisounds.jumpgate":
+        raise AssertionError("bundled UI sounds do not use the Jumpgate add-on ID")
+    repository_notice = "Jumpgate mirrors the official Kodi add-on repository"
+    english_disclaimers = [
+        node.text or ""
+        for node in repository.findall(".//disclaimer")
+        if (node.get("lang") or "").startswith("en_")
+    ]
+    if not english_disclaimers or any(
+        repository_notice not in disclaimer
+        or "not endorsed by Team Kodi" not in disclaimer
+        for disclaimer in english_disclaimers
+    ):
+        raise AssertionError("Jumpgate repository lacks explicit Kodi mirror non-endorsement")
+
+    packaged_addons = ADDON_MANIFEST.read_text(encoding="utf-8") + COMMON_ADDONS.read_text(
+        encoding="utf-8"
+    )
+    for obsolete_id in (
+        "repository.xbmc.org",
+        "resource.uisounds.kodi",
+        "service.xbmc.versioncheck",
+    ):
+        if obsolete_id in packaged_addons:
+            raise AssertionError(f"packaged add-on inventory retains {obsolete_id}")
+    if "repository.jumpgate.addons" not in packaged_addons or "resource.uisounds.jumpgate" not in packaged_addons:
+        raise AssertionError("packaged add-on inventory omits Jumpgate repository or UI sounds")
+    airplay = AIRPLAY_SOURCE.read_text(encoding="utf-8")
+    airtunes = AIRTUNES_SOURCE.read_text(encoding="utf-8")
+    upnp = UPNP_SOURCE.read_text(encoding="utf-8")
+    for source, obsolete in (
+        (airplay, "<string>Kodi,1</string>"),
+        (airtunes, "Kodi-AirTunes"),
+        (airtunes, 'txt.emplace_back("am", "Kodi,1")'),
+        (upnp, 'm_ModelName = "Kodi"'),
+        (upnp, 'm_Manufacturer = "XBMC Foundation"'),
+    ):
+        if obsolete in source:
+            raise AssertionError(f"network publication retains {obsolete!r}")
+    for source in (airplay, airtunes, upnp):
+        if "CCompileInfo::GetAppName()" not in source:
+            raise AssertionError("network publication is not derived from runtime app identity")
+    if upnp.count("https://github.com/ruizkinio/Jumpgate") != 4:
+        raise AssertionError("UPnP does not advertise the Jumpgate project origin consistently")
+
+    system_info = ESTUARY_SYSTEM_INFO.read_text(encoding="utf-8")
+    if "kodilove" in system_info or "kodi.tv/donate" in system_info:
+        raise AssertionError("Estuary retains Kodi donation UI")
+    for donation_asset in (
+        ROOT / "media" / "qr" / "kodilove" / "qr-logo.png",
+        ROOT / "media" / "qr" / "kodilove" / "qr-popcorn.jpg",
+    ):
+        if donation_asset.exists():
+            raise AssertionError(f"Kodi donation artwork remains: {donation_asset.relative_to(ROOT)}")
+
+    approved_kodi_display_phrases = ("Powered by Kodi", "Kodi.tv")
+    for locale_path in sorted(CHORUS_LOCALES.glob("*.json")):
+        document = json.loads(locale_path.read_text(encoding="utf-8"))
+        messages = document.get("locale_data", {}).get("messages", {})
+        for display_value in iter_display_strings(messages):
+            if "Kodi" in display_value and not any(
+                phrase in display_value for phrase in approved_kodi_display_phrases
+            ):
+                raise AssertionError(
+                    f"Chorus locale retains user-facing Kodi branding: {locale_path.name}: "
+                    f"{display_value!r}"
+                )
+
+    chorus_bundle = CHORUS_BUNDLE.read_text(encoding="utf-8")
+    for runtime_identifier in (
+        "this.Kodi",
+        "Kodi.request",
+        "Kodi.execute",
+        "Kodi.navigate",
+        "KodiEntities",
+        "baseKodiUrl",
+    ):
+        if runtime_identifier not in chorus_bundle:
+            raise AssertionError(f"Chorus runtime identifier changed: {runtime_identifier}")
+    for obsolete_display in (
+        "appTitle: 'Kodi'",
+        "<strong>Kodi ",
+        "A web interface for Kodi.",
+    ):
+        if obsolete_display in chorus_bundle:
+            raise AssertionError(f"Chorus bundle retains user-facing {obsolete_display!r}")
 
 
 def verify_estuary_osd_defaults():
@@ -3305,6 +3533,7 @@ def main(arguments):
 
     verify_release_policy_spdx()
     verify_version_code_boundaries()
+    verify_complete_branding()
     verify_estuary_osd_defaults()
     verify_identity()
     verify_package_derivation()
