@@ -53,6 +53,12 @@ try {
   if ($LASTEXITCODE -ne 0) { throw 'Failed to create media/splash.jpg' }
 
   Render-Svg $wordmark (Join-Path $root 'media\vendor_logo.png') 465 128
+  $androidWordmark = Join-Path $root `
+    'tools\android\packaging\xbmc\res\drawable-nodpi\jumpgate_wordmark.png'
+  New-Item -ItemType Directory -Force -Path ([IO.Path]::GetDirectoryName($androidWordmark)) |
+    Out-Null
+  Copy-Item -LiteralPath (Join-Path $root 'media\vendor_logo.png') `
+    -Destination $androidWordmark -Force
   Render-Svg $mark (Join-Path $root 'media\vendor_icon.png') 128 128
 
   foreach ($size in 16, 32, 48, 80, 120, 256) {

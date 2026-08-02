@@ -2155,6 +2155,7 @@ void CXBMCApp::UpdateLoadingOverlayContentInfo(bool force)
   std::string showOrMovieTitle = m_traktScrobbler->GetTitle();
   std::string episodeTitle = m_traktScrobbler->GetEpisodeTitle();
   std::string logoUrl = m_traktScrobbler->GetLogoUrl();
+  std::string backgroundUrl = m_traktScrobbler->GetBackgroundUrl();
   int year = m_traktScrobbler->GetYear();
   int season = m_traktScrobbler->GetSeason();
   int episode = m_traktScrobbler->GetEpisode();
@@ -2190,16 +2191,18 @@ void CXBMCApp::UpdateLoadingOverlayContentInfo(bool force)
     title = "Identifying...";
 
   if (!force && title == m_lastOverlayTitle && meta == m_lastOverlayMeta &&
-      logoUrl == m_lastOverlayLogoUrl)
+      logoUrl == m_lastOverlayLogoUrl && backgroundUrl == m_lastOverlayBackgroundUrl)
     return;
 
   m_lastOverlayTitle = title;
   m_lastOverlayMeta = meta;
   m_lastOverlayLogoUrl = logoUrl;
+  m_lastOverlayBackgroundUrl = backgroundUrl;
 
   call_method<void>(m_context, "updateLoadingOverlayContentInfo",
-                    "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
-                    jcast<jhstring>(title), jcast<jhstring>(meta), jcast<jhstring>(logoUrl));
+                    "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+                    jcast<jhstring>(title), jcast<jhstring>(meta), jcast<jhstring>(logoUrl),
+                    jcast<jhstring>(backgroundUrl));
 }
 
 // --- Secure profile runtime and settings ---
@@ -2559,6 +2562,7 @@ void CXBMCApp::ProcessPlaybackSourceClaim()
   }
   const std::string title = context->display.title.value_or("");
   const std::string logoUrl = context->display.logo.value_or("");
+  const std::string backgroundUrl = context->display.background.value_or("");
   const int year = context->display.year.value_or(0);
 
   const bool applied =
@@ -2567,7 +2571,7 @@ void CXBMCApp::ProcessPlaybackSourceClaim()
           generation, active.profileId, active.deviceId, active.bridgeOrigin, active.deviceToken,
           completion->result.claim.sessionId, completion->result.claim.historyGrant,
           completion->result.claim.historyGrantKind, completion->result.claim.sessionRevision,
-          provider, canonicalId, mediaType, title, logoUrl, year, season, episode,
+          provider, canonicalId, mediaType, title, logoUrl, backgroundUrl, year, season, episode,
           context->traktEligible);
   if (!applied)
   {

@@ -53,6 +53,7 @@ public:
                              const std::string& mediaType,
                              const std::string& title,
                              const std::string& logoUrl,
+                             const std::string& backgroundUrl,
                              int year,
                              int season,
                              int episode,
@@ -66,6 +67,7 @@ public:
   std::string GetTitle() const;
   std::string GetEpisodeTitle() const;
   std::string GetLogoUrl() const;
+  std::string GetBackgroundUrl() const;
   int GetYear() const;
   int GetSeason() const;
   int GetEpisode() const;
@@ -101,6 +103,7 @@ private:
   std::string m_title;
   std::string m_episodeTitle;
   std::string m_logoUrl;
+  std::string m_backgroundUrl;
   int m_year{0};
   int m_season{-1};
   int m_episode{-1};
