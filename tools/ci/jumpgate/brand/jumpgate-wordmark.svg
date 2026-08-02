@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="465" height="128" viewBox="0 0 465 128">
+  <defs>
+    <style>
+      @font-face {
+        font-family: "Oxanium";
+        src: url("Oxanium-Variable.ttf") format("truetype");
+        font-weight: 200 800;
+      }
+    </style>
+    <linearGradient id="ice" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#9cecff"/>
+      <stop offset=".5" stop-color="#24b9e8"/>
+      <stop offset="1" stop-color="#056c97"/>
+    </linearGradient>
+    <filter id="glow" x="-80%" y="-80%" width="260%" height="260%">
+      <feGaussianBlur stdDeviation="2.8" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <g transform="translate(64 64)">
+    <circle r="50" fill="#0b1218" stroke="#2d5063" stroke-width="3"/>
+    <circle r="43" fill="none" stroke="url(#ice)" stroke-width="4"
+            stroke-dasharray="151 42" transform="rotate(-35)" filter="url(#glow)"/>
+    <path d="M-43 0-14-28v15L-28 0l14 13v15zM43 0 14-28v15L28 0 14 13v15z"
+          fill="url(#ice)"/>
+    <path d="M-14-28H3l-11 15h-17zM-14 28H3L-8 13h-17z" fill="#dbf8ff"/>
+    <circle r="3.5" fill="#eefcff" filter="url(#glow)"/>
+  </g>
+  <text x="132" y="79" fill="#f1f9fd" font-family="Oxanium, sans-serif"
+        font-size="49" font-weight="650" letter-spacing="3">JUMPGATE</text>
+</svg>

@@ -11,6 +11,7 @@
 
 #include "AirPlayServer.h"
 
+#include "CompileInfo.h"
 #include "FileItem.h"
 #include "FileItemList.h"
 #include "ServiceBroker.h"
@@ -136,7 +137,7 @@ const char *eventStrings[] = {"playing", "paused", "loading", "stopped"};
   "<key>features</key>\r\n" \
   "<integer>119</integer>\r\n" \
   "<key>model</key>\r\n" \
-  "<string>Kodi,1</string>\r\n" \
+  "<string>{:s},1</string>\r\n" \
   "<key>protovers</key>\r\n" \
   "<string>1.0</string>\r\n" \
   "<key>srcvers</key>\r\n" \
@@ -1175,7 +1176,8 @@ int CAirPlayServer::CTCPClient::ProcessRequest( std::string& responseHeader,
   {
     CLog::Log(LOGDEBUG, "AIRPLAY: got request {}", uri);
     responseBody = StringUtils::Format(
-        SERVER_INFO, CServiceBroker::GetNetwork().GetFirstConnectedInterface()->GetMacAddress());
+        SERVER_INFO, CServiceBroker::GetNetwork().GetFirstConnectedInterface()->GetMacAddress(),
+        CCompileInfo::GetAppName());
     responseHeader = "Content-Type: text/x-apple-plist+xml\r\n";
   }
 

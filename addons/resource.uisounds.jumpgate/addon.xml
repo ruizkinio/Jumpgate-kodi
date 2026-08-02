@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<addon id="resource.uisounds.jumpgate" version="1.0.2" name="Jumpgate UI Sounds" provider-name="Team Kodi, Jumpgate contributors">
+  <requires>
+    <import addon="kodi.resource" version="1.0.0"/>
+  </requires>
+  <extension point="kodi.resource.uisounds"/>
+  <extension point="kodi.addon.metadata">
+    <summary lang="en">Jumpgate interface sounds</summary>
+    <description lang="en">Interface sounds derived from the upstream Kodi sound resource.</description>
+    <platform>all</platform>
+    <assets>
+      <icon>icon.png</icon>
+    </assets>
+  </extension>
+</addon>

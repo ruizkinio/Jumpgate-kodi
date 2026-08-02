@@ -11,7 +11,7 @@ VERSION_MINOR 0
 VERSION_TAG ALPHA2-Jumpgate-3.0.0
 VERSION_CODE 22.0.300
 ADDON_API 21.90.702
-ADDON_REPOS repository.xbmc.org|https://mirrors.kodi.tv
+ADDON_REPOS repository.jumpgate.addons|https://mirrors.kodi.tv
 APP_PACKAGE io.github.ruizkinio.jumpgate
 PACKAGE_IDENTITY ruizkinio.Jumpgate
 PACKAGE_PUBLISHER 2BE0C441-2359-4F97-B3B5-7EAA5DF88B79

@@ -12,6 +12,7 @@
 
 #include "UPnP.h"
 
+#include "CompileInfo.h"
 #include "FileItem.h"
 #include "ServiceBroker.h"
 #include "UPnPInternal.h"
@@ -764,12 +765,13 @@ CUPnPServer* CUPnP::CreateServer(int port /* = 0 */)
                   "/")
           .ToString();
 
-  device->m_ModelName = "Kodi";
+  const std::string appName = CCompileInfo::GetAppName();
+  device->m_ModelName = appName.c_str();
   device->m_ModelNumber = CSysInfo::GetVersion().c_str();
-  device->m_ModelDescription = "Kodi - Media Server";
-  device->m_ModelURL = "http://kodi.tv/";
-  device->m_Manufacturer = "XBMC Foundation";
-  device->m_ManufacturerURL = "http://kodi.tv/";
+  device->m_ModelDescription = (appName + " - Media Server").c_str();
+  device->m_ModelURL = "https://github.com/ruizkinio/Jumpgate";
+  device->m_Manufacturer = "Jumpgate contributors";
+  device->m_ManufacturerURL = "https://github.com/ruizkinio/Jumpgate";
 
   device->SetDelegate(device);
   return device;
@@ -858,12 +860,13 @@ CUPnPRenderer* CUPnP::CreateRenderer(int port /* = 0 */)
                       CSettings::SETTING_SERVICES_WEBSERVERPORT),
                   "/")
           .ToString();
-  device->m_ModelName = "Kodi";
+  const std::string appName = CCompileInfo::GetAppName();
+  device->m_ModelName = appName.c_str();
   device->m_ModelNumber = CSysInfo::GetVersion().c_str();
-  device->m_ModelDescription = "Kodi - Media Renderer";
-  device->m_ModelURL = "http://kodi.tv/";
-  device->m_Manufacturer = "XBMC Foundation";
-  device->m_ManufacturerURL = "http://kodi.tv/";
+  device->m_ModelDescription = (appName + " - Media Renderer").c_str();
+  device->m_ModelURL = "https://github.com/ruizkinio/Jumpgate";
+  device->m_Manufacturer = "Jumpgate contributors";
+  device->m_ManufacturerURL = "https://github.com/ruizkinio/Jumpgate";
 
   return device;
 }

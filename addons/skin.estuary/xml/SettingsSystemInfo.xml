@@ -116,31 +116,6 @@
 				<height>3</height>
 				<texture colordiffuse="button_focus" border="2">dialogs/separator-grey.png</texture>
 			</control>
-			<control type="group" id="102">
-				<description>System Info page that shows a QR code linking to https://kodi.tv/donate/</description>
-				<left>420</left>
-				<right>50</right>
-				<top>30</top>
-				<bottom>30</bottom>
-				<control type="textbox">
-					<height>110</height>
-					<label>$LOCALIZE[12397]</label>
-				</control>
-				<control type="multiimage" id="103">
-					<top>110</top>
-					<height>620</height>
-					<imagepath>special://xbmc/media/qr/kodilove/</imagepath>
-					<aspectratio>keep</aspectratio>
-					<timeperimage>5000</timeperimage>
-					<fadetime>1000</fadetime>
-					<randomize>false</randomize>
-				</control>
-				<control type="label">
-					<top>748</top>
-					<align>center</align>
-					<label>$LOCALIZE[12398]</label>
-				</control>
-			</control>
 		</control>
 		<control type="group">
 			<left>0</left>

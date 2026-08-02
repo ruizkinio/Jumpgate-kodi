@@ -2528,35 +2528,35 @@ GETTEXT_CATALOG_ENTRY = re.compile(
 # a reviewed SHA-256 refresh; do not replace this map with message-key heuristics.
 AUTHENTICATED_GETTEXT_CATALOGS = {
     'addons/webinterface.default/lang/_strings/ca.json':
-        '3cf7893600ad0b6a06a5c8f7b819f8628d221758b3595b33dbbdf4f008bd52fb',
+        '31a3c8833c916ecd28abacf50a80ae79fecc7c01206ee744934f94d4e18882be',
     'addons/webinterface.default/lang/_strings/de.json':
-        '71962a3e5d06ff4c1e6f8b4a6dcf74ee2f0ab65fd10b73953c61d879e228c3a4',
+        'd2a5dea445d876346f6271c5f611d5eecab838d9659b8cbc4288e2f68f0244bc',
     'addons/webinterface.default/lang/_strings/en.json':
-        '3635a6232502075988c7e7d4f50dfa50a25ff0a6d8b9986f4d434ccfb978cff6',
+        'bb7e8d07485b9ab43d9bb274bdd60780b4f51ef346233119bae345c271228c45',
     'addons/webinterface.default/lang/_strings/et.json':
-        '35b5e614b902ed788e2bc6102a1da989a4552ccc41535b5317a228b31eb5d24c',
+        '9d0c4381af6f34435eb774c7e75788ea7aaeb3951c850ec42188365e0ea5587d',
     'addons/webinterface.default/lang/_strings/fi.json':
-        '6149652b2aa36687a7c487f83da4447c51793b05f4ab02fcc1f22583966eb611',
+        '6acd36ec5d8d42ebd85715966c0b5652bc1e9f22ede088249a87db8783dcd3f5',
     'addons/webinterface.default/lang/_strings/fr.json':
-        '0570b7c22a4f4d7a520038ca84a975ffa4e8f0f177c583eba76662db11ed1a93',
+        '2f5b67ecbc3b0f898a8cfde63fd86293800ef8215710343f09b610977fec1167',
     'addons/webinterface.default/lang/_strings/hr.json':
-        '7ba2b179ba47657aecd29f2d2017a245ff8a903597269e5ccaf169449b10bfb3',
+        '9fddaf458cc0c040c17081d1e07c041ec98b0e58022e35b165aa654bfcdff809',
     'addons/webinterface.default/lang/_strings/hu.json':
-        '13361d638b5e06245254cea75bda8d214d59014f13bb8e50afdeb6d3b5fc8262',
+        'ee59fae49e1ec2d860fce26014219e72480ae39779c63d8ce1997ced607e0afc',
     'addons/webinterface.default/lang/_strings/it.json':
-        '7102338e7cdf4a47af49eb75ba5e3f51aa7fc3923e321bac1a6f975b6f347694',
+        'bb0316522763aedf27832716913fb9c8d395e5607e29e48633177b73035a02cb',
     'addons/webinterface.default/lang/_strings/ja.json':
-        'd2edffca36008913bab04328eb1fe8a5f3d5ce375252550f9eacbd8debee4d64',
+        '9d966618ab1dd6e3ede12ccc1af30a9da79aeac1c55aed5f0b7dc60850d26290',
     'addons/webinterface.default/lang/_strings/ko.json':
-        'b6c3900e142171193c3ff38b1f03bbf412a36a4e603d2b29344d3032cfee13ad',
+        '727fbb1ee8929fced252df4e7838d8a537e322baa7f0461c914a66e170383692',
     'addons/webinterface.default/lang/_strings/nl.json':
-        'b630c74bf1a292e6db9aa9369fc75e06daa0195b4477ab39e88b019606af9f43',
+        '881bf846480b0ffe2687e91fd07f5b9a551e4b1e82900fc73ab16eae54e1b4a0',
     'addons/webinterface.default/lang/_strings/ru.json':
-        'ca03a5ef31e4bb5a4326fed9b5940d710250f7a29b4246d06a5c4ae04baa4bfb',
+        'd8da6a6f0e61c885abade658135cf621409a098b06bff9642082fa09dfcdf1f8',
     'addons/webinterface.default/lang/_strings/sk.json':
-        '8f939ff044bfa27e8f85d338c45b8eec2dd5ff120752b15eff153afd087064c7',
+        'af4586c66f2b057fd410bf26bb393b66340316caccf2bfa295ee09f14fff6e59',
     'addons/webinterface.default/lang/_strings/zh_tw.json':
-        '5a73da1376e81bee87400f7d35564af4d5773c7f6b6d0e1fcc343b2d347ee6e1',
+        '02242cc60ccd8d1ef6591810a025496ae6d8908e606727a8553f4aa467ed0abf',
 }
 
 scan_entry_sha256 = None

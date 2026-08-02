@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="1080" viewBox="0 0 1920 1080">
+  <defs>
+    <style>
+      @font-face {
+        font-family: "Oxanium";
+        src: url("Oxanium-Variable.ttf") format("truetype");
+        font-weight: 200 800;
+      }
+    </style>
+    <linearGradient id="ice" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#a6efff"/>
+      <stop offset=".44" stop-color="#29b9e7"/>
+      <stop offset="1" stop-color="#036b96"/>
+    </linearGradient>
+    <filter id="glow" x="-80%" y="-80%" width="260%" height="260%">
+      <feGaussianBlur stdDeviation="7" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <image href="jumpgate-backdrop.svg" width="1920" height="1080"/>
+  <g font-family="Oxanium, sans-serif">
+    <text x="132" y="190" fill="#75dfff" font-size="24" font-weight="570"
+          letter-spacing="7">SOURCE-AWARE EXTERNAL PLAYER</text>
+    <text x="122" y="355" fill="#f3fbff" font-size="118" font-weight="690"
+          letter-spacing="10">JUMPGATE</text>
+    <rect x="132" y="393" width="132" height="6" fill="#3bcaf3" filter="url(#glow)"/>
+    <rect x="278" y="395" width="350" height="2" fill="#31586c"/>
+    <text x="132" y="484" fill="#c8dce6" font-size="31" font-weight="470"
+          letter-spacing="2">EXACT STREMIO CONTEXT.</text>
+    <text x="132" y="532" fill="#c8dce6" font-size="31" font-weight="470"
+          letter-spacing="2">LOCAL HISTORY. OPTIONAL TRAKT.</text>
+    <text x="132" y="928" fill="#7593a1" font-size="20" font-weight="500"
+          letter-spacing="3">POWERED BY KODI</text>
+    <text x="132" y="970" fill="#4f6c79" font-size="16" font-weight="500"
+          letter-spacing="2">NOT AFFILIATED WITH KODI, STREMIO, TRAKT, OR TMDB</text>
+  </g>
+</svg>

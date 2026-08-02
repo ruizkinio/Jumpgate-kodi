@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="201" height="50" viewBox="0 0 201 50">
+  <defs>
+    <style>
+      @font-face {
+        font-family: "Oxanium";
+        src: url("Oxanium-Variable.ttf") format("truetype");
+        font-weight: 200 800;
+      }
+    </style>
+  </defs>
+  <g transform="translate(25 25)" fill="#eaf8fd">
+    <path d="M-22 0-7-15v8l-8 7 8 7v8zM22 0 7-15v8l8 7-8 7v8z"/>
+    <path d="M-7-15H5L-2-7h-12zM-7 15H5L-2 7h-12z"/>
+    <circle r="2"/>
+  </g>
+  <text x="56" y="33" fill="#eaf8fd" font-family="Oxanium, sans-serif"
+        font-size="23" font-weight="650" letter-spacing="1.5">JUMPGATE</text>
+</svg>
