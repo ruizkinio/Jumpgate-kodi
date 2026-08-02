@@ -5,7 +5,6 @@ import @APP_PACKAGE@.channels.util.TvUtil;
 import static android.content.pm.PackageManager.FEATURE_LEANBACK;
 
 import android.annotation.TargetApi;
-import android.animation.ObjectAnimator;
 import android.animation.ValueAnimator;
 import android.app.NativeActivity;
 import android.content.Intent;
@@ -13,6 +12,7 @@ import android.content.pm.ResolveInfo;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Rect;
+import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.GradientDrawable;
 import android.hardware.input.InputManager;
 import android.media.AudioManager;
@@ -42,8 +42,8 @@ import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.RelativeLayout;
 import android.widget.TextView;
-import android.view.animation.LinearInterpolator;
 
+import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.io.File;
 import java.io.FileInputStream;
@@ -62,11 +62,16 @@ import java.util.regex.Pattern;
 public class Main extends NativeActivity implements Choreographer.FrameCallback
 {
   private static final String TAG = "@APP_NAME@";
-  private static final int OVERLAY_LOGO_CACHE_KB = 6 * 1024;
-  private static final long OVERLAY_LOGO_DISK_MAX_BYTES = 20L * 1024L * 1024L;
-  private static final int OVERLAY_LOGO_DISK_MAX_FILES = 96;
-  private static final long OVERLAY_LOGO_DISK_MAX_AGE_MS = 14L * 24L * 60L * 60L * 1000L;
-  private static final LruCache<String, Bitmap> sOverlayLogoCache = new LruCache<String, Bitmap>(OVERLAY_LOGO_CACHE_KB) {
+  private static final int OVERLAY_ARTWORK_CACHE_KB = 6 * 1024;
+  private static final long OVERLAY_ARTWORK_DISK_MAX_BYTES = 20L * 1024L * 1024L;
+  private static final int OVERLAY_ARTWORK_DISK_MAX_FILES = 96;
+  private static final long OVERLAY_ARTWORK_DISK_MAX_AGE_MS = 14L * 24L * 60L * 60L * 1000L;
+  private static final int OVERLAY_ARTWORK_MAX_ENCODED_BYTES = 6 * 1024 * 1024;
+  private static final int OVERLAY_ARTWORK_MAX_DIMENSION = 4096;
+  private static final long OVERLAY_ARTWORK_MAX_PIXELS = 16L * 1024L * 1024L;
+  private static final int OVERLAY_ARTWORK_MAX_REDIRECTS = 2;
+  private static final LruCache<String, Bitmap> sOverlayArtworkCache =
+      new LruCache<String, Bitmap>(OVERLAY_ARTWORK_CACHE_KB) {
     @Override
     protected int sizeOf(String key, Bitmap value) {
       if (value == null) {
@@ -123,18 +128,19 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
   // Loading overlay: WindowManager overlay (separate window layer above SurfaceView)
   private View mLoadingOverlay = null;
   private WindowManager mWindowManager = null;
-  private View mOverlayGateRing = null;
-  private View mOverlayGatePulse = null;
+  private ImageView mOverlayBackdropView = null;
+  private View mOverlayLogoPulseContainer = null;
   private View mOverlayProgressFill = null;
   private TextView mOverlayStatusText = null;
-  private TextView mOverlayPercentText = null;
   private TextView mOverlayTitleText = null;
   private TextView mOverlayMetaText = null;
   private ImageView mOverlayLogoView = null;
   private String mOverlayLogoUrl = "";
-  private int mOverlayLogoRequestId = 0;
+  private String mOverlayBackgroundUrl = "";
+  private long mOverlayLogoRequestId = 0L;
+  private long mOverlayBackgroundRequestId = 0L;
+  private long mOverlayArtworkSequence = 0L;
   private Runnable mOverlayProgressRunnable = null;
-  private ObjectAnimator mOverlayRotationAnimator = null;
   private ValueAnimator mOverlayPulseAnimator = null;
   private long mOverlayShownAtMs = 0L;
   private int mOverlayProgress = 0;
@@ -296,6 +302,7 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
     mExternalPlayerMode = getIntent().getBooleanExtra("external_player_mode", false);
     if (mExternalPlayerMode) {
       Log.d(TAG, "Main: External player mode activated");
+      getWindow().setBackgroundDrawable(new ColorDrawable(Color.BLACK));
     }
 
     String initialRequestId =
@@ -1158,13 +1165,16 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
   }
 
   /**
-   * Shows a cinematic Jumpgate loading overlay above the SurfaceView.
-   * Uses WindowManager so it stays above XBMCMainView's Surface layer.
+   * Shows a Stremio-shaped Jumpgate transition above the SurfaceView.
+   * The source claim supplies optional artwork after the black first frame is already visible.
    */
   private void showLoadingOverlay(Intent sourceIntent) {
     if (mLoadingOverlay != null) {
+      clearOverlayBackground();
+      mOverlayLogoRequestId = nextOverlayArtworkRequestId();
+      showOverlayLogoFallback(false);
       updateLoadingOverlayMetadata(sourceIntent);
-      setLoadingOverlayStatus("Re-linking jumpgate route...");
+      setLoadingOverlayStatus("Re-establishing selected stream...");
       setLoadingOverlayProgress(Math.max(mOverlayProgress, 12));
       return;
     }
@@ -1174,172 +1184,124 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
     FrameLayout overlay = new FrameLayout(this);
     overlay.setBackgroundColor(Color.BLACK);
 
-    View backdrop = new View(this);
-    GradientDrawable backdropGradient = new GradientDrawable(
-        GradientDrawable.Orientation.TOP_BOTTOM,
-        new int[] {
-            Color.parseColor("#0B2B63"),
-            Color.parseColor("#071A3E"),
-            Color.parseColor("#040A1A")
-        });
-    backdrop.setBackground(backdropGradient);
-    backdrop.setAlpha(0.98f);
-    overlay.addView(backdrop, new FrameLayout.LayoutParams(
+    ImageView backdropView = new ImageView(this);
+    backdropView.setScaleType(ImageView.ScaleType.CENTER_CROP);
+    backdropView.setAlpha(0f);
+    overlay.addView(backdropView, new FrameLayout.LayoutParams(
         FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+    mOverlayBackdropView = backdropView;
 
-    View haze = new View(this);
-    GradientDrawable hazeGradient = new GradientDrawable(
-        GradientDrawable.Orientation.TL_BR,
-        new int[] {
-            Color.parseColor("#0047B5FF"),
-            Color.parseColor("#332D86FF"),
-            Color.parseColor("#00168BE8")
-        });
-    haze.setBackground(hazeGradient);
-    haze.setAlpha(0.40f);
-    overlay.addView(haze, new FrameLayout.LayoutParams(
-        FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+    FrameLayout portalIndicator = new FrameLayout(this);
+    GradientDrawable indicatorBackground = new GradientDrawable();
+    indicatorBackground.setShape(GradientDrawable.RECTANGLE);
+    indicatorBackground.setCornerRadius(dp(7));
+    indicatorBackground.setColor(Color.parseColor("#A30A1117"));
+    indicatorBackground.setStroke(dp(1), Color.parseColor("#667EDDF5"));
+    portalIndicator.setBackground(indicatorBackground);
+    FrameLayout.LayoutParams indicatorParams = new FrameLayout.LayoutParams(dp(248), dp(46));
+    indicatorParams.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
+    indicatorParams.topMargin = dp(24);
+    overlay.addView(portalIndicator, indicatorParams);
 
-    FrameLayout gateContainer = new FrameLayout(this);
-    FrameLayout.LayoutParams gateContainerParams = new FrameLayout.LayoutParams(dp(132), dp(132));
-    gateContainerParams.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
-    gateContainerParams.topMargin = dp(88);
-    overlay.addView(gateContainer, gateContainerParams);
-
-    View gateRing = new View(this);
-    GradientDrawable gateRingDrawable = new GradientDrawable();
-    gateRingDrawable.setShape(GradientDrawable.OVAL);
-    gateRingDrawable.setColor(Color.TRANSPARENT);
-    // Kodi-ish blue accent for the jumpgate ring.
-    gateRingDrawable.setStroke(dp(3), Color.parseColor("#C217B2E7"));
-    gateRing.setBackground(gateRingDrawable);
-    gateContainer.addView(gateRing, new FrameLayout.LayoutParams(
-        FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
-    mOverlayGateRing = gateRing;
-
-    View gatePulse = new View(this);
-    GradientDrawable gatePulseDrawable = new GradientDrawable();
-    gatePulseDrawable.setShape(GradientDrawable.OVAL);
-    gatePulseDrawable.setColor(Color.TRANSPARENT);
-    gatePulseDrawable.setStroke(dp(2), Color.parseColor("#8A17B2E7"));
-    gatePulse.setBackground(gatePulseDrawable);
-    gatePulse.setScaleX(0.86f);
-    gatePulse.setScaleY(0.86f);
-    gateContainer.addView(gatePulse, new FrameLayout.LayoutParams(
-        FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
-    mOverlayGatePulse = gatePulse;
-
-    LinearLayout content = new LinearLayout(this);
-    content.setOrientation(LinearLayout.VERTICAL);
-    content.setGravity(Gravity.CENTER_HORIZONTAL);
-    FrameLayout.LayoutParams contentParams = new FrameLayout.LayoutParams(
-        FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT);
-    contentParams.gravity = Gravity.TOP;
-    contentParams.topMargin = dp(248);
-    contentParams.leftMargin = dp(24);
-    contentParams.rightMargin = dp(24);
-    overlay.addView(content, contentParams);
-
-    TextView badge = new TextView(this);
-    badge.setText("JUMPGATE BRIDGE");
-    badge.setTextColor(Color.parseColor("#BED6FF"));
-    badge.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
-    badge.setLetterSpacing(0.28f);
-    badge.setAllCaps(true);
-    badge.setGravity(Gravity.CENTER);
-    content.addView(badge);
-
-    ImageView logoView = new ImageView(this);
-    logoView.setAdjustViewBounds(true);
-    logoView.setScaleType(ImageView.ScaleType.FIT_CENTER);
-    logoView.setVisibility(View.GONE);
-    LinearLayout.LayoutParams logoParams = new LinearLayout.LayoutParams(
-        LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-    logoParams.topMargin = dp(14);
-    logoView.setMaxHeight(dp(74));
-    content.addView(logoView, logoParams);
-    mOverlayLogoView = logoView;
-
-    TextView title = new TextView(this);
-    title.setTextColor(Color.WHITE);
-    // Slightly smaller to avoid oversized token-like or proxy-derived titles.
-    title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
-    title.setTypeface(title.getTypeface(), android.graphics.Typeface.BOLD);
-    title.setGravity(Gravity.CENTER);
-    title.setMaxLines(2);
-    title.setEllipsize(TextUtils.TruncateAt.END);
-    LinearLayout.LayoutParams titleParams = new LinearLayout.LayoutParams(
-        LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-    titleParams.topMargin = dp(12);
-    content.addView(title, titleParams);
-    mOverlayTitleText = title;
-
-    TextView meta = new TextView(this);
-    meta.setTextColor(Color.parseColor("#C2D9FF"));
-    meta.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-    meta.setGravity(Gravity.CENTER);
-    meta.setAllCaps(true);
-    LinearLayout.LayoutParams metaParams = new LinearLayout.LayoutParams(
-        LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-    metaParams.topMargin = dp(6);
-    content.addView(meta, metaParams);
-    mOverlayMetaText = meta;
-
-    TextView status = new TextView(this);
-    status.setTextColor(Color.parseColor("#E2EEFF"));
-    status.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
-    status.setGravity(Gravity.CENTER);
-    status.setMaxLines(2);
-    status.setEllipsize(TextUtils.TruncateAt.END);
-    LinearLayout.LayoutParams statusParams = new LinearLayout.LayoutParams(
-        LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-    statusParams.topMargin = dp(22);
-    content.addView(status, statusParams);
-    mOverlayStatusText = status;
+    TextView indicatorLabel = new TextView(this);
+    indicatorLabel.setText("JUMPGATE LOADING");
+    indicatorLabel.setTextColor(Color.parseColor("#DDF5FC"));
+    indicatorLabel.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
+    indicatorLabel.setLetterSpacing(0.22f);
+    indicatorLabel.setGravity(Gravity.CENTER);
+    FrameLayout.LayoutParams indicatorLabelParams = new FrameLayout.LayoutParams(
+        FrameLayout.LayoutParams.MATCH_PARENT, dp(30));
+    indicatorLabelParams.gravity = Gravity.TOP;
+    portalIndicator.addView(indicatorLabel, indicatorLabelParams);
 
     FrameLayout progressTrack = new FrameLayout(this);
     GradientDrawable progressTrackDrawable = new GradientDrawable();
     progressTrackDrawable.setShape(GradientDrawable.RECTANGLE);
-    progressTrackDrawable.setCornerRadius(dp(8));
-    progressTrackDrawable.setColor(Color.parseColor("#243D66"));
-    progressTrackDrawable.setStroke(dp(1), Color.parseColor("#5D83B8"));
+    progressTrackDrawable.setCornerRadius(dp(1));
+    progressTrackDrawable.setColor(Color.parseColor("#30476170"));
     progressTrack.setBackground(progressTrackDrawable);
-    LinearLayout.LayoutParams progressTrackParams = new LinearLayout.LayoutParams(
-        LinearLayout.LayoutParams.MATCH_PARENT, dp(16));
-    progressTrackParams.topMargin = dp(20);
-    progressTrackParams.leftMargin = dp(18);
-    progressTrackParams.rightMargin = dp(18);
-    content.addView(progressTrack, progressTrackParams);
+    FrameLayout.LayoutParams progressTrackParams = new FrameLayout.LayoutParams(dp(204), dp(2));
+    progressTrackParams.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
+    progressTrackParams.bottomMargin = dp(8);
+    portalIndicator.addView(progressTrack, progressTrackParams);
 
     View progressFill = new View(this);
     GradientDrawable progressFillDrawable = new GradientDrawable(
         GradientDrawable.Orientation.LEFT_RIGHT,
         new int[] {
-            Color.parseColor("#1FD2FF"),
-            Color.parseColor("#17B2E7"),
-            Color.parseColor("#1A7DD8")
+            Color.parseColor("#9CEBFF"),
+            Color.parseColor("#24B9E8"),
+            Color.parseColor("#056C97")
         });
-    progressFillDrawable.setCornerRadius(dp(7));
+    progressFillDrawable.setCornerRadius(dp(1));
     progressFill.setBackground(progressFillDrawable);
-    FrameLayout.LayoutParams progressFillParams = new FrameLayout.LayoutParams(
-        FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT);
-    progressTrack.addView(progressFill, progressFillParams);
+    progressTrack.addView(progressFill, new FrameLayout.LayoutParams(
+        FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
     progressFill.setPivotX(0f);
     progressFill.setScaleX(0f);
     mOverlayProgressFill = progressFill;
 
-    TextView percent = new TextView(this);
-    percent.setTextColor(Color.parseColor("#D6E8FF"));
-    percent.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-    percent.setGravity(Gravity.CENTER);
-    LinearLayout.LayoutParams percentParams = new LinearLayout.LayoutParams(
+    FrameLayout pulseContainer = new FrameLayout(this);
+    FrameLayout.LayoutParams pulseParams = new FrameLayout.LayoutParams(dp(200), dp(80));
+    pulseParams.gravity = Gravity.CENTER;
+    overlay.addView(pulseContainer, pulseParams);
+    mOverlayLogoPulseContainer = pulseContainer;
+
+    ImageView logoView = new ImageView(this);
+    logoView.setAdjustViewBounds(true);
+    logoView.setScaleType(ImageView.ScaleType.FIT_CENTER);
+    logoView.setImageResource(R.drawable.jumpgate_wordmark);
+    pulseContainer.addView(logoView, new FrameLayout.LayoutParams(
+        FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+    mOverlayLogoView = logoView;
+
+    LinearLayout details = new LinearLayout(this);
+    details.setOrientation(LinearLayout.VERTICAL);
+    details.setGravity(Gravity.CENTER_HORIZONTAL);
+    FrameLayout.LayoutParams detailsParams = new FrameLayout.LayoutParams(
+        FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT);
+    detailsParams.gravity = Gravity.CENTER;
+    detailsParams.leftMargin = dp(32);
+    detailsParams.rightMargin = dp(32);
+    details.setTranslationY(dp(104));
+    overlay.addView(details, detailsParams);
+
+    TextView title = new TextView(this);
+    title.setTextColor(Color.WHITE);
+    title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
+    title.setTypeface(title.getTypeface(), android.graphics.Typeface.BOLD);
+    title.setGravity(Gravity.CENTER);
+    title.setMaxLines(2);
+    title.setEllipsize(TextUtils.TruncateAt.END);
+    details.addView(title, new LinearLayout.LayoutParams(
+        LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+    mOverlayTitleText = title;
+
+    TextView meta = new TextView(this);
+    meta.setTextColor(Color.parseColor("#BDD9E5"));
+    meta.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+    meta.setGravity(Gravity.CENTER);
+    meta.setAllCaps(true);
+    LinearLayout.LayoutParams metaParams = new LinearLayout.LayoutParams(
         LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-    percentParams.topMargin = dp(10);
-    content.addView(percent, percentParams);
-    mOverlayPercentText = percent;
+    metaParams.topMargin = dp(5);
+    details.addView(meta, metaParams);
+    mOverlayMetaText = meta;
+
+    TextView status = new TextView(this);
+    status.setTextColor(Color.parseColor("#A8C7D4"));
+    status.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+    status.setGravity(Gravity.CENTER);
+    status.setMaxLines(1);
+    status.setEllipsize(TextUtils.TruncateAt.END);
+    LinearLayout.LayoutParams statusParams = new LinearLayout.LayoutParams(
+        LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+    statusParams.topMargin = dp(10);
+    details.addView(status, statusParams);
+    mOverlayStatusText = status;
 
     updateLoadingOverlayMetadata(sourceIntent);
-    setLoadingOverlayStatus("Opening jumpgate channel...");
+    setLoadingOverlayStatus("Opening selected stream...");
     setLoadingOverlayProgress(8);
 
     WindowManager.LayoutParams params = new WindowManager.LayoutParams(
@@ -1354,19 +1316,13 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
     mWindowManager.addView(overlay, params);
     mLoadingOverlay = overlay;
     mOverlayShownAtMs = System.currentTimeMillis();
-    Log.d(TAG, "Main: Jumpgate loading overlay shown");
+    Log.d(TAG, "Main: Jumpgate loading portal shown");
 
     startLoadingOverlayAnimations();
     startLoadingOverlayProgressTicker();
-
-    // Safety timeout: never permanently block the player view.
-    handler.postDelayed(() -> hideLoadingOverlay(), 30000);
   }
 
-  /**
-   * Called from native code when playback actually starts.
-   * Removes the WindowManager overlay to reveal the video surface.
-   */
+  /** Called from native code once synchronized A/V playback is ready to reveal. */
   public void hideLoadingOverlay() {
     runOnUiThread(() -> {
       if (mOverlayProgressRunnable != null) {
@@ -1374,60 +1330,60 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
         mOverlayProgressRunnable = null;
       }
 
-      if (mOverlayRotationAnimator != null) {
-        mOverlayRotationAnimator.cancel();
-        mOverlayRotationAnimator = null;
-      }
-
       if (mOverlayPulseAnimator != null) {
         mOverlayPulseAnimator.cancel();
         mOverlayPulseAnimator = null;
       }
 
-      if (mLoadingOverlay != null && mWindowManager != null) {
-        mWindowManager.removeView(mLoadingOverlay);
-        mLoadingOverlay = null;
-        mOverlayGateRing = null;
-        mOverlayGatePulse = null;
-        mOverlayProgressFill = null;
-        mOverlayStatusText = null;
-        mOverlayPercentText = null;
-        mOverlayTitleText = null;
-        mOverlayMetaText = null;
-        mOverlayLogoView = null;
-        mOverlayLogoUrl = "";
-        mOverlayLogoRequestId = 0;
-        mOverlayProgress = 0;
-        Log.d(TAG, "Main: Loading overlay hidden (playback started)");
+      final View overlay = mLoadingOverlay;
+      mLoadingOverlay = null;
+      mOverlayLogoRequestId = nextOverlayArtworkRequestId();
+      mOverlayBackgroundRequestId = nextOverlayArtworkRequestId();
+      mOverlayBackdropView = null;
+      mOverlayLogoPulseContainer = null;
+      mOverlayProgressFill = null;
+      mOverlayStatusText = null;
+      mOverlayTitleText = null;
+      mOverlayMetaText = null;
+      mOverlayLogoView = null;
+      mOverlayLogoUrl = "";
+      mOverlayBackgroundUrl = "";
+      mOverlayProgress = 0;
+
+      if (overlay != null && mWindowManager != null) {
+        overlay.animate().cancel();
+        overlay.animate().alpha(0f).setDuration(140L).withEndAction(() -> {
+          try {
+            mWindowManager.removeView(overlay);
+          } catch (IllegalArgumentException _e) {
+            // Activity teardown may already have detached this exact overlay.
+          }
+        }).start();
+        Log.d(TAG, "Main: Loading portal fading into playback");
       }
     });
   }
 
   private void startLoadingOverlayAnimations() {
-    if (mOverlayGateRing != null) {
-      mOverlayRotationAnimator = ObjectAnimator.ofFloat(mOverlayGateRing, View.ROTATION, 0f, 360f);
-      mOverlayRotationAnimator.setDuration(2600L);
-      mOverlayRotationAnimator.setInterpolator(new LinearInterpolator());
-      mOverlayRotationAnimator.setRepeatCount(ValueAnimator.INFINITE);
-      mOverlayRotationAnimator.start();
+    if (mOverlayLogoPulseContainer == null) {
+      return;
     }
 
-    if (mOverlayGatePulse != null) {
-      mOverlayPulseAnimator = ValueAnimator.ofFloat(0.86f, 1.12f);
-      mOverlayPulseAnimator.setDuration(1250L);
-      mOverlayPulseAnimator.setRepeatMode(ValueAnimator.REVERSE);
-      mOverlayPulseAnimator.setRepeatCount(ValueAnimator.INFINITE);
-      mOverlayPulseAnimator.addUpdateListener(animator -> {
-        if (mOverlayGatePulse == null) {
-          return;
-        }
-        float scale = (float) animator.getAnimatedValue();
-        mOverlayGatePulse.setScaleX(scale);
-        mOverlayGatePulse.setScaleY(scale);
-        mOverlayGatePulse.setAlpha(0.30f + ((scale - 0.86f) / 0.26f) * 0.45f);
-      });
-      mOverlayPulseAnimator.start();
-    }
+    mOverlayPulseAnimator = ValueAnimator.ofFloat(0f, 1f);
+    mOverlayPulseAnimator.setDuration(750L);
+    mOverlayPulseAnimator.setRepeatMode(ValueAnimator.REVERSE);
+    mOverlayPulseAnimator.setRepeatCount(ValueAnimator.INFINITE);
+    mOverlayPulseAnimator.addUpdateListener(animator -> {
+      if (mOverlayLogoPulseContainer == null) {
+        return;
+      }
+      float phase = (float) animator.getAnimatedValue();
+      float scale = 1f + (0.05f * phase);
+      mOverlayLogoPulseContainer.setScaleX(scale);
+      mOverlayLogoPulseContainer.setScaleY(scale);
+      mOverlayLogoPulseContainer.setAlpha(0.20f + (0.80f * phase));
+    });
+    mOverlayPulseAnimator.start();
   }
 
   private void startLoadingOverlayProgressTicker() {
@@ -1448,34 +1404,34 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
 
         if (elapsedMs < 1200L) {
           targetProgress = 14;
-          status = "Opening jumpgate channel...";
+          status = "Opening selected stream...";
         } else if (elapsedMs < 2600L) {
           targetProgress = 30;
-          status = "Negotiating source tunnel...";
+          status = "Claiming source context...";
         } else if (elapsedMs < 4500L) {
           targetProgress = 48;
-          status = "Locking codecs and container map...";
+          status = "Preparing title and subtitles...";
         } else if (elapsedMs < 7000L) {
           targetProgress = 66;
-          status = "Syncing bridge metadata and resume markers...";
+          status = "Opening Kodi media pipeline...";
         } else if (elapsedMs < 10000L) {
           targetProgress = 78;
-          status = "Spooling first packets...";
+          status = "Buffering video...";
         } else if (elapsedMs < 15000L) {
           targetProgress = 87;
-          status = "Buffering first video frame...";
+          status = "Synchronizing audio and video...";
         } else {
           targetProgress = 92;
-          status = "Waiting for decoder warm-up...";
+          status = "Waiting for the first frame...";
         }
 
         if (mLastPlaybackDuration > 0) {
           targetProgress = Math.max(targetProgress, 88);
-          status = "Manifest decoded. Priming video pipeline...";
+          status = "Video pipeline ready...";
         }
         if (mLastPlaybackPosition > 0) {
           targetProgress = Math.max(targetProgress, 96);
-          status = "Jumpgate lock acquired. Rendering first frames...";
+          status = "Rendering first frame...";
         }
 
         setLoadingOverlayStatus(status);
@@ -1499,13 +1455,8 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
   private void setLoadingOverlayProgress(int progress) {
     int safeProgress = Math.max(0, Math.min(progress, 100));
     mOverlayProgress = safeProgress;
-
     if (mOverlayProgressFill != null) {
       mOverlayProgressFill.setScaleX(safeProgress / 100f);
-    }
-
-    if (mOverlayPercentText != null) {
-      mOverlayPercentText.setText(String.format(Locale.US, "%d%%", safeProgress));
     }
   }
 
@@ -1538,18 +1489,13 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
     if (!TextUtils.isEmpty(title) && isLikelyOpaqueTokenTitle(title)) {
       title = "";
     }
-
-    if (TextUtils.isEmpty(title)) {
-      title = "Identifying...";
-    }
-    return title;
+    return TextUtils.isEmpty(title) ? "Identifying..." : title;
   }
 
-  /**
-   * Called from native code when content identification completes (or improves).
-   * Updates overlay title/meta without relying on intent token-derived strings.
-   */
-  public void updateLoadingOverlayContentInfo(final String title, final String meta, final String logoUrl) {
+  /** Called from native code when the authenticated source claim improves display metadata. */
+  public void updateLoadingOverlayContentInfo(final String title, final String meta,
+                                              final String logoUrl,
+                                              final String backgroundUrl) {
     if (mLoadingOverlay == null) {
       return;
     }
@@ -1563,59 +1509,68 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
       if (TextUtils.isEmpty(safeTitle) || isLikelyOpaqueTokenTitle(safeTitle)) {
         safeTitle = "Identifying...";
       }
-
       if (mOverlayTitleText != null) {
         mOverlayTitleText.setText(safeTitle);
         mOverlayTitleText.setVisibility(View.VISIBLE);
       }
 
       String safeMeta = meta != null ? meta.trim() : "";
-      if (!TextUtils.isEmpty(safeMeta) && !isLikelyOpaqueTokenTitle(safeMeta) && mOverlayMetaText != null) {
+      if (!TextUtils.isEmpty(safeMeta) && !isLikelyOpaqueTokenTitle(safeMeta)
+          && mOverlayMetaText != null) {
         mOverlayMetaText.setText(safeMeta);
       }
 
-      final boolean isEpisode = isEpisodeMeta(safeMeta);
-      loadOverlayLogo(logoUrl, isEpisode);
+      loadOverlayBackground(backgroundUrl);
+      loadOverlayLogo(logoUrl, isEpisodeMeta(safeMeta));
     });
   }
 
   private boolean isEpisodeMeta(String meta) {
-    if (TextUtils.isEmpty(meta)) {
-      return false;
-    }
-    return meta.matches("(?i).*\\bS\\d{1,2}E\\d{1,2}\\b.*");
+    return !TextUtils.isEmpty(meta) && meta.matches("(?i).*\\bS\\d{1,2}E\\d{1,2}\\b.*");
   }
 
-  private boolean isAllowedLogoUrl(String rawUrl) {
+  private boolean isAllowedArtworkUrl(String rawUrl) {
     if (TextUtils.isEmpty(rawUrl)) {
       return false;
     }
     try {
-      Uri u = Uri.parse(rawUrl);
-      String scheme = u.getScheme();
-      String host = u.getHost();
-      return "https".equalsIgnoreCase(scheme)
-          && host != null
-          && host.equalsIgnoreCase("image.tmdb.org");
+      Uri uri = Uri.parse(rawUrl);
+      String path = uri.getEncodedPath();
+      return uri.isHierarchical()
+          && "https".equalsIgnoreCase(uri.getScheme())
+          && "image.tmdb.org".equalsIgnoreCase(uri.getHost())
+          && uri.getPort() == -1
+          && uri.getEncodedUserInfo() == null
+          && uri.getQuery() == null
+          && uri.getFragment() == null
+          && path != null
+          && path.startsWith("/t/p/");
     } catch (Exception _e) {
       return false;
     }
   }
 
-  private void clearOverlayLogo(boolean isEpisode) {
+  private long nextOverlayArtworkRequestId() {
+    if (mOverlayArtworkSequence == Long.MAX_VALUE) {
+      mOverlayArtworkSequence = 1L;
+    } else {
+      mOverlayArtworkSequence++;
+    }
+    return mOverlayArtworkSequence;
+  }
+
+  private void showOverlayLogoFallback(boolean isEpisode) {
     if (mOverlayLogoView != null) {
-      mOverlayLogoView.setImageDrawable(null);
-      mOverlayLogoView.setVisibility(View.GONE);
+      mOverlayLogoView.setImageResource(R.drawable.jumpgate_wordmark);
+      mOverlayLogoView.setVisibility(View.VISIBLE);
     }
     mOverlayLogoUrl = "";
-
-    // For movies, the logo replaces the title. If logo is gone, ensure title is visible again.
     if (!isEpisode && mOverlayTitleText != null) {
       mOverlayTitleText.setVisibility(View.VISIBLE);
     }
   }
 
-  private String hashOverlayLogoUrl(String rawUrl) {
+  private String hashOverlayArtworkUrl(String rawUrl) {
     try {
       MessageDigest md = MessageDigest.getInstance("SHA-256");
       byte[] digest = md.digest(rawUrl.getBytes("UTF-8"));
@@ -1629,8 +1584,9 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
     }
   }
 
-  private File getOverlayLogoCacheDir() {
+  private File getOverlayArtworkCacheDir() {
     try {
+      // Keep the existing directory so prior bounded logo entries are pruned with new backdrops.
       File dir = new File(getCacheDir(), "jumpgate_logo_cache");
       if (!dir.exists() && !dir.mkdirs()) {
         return null;
@@ -1641,47 +1597,84 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
     }
   }
 
-  private File getOverlayLogoDiskFile(String rawUrl) {
-    File dir = getOverlayLogoCacheDir();
-    if (dir == null) {
-      return null;
-    }
-    return new File(dir, hashOverlayLogoUrl(rawUrl) + ".png");
+  private File getOverlayArtworkDiskFile(String rawUrl) {
+    File dir = getOverlayArtworkCacheDir();
+    return dir == null ? null : new File(dir, hashOverlayArtworkUrl(rawUrl) + ".png");
   }
 
-  private Bitmap loadOverlayLogoFromDisk(String rawUrl) {
-    File cacheFile = getOverlayLogoDiskFile(rawUrl);
-    if (cacheFile == null || !cacheFile.exists() || !cacheFile.isFile()) {
+  private byte[] readOverlayArtworkBytes(InputStream input, int maximumBytes) throws Exception {
+    ByteArrayOutputStream output = new ByteArrayOutputStream(Math.min(maximumBytes, 64 * 1024));
+    byte[] buffer = new byte[16 * 1024];
+    int total = 0;
+    int count;
+    while ((count = input.read(buffer)) != -1) {
+      total += count;
+      if (total > maximumBytes) {
+        return null;
+      }
+      output.write(buffer, 0, count);
+    }
+    return output.toByteArray();
+  }
+
+  private Bitmap decodeOverlayArtwork(byte[] encoded, boolean preserveAlpha) {
+    if (encoded == null || encoded.length == 0
+        || encoded.length > OVERLAY_ARTWORK_MAX_ENCODED_BYTES) {
+      return null;
+    }
+
+    BitmapFactory.Options bounds = new BitmapFactory.Options();
+    bounds.inJustDecodeBounds = true;
+    BitmapFactory.decodeByteArray(encoded, 0, encoded.length, bounds);
+    if (bounds.outWidth <= 0 || bounds.outHeight <= 0
+        || bounds.outWidth > OVERLAY_ARTWORK_MAX_DIMENSION
+        || bounds.outHeight > OVERLAY_ARTWORK_MAX_DIMENSION
+        || ((long) bounds.outWidth * (long) bounds.outHeight) > OVERLAY_ARTWORK_MAX_PIXELS) {
+      return null;
+    }
+
+    int targetDimension = preserveAlpha ? 1024 : 1920;
+    int sampleSize = 1;
+    while ((bounds.outWidth / sampleSize) > targetDimension
+        || (bounds.outHeight / sampleSize) > targetDimension) {
+      sampleSize *= 2;
+    }
+
+    BitmapFactory.Options options = new BitmapFactory.Options();
+    options.inSampleSize = sampleSize;
+    options.inPreferredConfig = preserveAlpha ? Bitmap.Config.ARGB_8888 : Bitmap.Config.RGB_565;
+    return BitmapFactory.decodeByteArray(encoded, 0, encoded.length, options);
+  }
+
+  private Bitmap loadOverlayArtworkFromDisk(String rawUrl, boolean preserveAlpha) {
+    File cacheFile = getOverlayArtworkDiskFile(rawUrl);
+    if (cacheFile == null || !cacheFile.isFile()) {
       return null;
     }
 
     long now = System.currentTimeMillis();
-    long ageMs = now - cacheFile.lastModified();
-    if (ageMs > OVERLAY_LOGO_DISK_MAX_AGE_MS) {
+    if ((now - cacheFile.lastModified()) > OVERLAY_ARTWORK_DISK_MAX_AGE_MS
+        || cacheFile.length() <= 0
+        || cacheFile.length() > OVERLAY_ARTWORK_MAX_ENCODED_BYTES) {
       cacheFile.delete();
       return null;
     }
 
-    FileInputStream in = null;
-    try {
-      in = new FileInputStream(cacheFile);
-      BitmapFactory.Options opts = new BitmapFactory.Options();
-      opts.inPreferredConfig = Bitmap.Config.RGB_565;
-      Bitmap bmp = BitmapFactory.decodeStream(in, null, opts);
-      if (bmp != null) {
-        cacheFile.setLastModified(now);
+    try (FileInputStream input = new FileInputStream(cacheFile)) {
+      byte[] encoded = readOverlayArtworkBytes(input, OVERLAY_ARTWORK_MAX_ENCODED_BYTES);
+      Bitmap bitmap = decodeOverlayArtwork(encoded, preserveAlpha);
+      if (bitmap == null) {
+        cacheFile.delete();
+        return null;
       }
-      return bmp;
+      cacheFile.setLastModified(now);
+      return bitmap;
     } catch (Exception _e) {
       return null;
-    } finally {
-      try {
-        if (in != null) in.close();
-      } catch (Exception _e) {}
     }
   }
 
-  private void pruneOverlayLogoDiskCache(File dir) {
+  private void pruneOverlayArtworkDiskCache(File dir) {
     if (dir == null) {
       return;
     }
@@ -1693,187 +1686,262 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
     final long now = System.currentTimeMillis();
     long totalBytes = 0L;
     int count = 0;
-
-    for (File f : files) {
-      if (f == null || !f.isFile()) {
+    for (File file : files) {
+      if (file == null || !file.isFile()) {
         continue;
       }
-      long age = now - f.lastModified();
-      if (age > OVERLAY_LOGO_DISK_MAX_AGE_MS) {
-        f.delete();
+      if ((now - file.lastModified()) > OVERLAY_ARTWORK_DISK_MAX_AGE_MS) {
+        file.delete();
         continue;
       }
-      totalBytes += Math.max(0L, f.length());
+      totalBytes += Math.max(0L, file.length());
       count++;
     }
 
-    if (count <= OVERLAY_LOGO_DISK_MAX_FILES && totalBytes <= OVERLAY_LOGO_DISK_MAX_BYTES) {
+    if (count <= OVERLAY_ARTWORK_DISK_MAX_FILES
+        && totalBytes <= OVERLAY_ARTWORK_DISK_MAX_BYTES) {
       return;
     }
 
     files = dir.listFiles();
-    if (files == null || files.length == 0) {
+    if (files == null) {
       return;
     }
     Arrays.sort(files, (a, b) -> Long.compare(a.lastModified(), b.lastModified()));
-    for (File f : files) {
-      if (f == null || !f.isFile()) {
+    for (File file : files) {
+      if (file == null || !file.isFile()) {
         continue;
       }
-      if (count <= OVERLAY_LOGO_DISK_MAX_FILES && totalBytes <= OVERLAY_LOGO_DISK_MAX_BYTES) {
+      if (count <= OVERLAY_ARTWORK_DISK_MAX_FILES
+          && totalBytes <= OVERLAY_ARTWORK_DISK_MAX_BYTES) {
         break;
       }
-      long len = Math.max(0L, f.length());
-      if (f.delete()) {
+      long length = Math.max(0L, file.length());
+      if (file.delete()) {
         count--;
-        totalBytes = Math.max(0L, totalBytes - len);
+        totalBytes = Math.max(0L, totalBytes - length);
       }
     }
   }
 
-  private void saveOverlayLogoToDisk(String rawUrl, Bitmap bmp) {
-    if (bmp == null || bmp.isRecycled()) {
+  private void saveOverlayArtworkToDisk(String rawUrl, byte[] encoded) {
+    if (encoded == null || encoded.length == 0
+        || encoded.length > OVERLAY_ARTWORK_MAX_ENCODED_BYTES) {
       return;
     }
-
-    File cacheFile = getOverlayLogoDiskFile(rawUrl);
-    if (cacheFile == null) {
-      return;
-    }
-    File dir = cacheFile.getParentFile();
-    if (dir == null) {
+    File cacheFile = getOverlayArtworkDiskFile(rawUrl);
+    if (cacheFile == null || cacheFile.getParentFile() == null) {
       return;
     }
 
     File temp = new File(cacheFile.getAbsolutePath() + ".tmp");
-    FileOutputStream out = null;
     try {
-      out = new FileOutputStream(temp, false);
-      if (!bmp.compress(Bitmap.CompressFormat.PNG, 100, out)) {
+      try (FileOutputStream output = new FileOutputStream(temp, false)) {
+        output.write(encoded);
+        output.flush();
+      }
+      if (cacheFile.exists() && !cacheFile.delete()) {
         return;
       }
-      out.flush();
-      if (cacheFile.exists()) {
-        cacheFile.delete();
-      }
       if (!temp.renameTo(cacheFile)) {
-        temp.delete();
         return;
       }
       cacheFile.setLastModified(System.currentTimeMillis());
-      pruneOverlayLogoDiskCache(dir);
+      pruneOverlayArtworkDiskCache(cacheFile.getParentFile());
     } catch (Exception _e) {
-      // Non-critical best-effort cache write.
+      // Artwork remains optional; a cache write must never block playback.
     } finally {
-      try {
-        if (out != null) out.close();
-      } catch (Exception _e) {}
       if (temp.exists() && !temp.equals(cacheFile)) {
         temp.delete();
       }
     }
   }
 
+  private byte[] downloadOverlayArtwork(String rawUrl) {
+    String currentUrl = rawUrl;
+    for (int redirectCount = 0; redirectCount <= OVERLAY_ARTWORK_MAX_REDIRECTS;
+         redirectCount++) {
+      if (!isAllowedArtworkUrl(currentUrl)) {
+        return null;
+      }
+
+      HttpURLConnection connection = null;
+      InputStream input = null;
+      try {
+        URL parsedUrl = new URL(currentUrl);
+        connection = (HttpURLConnection) parsedUrl.openConnection();
+        connection.setConnectTimeout(2000);
+        connection.setReadTimeout(3000);
+        connection.setInstanceFollowRedirects(false);
+        connection.setUseCaches(true);
+        connection.setRequestProperty("User-Agent", "Jumpgate");
+        connection.setRequestProperty("Accept", "image/webp,image/*,*/*;q=0.8");
+
+        int status = connection.getResponseCode();
+        if (status >= 300 && status < 400) {
+          String location = connection.getHeaderField("Location");
+          if (TextUtils.isEmpty(location) || redirectCount == OVERLAY_ARTWORK_MAX_REDIRECTS) {
+            return null;
+          }
+          currentUrl = new URL(parsedUrl, location).toString();
+          continue;
+        }
+        if (status != HttpURLConnection.HTTP_OK) {
+          return null;
+        }
+
+        int contentLength = connection.getContentLength();
+        if (contentLength > OVERLAY_ARTWORK_MAX_ENCODED_BYTES) {
+          return null;
+        }
+        String contentType = connection.getContentType();
+        if (contentType == null || !contentType.toLowerCase(Locale.US).startsWith("image/")) {
+          return null;
+        }
+
+        input = connection.getInputStream();
+        return readOverlayArtworkBytes(input, OVERLAY_ARTWORK_MAX_ENCODED_BYTES);
+      } catch (Exception _e) {
+        return null;
+      } finally {
+        try {
+          if (input != null) input.close();
+        } catch (Exception _e) {}
+        if (connection != null) connection.disconnect();
+      }
+    }
+    return null;
+  }
+
+  private void showOverlayBackgroundBitmap(Bitmap bitmap) {
+    if (mOverlayBackdropView == null || bitmap == null || bitmap.isRecycled()) {
+      return;
+    }
+    mOverlayBackdropView.animate().cancel();
+    mOverlayBackdropView.setImageBitmap(bitmap);
+    mOverlayBackdropView.setAlpha(0f);
+    mOverlayBackdropView.animate().alpha(0.50f).setDuration(220L).start();
+  }
+
+  private void clearOverlayBackground() {
+    mOverlayBackgroundRequestId = nextOverlayArtworkRequestId();
+    mOverlayBackgroundUrl = "";
+    if (mOverlayBackdropView != null) {
+      mOverlayBackdropView.animate().cancel();
+      mOverlayBackdropView.setImageDrawable(null);
+      mOverlayBackdropView.setAlpha(0f);
+    }
+  }
+
+  private void loadOverlayBackground(String rawUrl) {
+    if (mOverlayBackdropView == null) {
+      return;
+    }
+    String url = rawUrl != null ? rawUrl.trim() : "";
+    if (TextUtils.isEmpty(url) || !isAllowedArtworkUrl(url)) {
+      clearOverlayBackground();
+      return;
+    }
+    if (url.equals(mOverlayBackgroundUrl)) {
+      return;
+    }
+
+    final long requestId = nextOverlayArtworkRequestId();
+    mOverlayBackgroundRequestId = requestId;
+    mOverlayBackgroundUrl = url;
+    mOverlayBackdropView.animate().cancel();
+    mOverlayBackdropView.setImageDrawable(null);
+    mOverlayBackdropView.setAlpha(0f);
+    Bitmap memoryBitmap = sOverlayArtworkCache.get(url);
+    if (memoryBitmap != null && !memoryBitmap.isRecycled()) {
+      showOverlayBackgroundBitmap(memoryBitmap);
+      return;
+    }
+
+    new Thread(() -> {
+      Bitmap bitmap = loadOverlayArtworkFromDisk(url, false);
+      byte[] downloaded = null;
+      if (bitmap == null) {
+        downloaded = downloadOverlayArtwork(url);
+        bitmap = decodeOverlayArtwork(downloaded, false);
+      }
+      final Bitmap loadedBitmap = bitmap;
+      final byte[] encoded = downloaded;
+      runOnUiThread(() -> {
+        if (mLoadingOverlay == null || requestId != mOverlayBackgroundRequestId
+            || mOverlayBackdropView == null) {
+          return;
+        }
+        if (loadedBitmap == null) {
+          clearOverlayBackground();
+          return;
+        }
+        sOverlayArtworkCache.put(url, loadedBitmap);
+        showOverlayBackgroundBitmap(loadedBitmap);
+      });
+      if (loadedBitmap != null && encoded != null) {
+        saveOverlayArtworkToDisk(url, encoded);
+      }
+    }, "Jumpgate-backdrop").start();
+  }
+
   private void loadOverlayLogo(String rawUrl, boolean isEpisode) {
     if (mOverlayLogoView == null) {
       return;
     }
-
     String url = rawUrl != null ? rawUrl.trim() : "";
-    if (TextUtils.isEmpty(url) || !isAllowedLogoUrl(url)) {
-      clearOverlayLogo(isEpisode);
+    if (TextUtils.isEmpty(url) || !isAllowedArtworkUrl(url)) {
+      mOverlayLogoRequestId = nextOverlayArtworkRequestId();
+      showOverlayLogoFallback(isEpisode);
       return;
     }
-
     if (url.equals(mOverlayLogoUrl)) {
       return;
     }
 
-    Bitmap cachedBmp = sOverlayLogoCache.get(url);
-    if (cachedBmp != null && !cachedBmp.isRecycled()) {
-      mOverlayLogoUrl = url;
-      mOverlayLogoRequestId++;
-      mOverlayLogoView.setImageBitmap(cachedBmp);
-      mOverlayLogoView.setVisibility(View.VISIBLE);
-      if (!isEpisode && mOverlayTitleText != null) {
-        mOverlayTitleText.setVisibility(View.GONE);
-      }
-      return;
-    }
-
-    Bitmap diskBmp = loadOverlayLogoFromDisk(url);
-    if (diskBmp != null && !diskBmp.isRecycled()) {
-      sOverlayLogoCache.put(url, diskBmp);
-      mOverlayLogoUrl = url;
-      mOverlayLogoRequestId++;
-      mOverlayLogoView.setImageBitmap(diskBmp);
-      mOverlayLogoView.setVisibility(View.VISIBLE);
-      if (!isEpisode && mOverlayTitleText != null) {
-        mOverlayTitleText.setVisibility(View.GONE);
-      }
-      return;
-    }
-
+    final long requestId = nextOverlayArtworkRequestId();
+    mOverlayLogoRequestId = requestId;
+    showOverlayLogoFallback(isEpisode);
     mOverlayLogoUrl = url;
-    mOverlayLogoRequestId++;
-    final int reqId = mOverlayLogoRequestId;
-    final String loadedUrl = url;
-
-    // Hide until actually loaded (prevents showing broken/empty placeholder).
-    mOverlayLogoView.setVisibility(View.GONE);
+    Bitmap memoryBitmap = sOverlayArtworkCache.get(url);
+    if (memoryBitmap != null && !memoryBitmap.isRecycled()) {
+      mOverlayLogoView.setImageBitmap(memoryBitmap);
+      mOverlayLogoView.setVisibility(View.VISIBLE);
+      if (!isEpisode && mOverlayTitleText != null) {
+        mOverlayTitleText.setVisibility(View.GONE);
+      }
+      return;
+    }
 
     new Thread(() -> {
-      Bitmap bmp = null;
-      HttpURLConnection conn = null;
-      InputStream in = null;
-      try {
-        conn = (HttpURLConnection) new URL(url).openConnection();
-        conn.setConnectTimeout(2000);
-        conn.setReadTimeout(3000);
-        conn.setInstanceFollowRedirects(true);
-        conn.setUseCaches(true);
-        conn.setRequestProperty("User-Agent", "Jumpgate");
-        conn.setRequestProperty("Accept", "image/webp,image/*,*/*;q=0.8");
-
-        in = conn.getInputStream();
-        BitmapFactory.Options opts = new BitmapFactory.Options();
-        opts.inPreferredConfig = Bitmap.Config.RGB_565;
-        bmp = BitmapFactory.decodeStream(in, null, opts);
-      } catch (Exception _e) {
-        bmp = null;
-      } finally {
-        try { if (in != null) in.close(); } catch (Exception _e) {}
-        if (conn != null) conn.disconnect();
+      Bitmap bitmap = loadOverlayArtworkFromDisk(url, true);
+      byte[] downloaded = null;
+      if (bitmap == null) {
+        downloaded = downloadOverlayArtwork(url);
+        bitmap = decodeOverlayArtwork(downloaded, true);
       }
-
-      if (bmp != null) {
-        saveOverlayLogoToDisk(loadedUrl, bmp);
-      }
-
-      final Bitmap finalBmp = bmp;
+      final Bitmap loadedBitmap = bitmap;
+      final byte[] encoded = downloaded;
       runOnUiThread(() -> {
-        if (mLoadingOverlay == null) {
+        if (mLoadingOverlay == null || requestId != mOverlayLogoRequestId
+            || mOverlayLogoView == null) {
           return;
         }
-        if (reqId != mOverlayLogoRequestId) {
+        if (loadedBitmap == null) {
+          showOverlayLogoFallback(isEpisode);
           return;
         }
-        if (mOverlayLogoView == null) {
-          return;
-        }
-
-        if (finalBmp != null) {
-          sOverlayLogoCache.put(loadedUrl, finalBmp);
-          mOverlayLogoView.setImageBitmap(finalBmp);
-          mOverlayLogoView.setVisibility(View.VISIBLE);
-          if (!isEpisode && mOverlayTitleText != null) {
-            mOverlayTitleText.setVisibility(View.GONE);
-          }
-        } else {
-          clearOverlayLogo(isEpisode);
+        sOverlayArtworkCache.put(url, loadedBitmap);
+        mOverlayLogoView.setImageBitmap(loadedBitmap);
+        mOverlayLogoView.setVisibility(View.VISIBLE);
+        if (!isEpisode && mOverlayTitleText != null) {
+          mOverlayTitleText.setVisibility(View.GONE);
         }
       });
-    }).start();
+      if (loadedBitmap != null && encoded != null) {
+        saveOverlayArtworkToDisk(url, encoded);
+      }
+    }, "Jumpgate-logo").start();
   }
 
   private String deriveOverlayMeta(Intent intent) {

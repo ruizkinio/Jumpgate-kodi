@@ -6,5 +6,6 @@
     <style name="AppTheme" parent="android:Theme.NoTitleBar">
         <!-- Main theme colors -->
         <item name="android:colorPrimary">@color/principal_color</item>
+        <item name="android:windowBackground">#000000</item>
     </style>
 </resources>

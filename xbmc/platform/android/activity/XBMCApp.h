@@ -552,6 +552,7 @@ private:
   std::string m_lastOverlayTitle;
   std::string m_lastOverlayMeta;
   std::string m_lastOverlayLogoUrl;
+  std::string m_lastOverlayBackgroundUrl;
 
   // Stable for the CXBMCApp lifetime; initialized only in external-player mode.
   std::unique_ptr<TraktScrobbler> m_traktScrobbler;

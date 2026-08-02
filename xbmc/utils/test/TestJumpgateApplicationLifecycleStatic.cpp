@@ -372,6 +372,57 @@ TEST(TestJumpgateApplicationLifecycleStatic, AndroidExternalResultOwnerSurvivesW
   EXPECT_NE(coordinator.find("claim(Terminal terminal)"), std::string::npos);
 }
 
+TEST(TestJumpgateApplicationLifecycleStatic,
+     AndroidLoadingPortalIsClaimBoundBoundedAndFrameReady)
+{
+  const std::string main =
+      ReadKodiSource("../tools/android/packaging/xbmc/src/Main.java.in");
+  const std::string app = ReadKodiSource("platform/android/activity/XBMCApp.cpp");
+  ASSERT_FALSE(main.empty());
+  ASSERT_FALSE(app.empty());
+
+  const std::string show = FunctionBody(main, "private void showLoadingOverlay(Intent sourceIntent)");
+  const std::string hide = FunctionBody(main, "public void hideLoadingOverlay()");
+  const std::string allowed = FunctionBody(main, "private boolean isAllowedArtworkUrl(");
+  const std::string download = FunctionBody(main, "private byte[] downloadOverlayArtwork(");
+  const std::string decode = FunctionBody(main, "private Bitmap decodeOverlayArtwork(");
+  ASSERT_FALSE(show.empty());
+  ASSERT_FALSE(hide.empty());
+  ASSERT_FALSE(allowed.empty());
+  ASSERT_FALSE(download.empty());
+  ASSERT_FALSE(decode.empty());
+
+  EXPECT_NE(show.find("ImageView.ScaleType.CENTER_CROP"), std::string::npos);
+  EXPECT_NE(show.find("dp(200), dp(80)"), std::string::npos);
+  EXPECT_NE(main.find("mOverlayBackdropView.animate().alpha(0.50f)"), std::string::npos);
+  EXPECT_NE(main.find("mOverlayPulseAnimator.setDuration(750L)"), std::string::npos);
+  EXPECT_NE(main.find("R.drawable.jumpgate_wordmark"), std::string::npos);
+  EXPECT_EQ(main.find("postDelayed(() -> hideLoadingOverlay(), 30000)"), std::string::npos);
+  EXPECT_EQ(hide.find("mOverlayArtworkSequence = 0"), std::string::npos);
+  EXPECT_EQ(hide.find("mOverlayLogoRequestId = 0"), std::string::npos);
+  EXPECT_EQ(hide.find("mOverlayBackgroundRequestId = 0"), std::string::npos);
+
+  for (const char* contract : {"\"https\".equalsIgnoreCase(uri.getScheme())",
+                               "\"image.tmdb.org\".equalsIgnoreCase(uri.getHost())",
+                               "uri.getPort() == -1", "uri.getEncodedUserInfo() == null",
+                               "uri.getQuery() == null", "uri.getFragment() == null"})
+    EXPECT_NE(allowed.find(contract), std::string::npos) << contract;
+  EXPECT_NE(download.find("setInstanceFollowRedirects(false)"), std::string::npos);
+  EXPECT_NE(download.find("OVERLAY_ARTWORK_MAX_ENCODED_BYTES"), std::string::npos);
+  EXPECT_NE(decode.find("OVERLAY_ARTWORK_MAX_DIMENSION"), std::string::npos);
+  EXPECT_NE(decode.find("OVERLAY_ARTWORK_MAX_PIXELS"), std::string::npos);
+  EXPECT_NE(main.find("output.write(encoded)"), std::string::npos);
+  EXPECT_EQ(main.find("bmp.compress("), std::string::npos);
+
+  EXPECT_NE(app.find("context->display.background.value_or"), std::string::npos);
+  EXPECT_NE(app.find("m_lastOverlayBackgroundUrl"), std::string::npos);
+  EXPECT_NE(app.find("Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;"),
+            std::string::npos);
+  EXPECT_NE(app.find("message == \"OnAVStart\""), std::string::npos);
+  EXPECT_NE(app.find("call_method<void>(m_context, \"hideLoadingOverlay\", \"()V\")"),
+            std::string::npos);
+}
+
 TEST(TestJumpgateApplicationLifecycleStatic, AuthorityLocksDoNotSpanAnnouncerReconfiguration)
 {
   const std::string app = ReadKodiSource("platform/android/activity/XBMCApp.cpp");
@@ -854,8 +905,13 @@ TEST(TestJumpgateApplicationLifecycleStatic,
             std::string::npos);
   EXPECT_NE(processClaim.find("const std::string logoUrl = context->display.logo.value_or"),
             std::string::npos);
+  EXPECT_NE(processClaim.find(
+                "const std::string backgroundUrl = context->display.background.value_or"),
+            std::string::npos);
   EXPECT_NE(setClaim.find("m_title = title"), std::string::npos);
   EXPECT_NE(setClaim.find("m_logoUrl = logoUrl"), std::string::npos);
+  EXPECT_NE(setClaim.find("m_backgroundUrl = backgroundUrl"), std::string::npos);
+  EXPECT_EQ(Count(source, "m_backgroundUrl.clear();"), 2u);
 
   const std::size_t applyClaim = processClaim.find("SetClaimedContentInfo(");
   const std::size_t bindProfile =

@@ -296,6 +296,7 @@ void TraktScrobbler::SetContentInfo(
   m_title = title;
   m_episodeTitle.clear();
   m_logoUrl.clear();
+  m_backgroundUrl.clear();
   m_year = year;
   m_season = season;
   m_episode = episode;
@@ -385,6 +386,7 @@ bool TraktScrobbler::SetClaimedContentInfo(std::uint64_t generation,
                                            const std::string& mediaType,
                                            const std::string& title,
                                            const std::string& logoUrl,
+                                           const std::string& backgroundUrl,
                                            int year,
                                            int season,
                                            int episode,
@@ -450,6 +452,7 @@ bool TraktScrobbler::SetClaimedContentInfo(std::uint64_t generation,
   m_title = title;
   m_episodeTitle.clear();
   m_logoUrl = logoUrl;
+  m_backgroundUrl = backgroundUrl;
   m_year = year;
   m_season = mediaType == "episode" ? season : -1;
   m_episode = mediaType == "episode" ? episode : -1;
@@ -482,6 +485,7 @@ void TraktScrobbler::ClearContentInfo()
   m_title.clear();
   m_episodeTitle.clear();
   m_logoUrl.clear();
+  m_backgroundUrl.clear();
   m_year = 0;
   m_season = -1;
   m_episode = -1;
@@ -532,6 +536,12 @@ std::string TraktScrobbler::GetLogoUrl() const
 {
   std::unique_lock lock(m_critSection);
   return m_logoUrl;
+}
+
+std::string TraktScrobbler::GetBackgroundUrl() const
+{
+  std::unique_lock lock(m_critSection);
+  return m_backgroundUrl;
 }
 
 int TraktScrobbler::GetYear() const

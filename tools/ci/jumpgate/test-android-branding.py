@@ -189,6 +189,7 @@ BRAND_ARTWORK = {
     "tools/android/packaging/media/mipmap-xxhdpi/ic_launcher.png": ((144, 144), "f31f1dc37b88181a21c6075a9952f65b6ee9209a3f3a9d1cd13cffed47ff94c9"),
     "tools/android/packaging/media/mipmap-xxxhdpi/ic_launcher.png": ((192, 192), "d8cb61f54d10dee3cf9fdb1b0d95969f4d343bf230be9f98d94d5b5489b0456b"),
     "tools/android/packaging/media/playstore.png": ((512, 512), "e14801eddb18e9993f3da0592c405cfe798b54b42e20e73f2b8015e93b8b4354"),
+    "tools/android/packaging/xbmc/res/drawable-nodpi/jumpgate_wordmark.png": ((465, 128), "3c5d5e30a59401c459d3964c4374a8f76fdc8f2b006119b9aeba89c786a024bf"),
     "tools/android/packaging/xbmc/res/drawable/notif_icon.png": ((36, 36), "1db0a32b4d0edccdf48d97876b4b290c5270bc06411b5cf25bc16b06c7ad0b5a"),
     "addons/webinterface.default/favicon.png": ((32, 32), "9e2a83f9a4f91f9e4ad332a3afb2fe6b3fd315831f2188d563156ab61b941dd8"),
     "addons/webinterface.default/icon.png": ((144, 144), "f31f1dc37b88181a21c6075a9952f65b6ee9209a3f3a9d1cd13cffed47ff94c9"),
@@ -1977,6 +1978,67 @@ def verify_uri_logging_privacy():
         raise AssertionError("title extraction logs the complete private media URI")
 
 
+def verify_loading_portal_contract():
+    main_activity = MAIN_ACTIVITY.read_text(encoding="utf-8")
+    app_source = APP_SOURCE.read_text(encoding="utf-8")
+
+    for contract in (
+        "ImageView.ScaleType.CENTER_CROP",
+        "dp(200), dp(80)",
+        "mOverlayBackdropView.animate().alpha(0.50f)",
+        "mOverlayPulseAnimator.setDuration(750L)",
+        "R.drawable.jumpgate_wordmark",
+        "OVERLAY_ARTWORK_MAX_ENCODED_BYTES",
+        "OVERLAY_ARTWORK_MAX_DIMENSION",
+        "OVERLAY_ARTWORK_MAX_PIXELS",
+        "output.write(encoded)",
+    ):
+        if contract not in main_activity:
+            raise AssertionError(f"loading portal is missing {contract!r}")
+    for forbidden in (
+        "postDelayed(() -> hideLoadingOverlay(), 30000)",
+        "bmp.compress(",
+    ):
+        if forbidden in main_activity:
+            raise AssertionError(f"loading portal retains unsafe behavior {forbidden!r}")
+
+    hide = extract_braced_block(main_activity, "public void hideLoadingOverlay()")
+    for forbidden in (
+        "mOverlayArtworkSequence = 0",
+        "mOverlayLogoRequestId = 0",
+        "mOverlayBackgroundRequestId = 0",
+    ):
+        if forbidden in hide:
+            raise AssertionError("loading portal resets stale-request fencing")
+
+    allowed = extract_braced_block(
+        main_activity, "private boolean isAllowedArtworkUrl("
+    )
+    for contract in (
+        '"https".equalsIgnoreCase(uri.getScheme())',
+        '"image.tmdb.org".equalsIgnoreCase(uri.getHost())',
+        "uri.getPort() == -1",
+        "uri.getEncodedUserInfo() == null",
+        "uri.getQuery() == null",
+        "uri.getFragment() == null",
+    ):
+        if contract not in allowed:
+            raise AssertionError(f"artwork URL allowlist is missing {contract!r}")
+    download = extract_braced_block(
+        main_activity, "private byte[] downloadOverlayArtwork("
+    )
+    if "setInstanceFollowRedirects(false)" not in download:
+        raise AssertionError("artwork fetch follows redirects outside explicit validation")
+
+    for contract in (
+        "context->display.background.value_or",
+        "m_lastOverlayBackgroundUrl",
+        "Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;",
+    ):
+        if contract not in app_source:
+            raise AssertionError(f"claim-bound backdrop propagation is missing {contract!r}")
+
+
 def verify_credential_context_wiring():
     header = CREDENTIAL_STORE_HEADER.read_text(encoding="utf-8")
     source = CREDENTIAL_STORE_SOURCE.read_text(encoding="utf-8")
@@ -3563,6 +3625,7 @@ def main(arguments):
     verify_host_policy_regressions()
     host_test_count = verify_jumpgate_host_test_policy()
     verify_uri_logging_privacy()
+    verify_loading_portal_contract()
     verify_credential_context_wiring()
     verify_back_lifecycle_rejection_contract()
     verify_native_back_wiring()
