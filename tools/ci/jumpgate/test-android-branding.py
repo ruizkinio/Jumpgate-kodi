@@ -535,7 +535,7 @@ def verify_identity():
 
     expected = {
         "APP_NAME": "Jumpgate",
-        "APP_PACKAGE": "io.github.ruizkinio.jumpgate",
+        "APP_PACKAGE": "io.github.ruizkinio.jumpgate.uat",
         "VERSION_TAG": f"ALPHA2-Jumpgate-{jumpgate_version}",
         "VERSION_CODE": "22.0.300",
         "PACKAGE_IDENTITY": "ruizkinio.Jumpgate",
