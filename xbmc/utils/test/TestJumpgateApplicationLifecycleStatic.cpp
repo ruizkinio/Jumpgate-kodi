@@ -385,12 +385,15 @@ TEST(TestJumpgateApplicationLifecycleStatic,
   const std::string hide = FunctionBody(main, "public void hideLoadingOverlay()");
   const std::string admission =
       FunctionBody(main, "public synchronized boolean beginExternalPlayerMode(");
+  const std::string rejectionHide =
+      FunctionBody(main, "private void hideLoadingOverlayForRequest(String requestId)");
   const std::string allowed = FunctionBody(main, "private boolean isAllowedArtworkUrl(");
   const std::string download = FunctionBody(main, "private byte[] downloadOverlayArtwork(");
   const std::string decode = FunctionBody(main, "private Bitmap decodeOverlayArtwork(");
   ASSERT_FALSE(show.empty());
   ASSERT_FALSE(hide.empty());
   ASSERT_FALSE(admission.empty());
+  ASSERT_FALSE(rejectionHide.empty());
   ASSERT_FALSE(allowed.empty());
   ASSERT_FALSE(download.empty());
   ASSERT_FALSE(decode.empty());
@@ -408,7 +411,10 @@ TEST(TestJumpgateApplicationLifecycleStatic,
   EXPECT_EQ(show.find("WindowManager"), std::string::npos);
   EXPECT_EQ(main.find("mWindowManager"), std::string::npos);
   EXPECT_NE(hide.find("parent instanceof ViewGroup"), std::string::npos);
-  EXPECT_LT(admission.find("hideLoadingOverlay();"), admission.find("return true;"));
+  EXPECT_LT(admission.find("hideLoadingOverlayForRequest(requestId);"),
+            admission.find("return true;"));
+  EXPECT_NE(rejectionHide.find("requestId.equals(mLoadingOverlayRequestId)"), std::string::npos);
+  EXPECT_NE(rejectionHide.find("hideLoadingOverlay();"), std::string::npos);
   EXPECT_NE(main.find("mOverlayBackdropView.animate().alpha(0.50f)"), std::string::npos);
   EXPECT_NE(main.find("mOverlayPulseAnimator.setDuration(750L)"), std::string::npos);
   EXPECT_NE(main.find("R.drawable.jumpgate_wordmark"), std::string::npos);
