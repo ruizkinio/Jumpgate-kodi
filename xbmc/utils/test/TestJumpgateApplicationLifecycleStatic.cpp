@@ -394,6 +394,13 @@ TEST(TestJumpgateApplicationLifecycleStatic,
 
   EXPECT_NE(show.find("ImageView.ScaleType.CENTER_CROP"), std::string::npos);
   EXPECT_NE(show.find("dp(200), dp(80)"), std::string::npos);
+  EXPECT_NE(show.find("contentRoot.addView("), std::string::npos);
+  EXPECT_NE(show.find("overlay.setElevation("), std::string::npos);
+  EXPECT_NE(show.find("overlay.bringToFront()"), std::string::npos);
+  EXPECT_NE(show.find("resumeLoadingOverlayAnimations"), std::string::npos);
+  EXPECT_EQ(show.find("WindowManager"), std::string::npos);
+  EXPECT_EQ(main.find("mWindowManager"), std::string::npos);
+  EXPECT_NE(hide.find("parent instanceof ViewGroup"), std::string::npos);
   EXPECT_NE(main.find("mOverlayBackdropView.animate().alpha(0.50f)"), std::string::npos);
   EXPECT_NE(main.find("mOverlayPulseAnimator.setDuration(750L)"), std::string::npos);
   EXPECT_NE(main.find("R.drawable.jumpgate_wordmark"), std::string::npos);

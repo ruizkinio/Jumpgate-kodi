@@ -27,13 +27,13 @@ import android.util.Log;
 import android.util.LruCache;
 import android.util.TypedValue;
 import android.graphics.Color;
-import android.graphics.PixelFormat;
 import android.view.Choreographer;
 import android.view.Gravity;
 import android.view.View;
+import android.view.ViewGroup;
+import android.view.ViewParent;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
-import android.view.WindowManager;
 import android.window.BackEvent;
 import android.window.OnBackAnimationCallback;
 import android.window.OnBackInvokedDispatcher;
@@ -125,9 +125,8 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
   // Pending flag for delayed intents: set to true so when delayed intent fires, mWasStandalone is set.
   private boolean mPendingWasStandalone = false;
 
-  // Loading overlay: WindowManager overlay (separate window layer above SurfaceView)
+  // Loading overlay: one activity window, composited above XBMCMainView's SurfaceView.
   private View mLoadingOverlay = null;
-  private WindowManager mWindowManager = null;
   private ImageView mOverlayBackdropView = null;
   private View mOverlayLogoPulseContainer = null;
   private View mOverlayProgressFill = null;
@@ -323,12 +322,6 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
     super.onCreate(savedInstanceState);
     registerApi36BackCallback();
 
-    // Show loading overlay immediately — before any views or native rendering.
-    // Must be after super.onCreate() (window token needed) but before SurfaceView setup.
-    if (mExternalPlayerMode) {
-      showLoadingOverlay(getIntent());
-    }
-
     setContentView(R.layout.activity_main);
     setVolumeControlStream(AudioManager.STREAM_MUSIC);
 
@@ -381,6 +374,11 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
     RelativeLayout.LayoutParams layoutParams = new RelativeLayout.LayoutParams(RelativeLayout.LayoutParams.MATCH_PARENT, RelativeLayout.LayoutParams.MATCH_PARENT);
     mMainView.setElevation(1);  // Always on Top
     videoLayout.addView(mMainView, layoutParams);
+
+    // Keep the portal in this activity's only application window. A separate WindowManager
+    // surface can race Android TV display/task transitions while the SurfaceView is recreated.
+    if (mExternalPlayerMode)
+      showLoadingOverlay(getIntent());
 
     registerLegacySystemUiVisibilityListener();
   }
@@ -535,6 +533,7 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
       Log.d(TAG, "Main: Warm transition to external player mode (delayed, standalone was running)");
     }
     mPaused = false;
+    resumeLoadingOverlayAnimations();
     dispatchPendingNativeIntents();
   }
 
@@ -576,6 +575,7 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
     }
 
     mPaused = true;
+    pauseLoadingOverlayAnimations();
   }
 
   @Override
@@ -661,6 +661,7 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
   @Override
   public void onDestroy()
   {
+    detachLoadingOverlayImmediately();
     cancelPendingWarmTaskHandoff();
     handler.removeCallbacks(mBackLongPressRunnable);
     unregisterApi36BackCallback();
@@ -1179,10 +1180,9 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
       return;
     }
 
-    mWindowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
-
     FrameLayout overlay = new FrameLayout(this);
     overlay.setBackgroundColor(Color.BLACK);
+    overlay.setElevation(mMainView != null ? mMainView.getElevation() + 1f : 2f);
 
     ImageView backdropView = new ImageView(this);
     backdropView.setScaleType(ImageView.ScaleType.CENTER_CROP);
@@ -1304,68 +1304,94 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
     setLoadingOverlayStatus("Opening selected stream...");
     setLoadingOverlayProgress(8);
 
-    WindowManager.LayoutParams params = new WindowManager.LayoutParams(
-        WindowManager.LayoutParams.MATCH_PARENT,
-        WindowManager.LayoutParams.MATCH_PARENT,
-        WindowManager.LayoutParams.TYPE_APPLICATION,
-        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-            | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-            | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-        PixelFormat.OPAQUE);
-
-    mWindowManager.addView(overlay, params);
+    ViewGroup contentRoot = findViewById(android.R.id.content);
+    if (contentRoot == null) {
+      Log.e(TAG, "Main: Cannot show loading portal without an activity content root");
+      clearLoadingOverlayReferences();
+      return;
+    }
+    contentRoot.addView(
+        overlay,
+        new ViewGroup.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+    overlay.bringToFront();
     mLoadingOverlay = overlay;
     mOverlayShownAtMs = System.currentTimeMillis();
     Log.d(TAG, "Main: Jumpgate loading portal shown");
 
-    startLoadingOverlayAnimations();
-    startLoadingOverlayProgressTicker();
+    overlay.post(this::resumeLoadingOverlayAnimations);
   }
 
   /** Called from native code once synchronized A/V playback is ready to reveal. */
   public void hideLoadingOverlay() {
     runOnUiThread(() -> {
-      if (mOverlayProgressRunnable != null) {
-        handler.removeCallbacks(mOverlayProgressRunnable);
-        mOverlayProgressRunnable = null;
-      }
-
-      if (mOverlayPulseAnimator != null) {
-        mOverlayPulseAnimator.cancel();
-        mOverlayPulseAnimator = null;
-      }
-
+      pauseLoadingOverlayAnimations();
       final View overlay = mLoadingOverlay;
-      mLoadingOverlay = null;
-      mOverlayLogoRequestId = nextOverlayArtworkRequestId();
-      mOverlayBackgroundRequestId = nextOverlayArtworkRequestId();
-      mOverlayBackdropView = null;
-      mOverlayLogoPulseContainer = null;
-      mOverlayProgressFill = null;
-      mOverlayStatusText = null;
-      mOverlayTitleText = null;
-      mOverlayMetaText = null;
-      mOverlayLogoView = null;
-      mOverlayLogoUrl = "";
-      mOverlayBackgroundUrl = "";
-      mOverlayProgress = 0;
+      clearLoadingOverlayReferences();
 
-      if (overlay != null && mWindowManager != null) {
+      if (overlay != null) {
         overlay.animate().cancel();
         overlay.animate().alpha(0f).setDuration(140L).withEndAction(() -> {
-          try {
-            mWindowManager.removeView(overlay);
-          } catch (IllegalArgumentException _e) {
-            // Activity teardown may already have detached this exact overlay.
-          }
+          ViewParent parent = overlay.getParent();
+          if (parent instanceof ViewGroup)
+            ((ViewGroup) parent).removeView(overlay);
         }).start();
         Log.d(TAG, "Main: Loading portal fading into playback");
       }
     });
   }
 
+  private void clearLoadingOverlayReferences() {
+    mLoadingOverlay = null;
+    mOverlayLogoRequestId = nextOverlayArtworkRequestId();
+    mOverlayBackgroundRequestId = nextOverlayArtworkRequestId();
+    mOverlayBackdropView = null;
+    mOverlayLogoPulseContainer = null;
+    mOverlayProgressFill = null;
+    mOverlayStatusText = null;
+    mOverlayTitleText = null;
+    mOverlayMetaText = null;
+    mOverlayLogoView = null;
+    mOverlayLogoUrl = "";
+    mOverlayBackgroundUrl = "";
+    mOverlayProgress = 0;
+  }
+
+  private void detachLoadingOverlayImmediately() {
+    pauseLoadingOverlayAnimations();
+    final View overlay = mLoadingOverlay;
+    clearLoadingOverlayReferences();
+    if (overlay == null)
+      return;
+
+    overlay.animate().cancel();
+    ViewParent parent = overlay.getParent();
+    if (parent instanceof ViewGroup)
+      ((ViewGroup) parent).removeView(overlay);
+  }
+
+  private void resumeLoadingOverlayAnimations() {
+    if (mLoadingOverlay == null || mPaused || !mLoadingOverlay.isAttachedToWindow())
+      return;
+
+    startLoadingOverlayAnimations();
+    startLoadingOverlayProgressTicker();
+  }
+
+  private void pauseLoadingOverlayAnimations() {
+    if (mOverlayProgressRunnable != null) {
+      handler.removeCallbacks(mOverlayProgressRunnable);
+      mOverlayProgressRunnable = null;
+    }
+
+    if (mOverlayPulseAnimator != null) {
+      mOverlayPulseAnimator.cancel();
+      mOverlayPulseAnimator = null;
+    }
+  }
+
   private void startLoadingOverlayAnimations() {
-    if (mOverlayLogoPulseContainer == null) {
+    if (mOverlayLogoPulseContainer == null || mOverlayPulseAnimator != null) {
       return;
     }
 
