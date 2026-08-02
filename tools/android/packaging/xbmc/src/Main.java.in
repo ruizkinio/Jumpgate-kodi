@@ -797,6 +797,7 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
         mExternalResultProducer.admitPrepared(generation, requestId);
     if (admission == null) {
       Log.e(TAG, "Main: External playback lacked exact prepared request ownership");
+      hideLoadingOverlay();
       return true;
     }
     cancelPendingWarmTaskHandoff();

@@ -2570,6 +2570,9 @@ def verify_warm_task_handoff_contract(
     require_in_order(
         active_admission,
         "mExternalResultProducer.admitPrepared(generation, requestId)",
+        "if (admission == null)",
+        "hideLoadingOverlay()",
+        "return true;",
         "cancelPendingWarmTaskHandoff()",
     )
     destruction = extract_braced_block(main_activity, "public void onDestroy()")
