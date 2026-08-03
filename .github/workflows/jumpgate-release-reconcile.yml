@@ -1,0 +1,512 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+name: Jumpgate Release Reconciliation
+
+run-name: Reconcile owned ${{ inputs.release_tag }} draft
+
+'on':
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Exact canonical v<Jumpgate-semver> tag to reconcile
+        required: true
+        type: string
+      release_id:
+        description: Exact workflow-owned draft release ID
+        required: true
+        type: string
+      tag_object_sha:
+        description: Exact workflow-owned annotated tag object SHA
+        required: true
+        type: string
+      source_sha:
+        description: Exact source commit recorded by the owned tag and draft
+        required: true
+        type: string
+      reviewed_ref:
+        description: Exact reviewed ref recorded in the owned draft
+        required: true
+        type: string
+      owner_run_id:
+        description: Exact successful release workflow run that created the draft
+        required: true
+        type: string
+      owner_run_attempt:
+        description: Exact release workflow run attempt that created the draft
+        required: true
+        type: string
+      confirmation:
+        description: RECONCILE <tag> <release-id> <tag-object-sha>
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jumpgate-android-release
+  cancel-in-progress: false
+
+jobs:
+  reconcile_owned_draft:
+    name: Reconcile exact workflow-owned draft and tag
+    if: ${{ github.event_name == 'workflow_dispatch' && github.repository == 'ruizkinio/Jumpgate-kodi' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment:
+      name: android-release
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Verify the claimed owner run with the read-only job token
+        id: owner_run
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          EXPECTED_RELEASE_WORKFLOW_ID: '321201768'
+          OWNER_RUN_ATTEMPT: ${{ inputs.owner_run_attempt }}
+          OWNER_RUN_ID: ${{ inputs.owner_run_id }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const positiveIntegerPattern = /^[1-9][0-9]*$/;
+            const shaPattern = /^[0-9a-f]{40}$/;
+            const runIdText = process.env.OWNER_RUN_ID;
+            const runAttemptText = process.env.OWNER_RUN_ATTEMPT;
+            const workflowIdText = process.env.EXPECTED_RELEASE_WORKFLOW_ID;
+            const sourceSha = process.env.SOURCE_SHA;
+            const tag = process.env.RELEASE_TAG;
+            if (
+              !positiveIntegerPattern.test(runIdText || '')
+              || !positiveIntegerPattern.test(runAttemptText || '')
+              || !positiveIntegerPattern.test(workflowIdText || '')
+              || !shaPattern.test(sourceSha || '')
+              || !/^v[0-9]+\.[0-9]+\.[0-9]+$/.test(tag || '')
+            ) {
+              throw new Error('Claimed owner run identity is malformed');
+            }
+            const runId = Number(runIdText);
+            const runAttempt = Number(runAttemptText);
+            const workflowId = Number(workflowIdText);
+            if (![runId, runAttempt, workflowId].every(Number.isSafeInteger)) {
+              throw new Error('Claimed owner run identity exceeds the safe integer range');
+            }
+            const run = (await github.rest.actions.getWorkflowRun({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: runId,
+            })).data;
+            if (
+              run.id !== runId
+              || run.run_attempt !== runAttempt
+              || run.name !== `Release ${tag} from ${sourceSha}`
+              || run.workflow_id !== workflowId
+              || run.path !== '.github/workflows/jumpgate-android-release.yml'
+              || run.event !== 'workflow_dispatch'
+              || run.head_branch !== context.payload.repository.default_branch
+              || run.head_sha !== sourceSha
+              || run.head_repository?.full_name !== 'ruizkinio/Jumpgate-kodi'
+              || run.status !== 'completed'
+              || run.conclusion !== 'success'
+            ) {
+              throw new Error('Claimed owner run is not the successful canonical release workflow');
+            }
+            core.setOutput('verified', 'true');
+
+      - name: Mint repository-scoped dedicated release App token
+        id: release_app_token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.JUMPGATE_ANDROID_RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.JUMPGATE_ANDROID_RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-administration: write
+          permission-contents: write
+          permission-metadata: read
+
+      - name: Delete only the exact workflow-owned draft and annotated tag
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          EXPECTED_RELEASE_APP_ID: ${{ secrets.JUMPGATE_ANDROID_RELEASE_APP_ID }}
+          EXPECTED_RELEASE_AUTHOR: jumpgate-release-publisher[bot]
+          OWNER_RUN_ATTEMPT: ${{ inputs.owner_run_attempt }}
+          OWNER_RUN_ID: ${{ inputs.owner_run_id }}
+          OWNER_RUN_VERIFIED: ${{ steps.owner_run.outputs.verified }}
+          RECONCILE_CONFIRMATION: ${{ inputs.confirmation }}
+          RELEASE_ID: ${{ inputs.release_id }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          REVIEWED_REF: ${{ inputs.reviewed_ref }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          TAG_OBJECT_SHA: ${{ inputs.tag_object_sha }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        with:
+          github-token: ${{ steps.release_app_token.outputs.token }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const repository = `${owner}/${repo}`;
+            const canonicalRepository = 'ruizkinio/Jumpgate-kodi';
+            const shaPattern = /^[0-9a-f]{40}$/;
+            const positiveIntegerPattern = /^[1-9][0-9]*$/;
+            const tagPattern = /^v[0-9]+\.[0-9]+\.[0-9]+$/;
+            const releaseIdText = process.env.RELEASE_ID;
+            const ownerRunIdText = process.env.OWNER_RUN_ID;
+            const ownerRunAttemptText = process.env.OWNER_RUN_ATTEMPT;
+            const expectedAppIdText = process.env.EXPECTED_RELEASE_APP_ID;
+            const releaseId = Number(releaseIdText);
+            const ownerRunId = Number(ownerRunIdText);
+            const ownerRunAttempt = Number(ownerRunAttemptText);
+            const expectedAppId = Number(expectedAppIdText);
+            const tag = process.env.RELEASE_TAG;
+            const sourceSha = process.env.SOURCE_SHA;
+            const reviewedRef = process.env.REVIEWED_REF;
+            const tagObjectSha = process.env.TAG_OBJECT_SHA;
+            const workflowSha = process.env.WORKFLOW_SHA;
+            const expectedReleaseAuthor = process.env.EXPECTED_RELEASE_AUTHOR;
+            const confirmation = process.env.RECONCILE_CONFIRMATION;
+            const defaultBranch = context.payload.repository.default_branch;
+            const fullTagRef = `refs/tags/${tag}`;
+            const shortTagRef = `tags/${tag}`;
+
+            function fail(message) {
+              throw new Error(message);
+            }
+
+            if (
+              repository !== canonicalRepository
+              || context.eventName !== 'workflow_dispatch'
+              || context.ref !== `refs/heads/${defaultBranch}`
+              || !shaPattern.test(workflowSha || '')
+            ) {
+              fail('Reconciliation must run from the canonical default-branch workflow commit');
+            }
+            for (const [label, value] of [
+              ['release ID', releaseIdText],
+              ['owner run ID', ownerRunIdText],
+              ['owner run attempt', ownerRunAttemptText],
+              ['release App ID', expectedAppIdText],
+            ]) {
+              if (!positiveIntegerPattern.test(value || '')) fail(`${label} is malformed`);
+            }
+            if (
+              !Number.isSafeInteger(releaseId)
+              || !Number.isSafeInteger(ownerRunId)
+              || !Number.isSafeInteger(ownerRunAttempt)
+              || !Number.isSafeInteger(expectedAppId)
+            ) {
+              fail('Numeric reconciliation identity exceeds the safe integer range');
+            }
+            if (
+              !tagPattern.test(tag || '')
+              || !shaPattern.test(sourceSha || '')
+              || !shaPattern.test(tagObjectSha || '')
+              || !reviewedRef
+              || reviewedRef.length > 255
+              || /[\u0000-\u001f\u007f]/.test(reviewedRef)
+            ) {
+              fail('Tag, source, tag object, or reviewed ref is malformed');
+            }
+            if (confirmation !== `RECONCILE ${tag} ${releaseIdText} ${tagObjectSha}`) {
+              fail('Explicit reconciliation confirmation does not match the exact target');
+            }
+
+            const retryableStatuses = new Set([404, 409, 422, 500, 502, 503, 504]);
+
+            async function retryRead(label, operation, retryNotFound = false) {
+              const attempts = 7;
+              for (let attempt = 0; attempt < attempts; attempt += 1) {
+                try {
+                  return await operation();
+                } catch (error) {
+                  const retryable = retryableStatuses.has(error.status)
+                    && (error.status !== 404 || retryNotFound);
+                  if (attempt + 1 >= attempts || !retryable) fail(label);
+                  await new Promise((resolve) => setTimeout(resolve, Math.min(250 * (2 ** attempt), 2000)));
+                }
+              }
+              fail(label);
+            }
+
+            async function listAllReleases() {
+              return await retryRead(
+                'Unable to enumerate the complete release inventory',
+                async () => await github.paginate(github.rest.repos.listReleases, {
+                  owner,
+                  repo,
+                  per_page: 100,
+                }),
+              );
+            }
+
+            async function assertDefaultBranchHead() {
+              const [repositoryState, branchState] = await Promise.all([
+                github.rest.repos.get({owner, repo}),
+                github.rest.git.getRef({owner, repo, ref: `heads/${defaultBranch}`}),
+              ]);
+              if (
+                repositoryState.data.full_name !== canonicalRepository
+                || repositoryState.data.default_branch !== defaultBranch
+                || branchState.data.ref !== `refs/heads/${defaultBranch}`
+                || branchState.data.object?.type !== 'commit'
+                || branchState.data.object?.sha !== workflowSha
+              ) {
+                fail('Canonical default-branch head changed during reconciliation');
+              }
+            }
+
+            async function assertRequiredTagRuleset() {
+              const summaries = await retryRead(
+                'Unable to enumerate the protected release-tag ruleset',
+                async () => await github.paginate(github.rest.repos.getRepoRulesets, {
+                  owner,
+                  repo,
+                  includes_parents: true,
+                  per_page: 100,
+                  targets: 'tag',
+                }),
+              );
+              const active = summaries.filter((ruleset) => ruleset.enforcement === 'active');
+              if (active.length !== 1 || active[0].target !== 'tag') {
+                fail('Reconciliation requires exactly one active release-tag ruleset');
+              }
+              const details = (await github.rest.repos.getRepoRuleset({
+                owner,
+                repo,
+                ruleset_id: active[0].id,
+              })).data;
+              const ruleTypes = new Set((details.rules || []).map((rule) => rule.type));
+              const actors = details.bypass_actors || [];
+              if (
+                details.enforcement !== 'active'
+                || details.target !== 'tag'
+                || JSON.stringify(details.conditions?.ref_name?.include) !== JSON.stringify(['refs/tags/v*'])
+                || JSON.stringify(details.conditions?.ref_name?.exclude) !== JSON.stringify([])
+                || !['creation', 'update', 'deletion'].every((type) => ruleTypes.has(type))
+                || actors.length !== 1
+                || actors[0].actor_type !== 'Integration'
+                || actors[0].actor_id !== expectedAppId
+                || actors[0].bypass_mode !== 'always'
+              ) {
+                fail('Release-tag ruleset does not isolate mutation to the dedicated release App');
+              }
+            }
+
+            function assertReleaseAssets(assets, versionName) {
+              const expected = new Map([
+                [`Jumpgate-${versionName}-arm64-v8a.apk`, 'application/vnd.android.package-archive'],
+                [`Jumpgate-${versionName}-arm64-v8a.spdx.json`, 'application/octet-stream'],
+                [`Jumpgate-${versionName}-armeabi-v7a.apk`, 'application/vnd.android.package-archive'],
+                [`Jumpgate-${versionName}-armeabi-v7a.spdx.json`, 'application/octet-stream'],
+                [`Jumpgate-${versionName}-metadata.json`, 'application/octet-stream'],
+                [`Jumpgate-${versionName}-provenance.json`, 'application/octet-stream'],
+                ['SHA256SUMS', 'application/octet-stream'],
+              ]);
+              const ids = new Set();
+              if (!Array.isArray(assets) || assets.length !== expected.size) {
+                fail('Owned draft does not contain the exact release asset set');
+              }
+              for (const asset of assets) {
+                if (
+                  !expected.has(asset.name)
+                  || asset.content_type !== expected.get(asset.name)
+                  || asset.state !== 'uploaded'
+                  || !Number.isSafeInteger(asset.id)
+                  || asset.id <= 0
+                  || ids.has(asset.id)
+                  || !Number.isSafeInteger(asset.size)
+                  || asset.size <= 0
+                  || asset.size > 2 * 1024 * 1024 * 1024
+                  || !/^sha256:[0-9a-f]{64}$/.test(asset.digest || '')
+                ) {
+                  fail('Owned draft release asset binding is malformed');
+                }
+                ids.add(asset.id);
+                expected.delete(asset.name);
+              }
+              if (expected.size !== 0) fail('Owned draft release asset set is incomplete');
+            }
+
+            function assertOwnedRelease(release) {
+              const releaseNamePrefix = 'Jumpgate ';
+              const versionName = release?.name?.startsWith(releaseNamePrefix)
+                ? release.name.slice(releaseNamePrefix.length)
+                : '';
+              const bodyLines = typeof release?.body === 'string' ? release.body.split('\n') : [];
+              if (
+                release?.id !== releaseId
+                || release.tag_name !== tag
+                || release.target_commitish !== sourceSha
+                || release.draft !== true
+                || release.prerelease !== false
+                || release.immutable !== false
+                || release.published_at !== null
+                || release.author?.login !== expectedReleaseAuthor
+                || !/^22\.0-ALPHA2-Jumpgate-[0-9]+\.[0-9]+\.[0-9]+$/.test(versionName)
+                || bodyLines.length !== 8
+                || bodyLines[0] !== 'Protected Android release candidate.'
+                || bodyLines[1] !== ''
+                || bodyLines[2] !== `Reviewed source: ${reviewedRef}`
+                || bodyLines[3] !== `Commit: ${sourceSha}`
+                || bodyLines[4] !== `Annotated tag object: ${tagObjectSha}`
+                || !new RegExp(`^Artifact attestation: https://github\\.com/${canonicalRepository}/attestations/[1-9][0-9]*$`).test(bodyLines[5])
+                || bodyLines[6] !== ''
+                || bodyLines[7] !== 'This draft must complete device UAT before publication.'
+              ) {
+                fail('Draft release does not match the exact workflow-owned identity');
+              }
+              assertReleaseAssets(release.assets, versionName);
+            }
+
+            async function readReleaseState() {
+              let release = null;
+              try {
+                release = (await github.rest.repos.getRelease({owner, repo, release_id: releaseId})).data;
+              } catch (error) {
+                if (error.status !== 404) throw error;
+              }
+              const matches = (await listAllReleases()).filter((candidate) => candidate.tag_name === tag);
+              if (matches.length > 1 || (release && (matches.length !== 1 || matches[0].id !== releaseId))) {
+                fail('Release inventory does not uniquely bind the claimed owned draft');
+              }
+              if (!release && matches.length !== 0) {
+                fail('Target tag is bound to a different release ID');
+              }
+              if (release) assertOwnedRelease(release);
+              return release;
+            }
+
+            function assertOwnedTagObject(tagObject) {
+              const expectedMessage = [
+                'Jumpgate Android release tag',
+                '',
+                `Ownership: jumpgate-android-release-owner-v1:${canonicalRepository}:${ownerRunId}:${ownerRunAttempt}:${tag}:${sourceSha}`,
+                `Reviewed source: ${reviewedRef}`,
+              ].join('\n');
+              if (
+                tagObject?.sha !== tagObjectSha
+                || tagObject.tag !== tag
+                || tagObject.message !== expectedMessage
+                || tagObject.object?.type !== 'commit'
+                || tagObject.object?.sha !== sourceSha
+                || tagObject.tagger?.name !== expectedReleaseAuthor
+                || !/^305594533\+jumpgate-release-publisher\[bot\]@users\.noreply\.github\.com$/.test(tagObject.tagger?.email || '')
+              ) {
+                fail('Annotated tag does not match the exact workflow-owned identity');
+              }
+            }
+
+            async function readTagState() {
+              let ref;
+              try {
+                ref = (await github.rest.git.getRef({owner, repo, ref: shortTagRef})).data;
+              } catch (error) {
+                if (error.status === 404) return null;
+                throw error;
+              }
+              if (
+                ref.ref !== fullTagRef
+                || ref.object?.type !== 'tag'
+                || ref.object?.sha !== tagObjectSha
+              ) {
+                fail('Release tag ref does not match the claimed annotated tag object');
+              }
+              const tagObject = (await github.rest.git.getTag({
+                owner,
+                repo,
+                tag_sha: tagObjectSha,
+              })).data;
+              assertOwnedTagObject(tagObject);
+              return tagObject;
+            }
+
+            async function waitForReleaseAbsent() {
+              const attempts = 7;
+              for (let attempt = 0; attempt < attempts; attempt += 1) {
+                let byId;
+                try {
+                  byId = (await github.rest.repos.getRelease({owner, repo, release_id: releaseId})).data;
+                } catch (error) {
+                  if (error.status === 404) byId = null;
+                  else if (retryableStatuses.has(error.status)) byId = undefined;
+                  else throw error;
+                }
+                const matches = (await listAllReleases()).filter((candidate) => candidate.tag_name === tag);
+                if (byId === null && matches.length === 0) return;
+                if (byId && byId.id !== releaseId) fail('Release ID was replaced during deletion');
+                if (matches.some((candidate) => candidate.id !== releaseId)) {
+                  fail('Target tag was rebound to another release during deletion');
+                }
+                if (attempt + 1 < attempts) {
+                  await new Promise((resolve) => setTimeout(resolve, Math.min(250 * (2 ** attempt), 2000)));
+                }
+              }
+              fail('Owned draft release deletion did not converge');
+            }
+
+            async function waitForTagAbsent() {
+              const attempts = 7;
+              for (let attempt = 0; attempt < attempts; attempt += 1) {
+                let exactRef;
+                try {
+                  exactRef = (await github.rest.git.getRef({owner, repo, ref: shortTagRef})).data;
+                } catch (error) {
+                  if (error.status === 404) exactRef = null;
+                  else if (retryableStatuses.has(error.status)) exactRef = undefined;
+                  else throw error;
+                }
+                const matches = await github.paginate(github.rest.git.listMatchingRefs, {
+                  owner,
+                  repo,
+                  ref: `tags/${tag}`,
+                  per_page: 100,
+                });
+                const canonicalMatches = matches.filter((candidate) => candidate.ref === fullTagRef);
+                if (exactRef === null && canonicalMatches.length === 0) return;
+                if (exactRef && exactRef.object?.sha !== tagObjectSha) {
+                  fail('Target tag was replaced during deletion');
+                }
+                if (canonicalMatches.some((candidate) => candidate.object?.sha !== tagObjectSha)) {
+                  fail('Target tag listing was rebound during deletion');
+                }
+                if (attempt + 1 < attempts) {
+                  await new Promise((resolve) => setTimeout(resolve, Math.min(250 * (2 ** attempt), 2000)));
+                }
+              }
+              fail('Owned annotated tag deletion did not converge');
+            }
+
+            if (process.env.OWNER_RUN_VERIFIED !== 'true') {
+              fail('Claimed owner run was not verified by the read-only preflight');
+            }
+            await Promise.all([assertDefaultBranchHead(), assertRequiredTagRuleset()]);
+            let release = await readReleaseState();
+            let tagObject = await readTagState();
+            if (!release && !tagObject) fail('Exact owned draft and tag are already absent');
+
+            if (release) {
+              await Promise.all([assertDefaultBranchHead(), assertRequiredTagRuleset()]);
+              release = await readReleaseState();
+              if (release) {
+                await github.rest.repos.deleteRelease({owner, repo, release_id: releaseId});
+                await waitForReleaseAbsent();
+              }
+            }
+
+            tagObject = await readTagState();
+            if (tagObject) {
+              await Promise.all([assertDefaultBranchHead(), assertRequiredTagRuleset()]);
+              tagObject = await readTagState();
+              if (tagObject) {
+                await github.rest.git.deleteRef({owner, repo, ref: shortTagRef});
+                await waitForTagAbsent();
+              }
+            }
+
+            await Promise.all([assertDefaultBranchHead(), assertRequiredTagRuleset()]);
+            if (await readReleaseState() || await readTagState()) {
+              fail('Owned release state reappeared after reconciliation');
+            }
+            core.notice(`Reconciled exact workflow-owned ${tag} draft ${releaseId} and tag ${tagObjectSha}`);
