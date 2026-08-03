@@ -1985,6 +1985,14 @@ def verify_loading_portal_contract():
     for contract in (
         "ImageView.ScaleType.CENTER_CROP",
         "dp(200), dp(80)",
+        "contentRoot.addView(",
+        "overlay.setElevation(",
+        "overlay.bringToFront()",
+        "LoadingPortalSurfaceView extends SurfaceView",
+        "setZOrderOnTop(true)",
+        "getHolder().lockHardwareCanvas()",
+        "scene.draw(canvas)",
+        "resumeLoadingOverlayAnimations",
         "mOverlayBackdropView.animate().alpha(0.50f)",
         "mOverlayPulseAnimator.setDuration(750L)",
         "R.drawable.jumpgate_wordmark",
@@ -1997,6 +2005,8 @@ def verify_loading_portal_contract():
             raise AssertionError(f"loading portal is missing {contract!r}")
     for forbidden in (
         "postDelayed(() -> hideLoadingOverlay(), 30000)",
+        "mWindowManager",
+        "WindowManager.LayoutParams",
         "bmp.compress(",
     ):
         if forbidden in main_activity:
@@ -2560,7 +2570,19 @@ def verify_warm_task_handoff_contract(
     require_in_order(
         active_admission,
         "mExternalResultProducer.admitPrepared(generation, requestId)",
+        "if (admission == null)",
+        "hideLoadingOverlayForRequest(requestId)",
+        "return true;",
         "cancelPendingWarmTaskHandoff()",
+    )
+    rejection_hide = extract_braced_block(
+        main_activity, "private void hideLoadingOverlayForRequest(String requestId)"
+    )
+    require_in_order(
+        rejection_hide,
+        "ExternalPlayerResultCoordinator.isValidRequestId(requestId)",
+        "requestId.equals(mLoadingOverlayRequestId)",
+        "hideLoadingOverlay()",
     )
     destruction = extract_braced_block(main_activity, "public void onDestroy()")
     require_in_order(
