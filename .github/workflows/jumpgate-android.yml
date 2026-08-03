@@ -351,6 +351,7 @@ jobs:
           python3 tools/ci/jumpgate/test-manager-addon.py
           python3 tools/ci/jumpgate/test-android-branding.py
           python3 tools/ci/jumpgate/test-jumpgate-android-release-workflow.py
+          python3 tools/ci/jumpgate/test-jumpgate-release-reconcile-workflow.py
           bash tools/ci/jumpgate/test-verify-shairplay-crypto-symbols.sh
           python3 tools/ci/jumpgate/test-verify-android-python-runtime.py
           bash tools/ci/jumpgate/test-verify-android-apk.sh
