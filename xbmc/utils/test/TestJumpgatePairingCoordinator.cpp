@@ -205,6 +205,12 @@ public:
     return m_deadlines;
   }
 
+  std::vector<std::string> Bodies() const
+  {
+    std::lock_guard lock(m_mutex);
+    return m_bodies;
+  }
+
   int CancelCalls() const
   {
     std::lock_guard lock(m_mutex);
@@ -275,10 +281,11 @@ struct CoordinatorHarness
     clock->ReleaseBlockedNow();
   }
 
-  bool Start()
+  bool Start(const std::string& validationScenario = {})
   {
     JumpgatePairingRequest request;
     request.bridgeOrigin = ORIGIN;
+    request.validationScenario = validationScenario;
     return coordinator.Start(
         std::move(request),
         [this](std::string json, const std::string& origin, const std::string& name)
@@ -409,6 +416,31 @@ struct CoordinatorHarness
   CJumpgatePairingCoordinator coordinator;
 };
 } // namespace
+
+TEST(TestJumpgatePairingCoordinator, NormalIssuanceOmitsReleaseValidationScenario)
+{
+  CoordinatorHarness harness;
+  harness.transport->Push(JsonResponse(IssueResponse()));
+  ASSERT_TRUE(harness.Start());
+  ASSERT_TRUE(harness.transport->WaitForCalls(1));
+  const auto bodies = harness.transport->Bodies();
+  ASSERT_EQ(bodies.size(), 1U);
+  EXPECT_EQ(bodies[0].find("validationScenario"), std::string::npos);
+  harness.coordinator.Cancel();
+}
+
+TEST(TestJumpgatePairingCoordinator, ValidationIssuanceIncludesExactScenario)
+{
+  CoordinatorHarness harness;
+  harness.transport->Push(JsonResponse(IssueResponse()));
+  ASSERT_TRUE(harness.Start("delayed-poll"));
+  ASSERT_TRUE(harness.transport->WaitForCalls(1));
+  const auto bodies = harness.transport->Bodies();
+  ASSERT_EQ(bodies.size(), 1U);
+  EXPECT_NE(bodies[0].find("\"validationScenario\""), std::string::npos);
+  EXPECT_NE(bodies[0].find("\"delayed-poll\""), std::string::npos);
+  harness.coordinator.Cancel();
+}
 
 TEST(TestJumpgatePairingCoordinator, PollsInOrderAndWaitsForSecureCommitBeforeApplied)
 {

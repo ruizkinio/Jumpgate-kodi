@@ -28,6 +28,7 @@
 #include "utils/Variant.h"
 
 #include <atomic>
+#include <chrono>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -342,12 +343,14 @@ private:
   void run();
   void stop();
   void SetupEnv();
-  void StartBridgePairing();
+  void StartBridgePairing(const std::string& validationScenario = {});
+  void ShowJumpgateReleaseValidationManager();
   static std::string GetBridgeOriginFromUrl(const std::string& currentUrl);
   void StopBridgePairingWorker(bool clearPendingState, bool waitForCompletion = true);
   void QueuePairingRedemption(std::string responseJson,
                               const std::string& origin,
-                              const std::string& profileName);
+                              const std::string& profileName,
+                              const std::string& validationScenario);
   void UpdateLoadingOverlayContentInfo(bool force);
   uint64_t QueuePlaybackSourceClaim(const std::string& rawLaunchUri, int64_t launchedAtMs);
   std::optional<KODI::JUMPGATE::CJumpgatePlaybackAuthority::Event> BeginExternalPlaybackAdmission(
@@ -547,6 +550,8 @@ private:
   std::string m_pairingRedemptionJson;
   std::string m_pairingRedemptionOrigin;
   std::string m_pairingApplyProfileName;
+  std::string m_pairingApplyValidationScenario;
+  std::chrono::steady_clock::time_point m_pairingApplyNotBefore{};
   bool m_updateChecked{false};
   bool m_overlayHidden{false};
   std::string m_lastOverlayTitle;

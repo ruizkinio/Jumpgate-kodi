@@ -83,6 +83,7 @@ struct JumpgatePairingRequest
 {
   std::string bridgeOrigin;
   std::string deviceName{"Jumpgate"};
+  std::string validationScenario;
 };
 
 using JumpgatePairingRedemptionHandler = std::function<void(
