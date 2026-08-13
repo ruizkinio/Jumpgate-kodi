@@ -91,6 +91,7 @@
 #include "platform/android/storage/AndroidStorageProvider.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <charconv>
 #include <condition_variable>
@@ -98,6 +99,7 @@
 #include <memory>
 #include <mutex>
 #include <sstream>
+#include <string_view>
 #include <stdlib.h>
 #include <string.h>
 #include <thread>
@@ -3033,15 +3035,37 @@ std::string CXBMCApp::GetBridgeOriginFromUrl(const std::string& currentUrl)
   return scheme + "://" + authority;
 }
 
+namespace
+{
+constexpr const char* JUMPGATE_RELEASE_VALIDATION_ORIGIN = "https://jumpgate-uat.fly.dev";
+constexpr auto JUMPGATE_RELEASE_VALIDATION_APPLY_DELAY = std::chrono::seconds(8);
+constexpr std::array<std::string_view, 8> JUMPGATE_RELEASE_VALIDATION_SCENARIOS{
+    "normal",       "delayed-issue", "delayed-poll", "short-expiry",
+    "rate-limit",   "terminal-failure", "apply-delay", "apply-failure"};
+
+bool IsJumpgateReleaseValidationScenario(std::string_view scenario)
+{
+  return std::find(JUMPGATE_RELEASE_VALIDATION_SCENARIOS.begin(),
+                   JUMPGATE_RELEASE_VALIDATION_SCENARIOS.end(),
+                   scenario) != JUMPGATE_RELEASE_VALIDATION_SCENARIOS.end();
+}
+} // namespace
+
 void CXBMCApp::QueuePairingRedemption(std::string responseJson,
                                       const std::string& origin,
-                                      const std::string& profileName)
+                                      const std::string& profileName,
+                                      const std::string& validationScenario)
 {
   std::unique_lock lock(m_pairingMutex);
   ClearSensitiveString(m_pairingRedemptionJson);
   m_pairingRedemptionJson = std::move(responseJson);
   m_pairingRedemptionOrigin = origin;
   m_pairingApplyProfileName = profileName;
+  m_pairingApplyValidationScenario = validationScenario;
+  m_pairingApplyNotBefore = validationScenario == "apply-delay"
+                                ? std::chrono::steady_clock::now() +
+                                      JUMPGATE_RELEASE_VALIDATION_APPLY_DELAY
+                                : std::chrono::steady_clock::time_point{};
   m_pairingRedemptionPending = true;
 }
 
@@ -3070,13 +3094,21 @@ void CXBMCApp::StopBridgePairingWorker(bool clearPendingState, bool waitForCompl
     ClearSensitiveString(m_pairingRedemptionJson);
     m_pairingRedemptionOrigin.clear();
     m_pairingApplyProfileName.clear();
+    m_pairingApplyValidationScenario.clear();
+    m_pairingApplyNotBefore = {};
     if (waitForCompletion && m_pairingCoordinator == coordinator)
       m_pairingCoordinator.reset();
   }
 }
 
-void CXBMCApp::StartBridgePairing()
+void CXBMCApp::StartBridgePairing(const std::string& validationScenario)
 {
+  if (!validationScenario.empty() && !IsJumpgateReleaseValidationScenario(validationScenario))
+  {
+    CGUIDialogKaiToast::QueueNotification(CGUIDialogKaiToast::Error, "Jumpgate",
+                                          "Unknown release-validation scenario", 5000, true);
+    return;
+  }
   bool canMutateProfile = false;
   {
     auto authorityTransaction = m_playbackAuthority.BeginTransaction();
@@ -3118,7 +3150,8 @@ void CXBMCApp::StartBridgePairing()
 
   // Capture one immutable origin. Code issuance, polling, response validation,
   // and credential commit all remain bound to this exact origin.
-  const std::string origin = m_jumpgateProfileRuntime->GetPairingOrigin();
+  const std::string origin = validationScenario.empty() ? m_jumpgateProfileRuntime->GetPairingOrigin()
+                                                         : JUMPGATE_RELEASE_VALIDATION_ORIGIN;
   if (!KODI::JUMPGATE::IsValidPairingOrigin(origin, true))
   {
     CGUIDialogKaiToast::QueueNotification(CGUIDialogKaiToast::Error, "Jumpgate",
@@ -3136,13 +3169,15 @@ void CXBMCApp::StartBridgePairing()
   KODI::JUMPGATE::JumpgatePairingRequest request;
   request.bridgeOrigin = origin;
   request.deviceName = "Jumpgate";
+  request.validationScenario = validationScenario;
   const bool started = coordinator->Start(
       std::move(request),
-      [this](std::string responseJson, const std::string& responseOrigin,
-             const std::string& profileName)
+      [this, validationScenario](std::string responseJson, const std::string& responseOrigin,
+                                const std::string& profileName)
       {
         // AndroidKeyStore and profile activation remain on Kodi's main thread.
-        QueuePairingRedemption(std::move(responseJson), responseOrigin, profileName);
+        QueuePairingRedemption(std::move(responseJson), responseOrigin, profileName,
+                               validationScenario);
       },
       [](const std::string& verificationUrl) { return RenderJumpgatePairingQr(verificationUrl); },
       [](const std::string& path) { XFILE::CFile::Delete(path); });
@@ -3166,6 +3201,34 @@ void CXBMCApp::StartBridgePairing()
   dialog->SetCoordinator(coordinator);
   dialog->Open();
   StopBridgePairingWorker(false);
+}
+
+void CXBMCApp::ShowJumpgateReleaseValidationManager()
+{
+  CGUIDialogSelect* dialog =
+      CServiceBroker::GetGUI()->GetWindowManager().GetWindow<CGUIDialogSelect>(
+          WINDOW_DIALOG_SELECT);
+  if (!dialog)
+    return;
+
+  dialog->Reset();
+  dialog->SetHeading(CVariant{"Release Validation - Maintainers Only"});
+  dialog->Add("Normal UAT pairing");
+  dialog->Add("Delayed code issuance");
+  dialog->Add("Delayed token polling");
+  dialog->Add("Short expiry boundary");
+  dialog->Add("One bounded HTTP 429");
+  dialog->Add("Injected terminal failure");
+  dialog->Add("Delayed secure commit");
+  dialog->Add("Injected secure-commit failure");
+  dialog->Open();
+  if (!dialog->IsConfirmed())
+    return;
+
+  const int selected = dialog->GetSelectedItem();
+  if (selected < 0 || selected >= static_cast<int>(JUMPGATE_RELEASE_VALIDATION_SCENARIOS.size()))
+    return;
+  StartBridgePairing(std::string{JUMPGATE_RELEASE_VALIDATION_SCENARIOS[selected]});
 }
 
 void CXBMCApp::CheckForUpdate()
@@ -3383,6 +3446,7 @@ void CXBMCApp::ShowJumpgateProfileManager()
   dialog->Add("Forget Profile");
   dialog->Add("Use Unpaired Local Mode");
   dialog->Add("Show Saved Profiles");
+  dialog->Add("Release Validation (Maintainers Only)");
   dialog->Open();
   if (!dialog->IsConfirmed())
     return;
@@ -3403,6 +3467,9 @@ void CXBMCApp::ShowJumpgateProfileManager()
       break;
     case 4:
       HandleJumpgateManagerCommand("show");
+      break;
+    case 5:
+      ShowJumpgateReleaseValidationManager();
       break;
     default:
       break;
@@ -3635,19 +3702,23 @@ void CXBMCApp::ProcessSlow()
     std::string pairingRedemptionJson;
     std::string pairingRedemptionOrigin;
     std::string pairingProfileName;
+    std::string pairingValidationScenario;
     std::string pairingErrorMessage;
     std::string pairingWarningMessage;
     std::shared_ptr<KODI::JUMPGATE::CJumpgatePairingCoordinator> pairingCoordinator;
     bool pairingProfilePreviouslyKnown = false;
     bool pairingRedemptionPending = false;
+    bool pairingApplyDelayElapsed = true;
     {
       std::unique_lock lock(m_pairingMutex);
       pairingRedemptionPending = m_pairingRedemptionPending;
       pairingCoordinator = m_pairingCoordinator;
+      if (pairingRedemptionPending && m_pairingApplyValidationScenario == "apply-delay")
+        pairingApplyDelayElapsed = std::chrono::steady_clock::now() >= m_pairingApplyNotBefore;
     }
 
     std::optional<KODI::JUMPGATE::CJumpgatePlaybackAuthority::Token> transitionToken;
-    if (pairingRedemptionPending)
+    if (pairingRedemptionPending && pairingApplyDelayElapsed)
     {
       std::string transitionError;
       transitionToken = BeginJumpgateProfileAuthorityTransition(transitionError);
@@ -3659,6 +3730,8 @@ void CXBMCApp::ProcessSlow()
           pairingRedemptionJson.swap(m_pairingRedemptionJson);
           pairingRedemptionOrigin.swap(m_pairingRedemptionOrigin);
           pairingProfileName.swap(m_pairingApplyProfileName);
+          pairingValidationScenario.swap(m_pairingApplyValidationScenario);
+          m_pairingApplyNotBefore = {};
           m_pairingRedemptionPending = false;
           m_pairingApplyProfileName.clear();
         }
@@ -3673,6 +3746,8 @@ void CXBMCApp::ProcessSlow()
             pairingRedemptionJson.swap(m_pairingRedemptionJson);
             m_pairingRedemptionOrigin.clear();
             m_pairingApplyProfileName.clear();
+            m_pairingApplyValidationScenario.clear();
+            m_pairingApplyNotBefore = {};
             m_pairingRedemptionPending = false;
             rejectedPendingRedemption = true;
           }
@@ -3707,6 +3782,13 @@ void CXBMCApp::ProcessSlow()
       auto historyAction = KODI::JUMPGATE::JumpgatePairingHistoryAction::None;
       KODI::JUMPGATE::ProfileMutationResult pairingResult;
       const int64_t now = static_cast<int64_t>(std::time(nullptr));
+      if (pairingErrorMessage.empty() && !pairingValidationScenario.empty())
+      {
+        pairingProfileName = "Release Validation - " + pairingValidationScenario;
+        redemption["name"] = pairingProfileName;
+      }
+      if (pairingValidationScenario == "apply-failure")
+        pairingErrorMessage = "Injected release-validation secure-commit failure";
       if (pairingErrorMessage.empty() && !InitializeJumpgateProfileRuntime())
         pairingErrorMessage = "Pairing profile runtime initialization failed";
       if (pairingErrorMessage.empty() && redemption.isMember("profileId") &&

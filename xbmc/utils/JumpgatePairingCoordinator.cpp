@@ -296,6 +296,8 @@ void CJumpgatePairingCoordinator::Run()
 
   CVariant issueBody(CVariant::VariantTypeObject);
   issueBody["deviceName"] = request.deviceName;
+  if (!request.validationScenario.empty())
+    issueBody["validationScenario"] = request.validationScenario;
   std::string issueBodyJson;
   if (!CJSONVariantWriter::Write(issueBody, issueBodyJson, true))
   {

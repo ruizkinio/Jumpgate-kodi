@@ -3619,6 +3619,94 @@ def verify_back_lifecycle_rejection_contract():
     )
 
 
+def verify_release_validation_pairing_contract():
+    app_header = APP_HEADER.read_text(encoding="utf-8")
+    app_source = APP_SOURCE.read_text(encoding="utf-8")
+    coordinator_header = (
+        ROOT / "xbmc" / "utils" / "JumpgatePairingCoordinator.h"
+    ).read_text(encoding="utf-8")
+    coordinator_source = (
+        ROOT / "xbmc" / "utils" / "JumpgatePairingCoordinator.cpp"
+    ).read_text(encoding="utf-8")
+    coordinator_test = (
+        ROOT / "xbmc" / "utils" / "test" / "TestJumpgatePairingCoordinator.cpp"
+    ).read_text(encoding="utf-8")
+
+    origin = '"https://jumpgate-uat.fly.dev"'
+    if app_source.count(origin) != 1:
+        raise AssertionError("release validation must use one exact hardcoded UAT origin")
+
+    expected_scenarios = (
+        "normal",
+        "delayed-issue",
+        "delayed-poll",
+        "short-expiry",
+        "rate-limit",
+        "terminal-failure",
+        "apply-delay",
+        "apply-failure",
+    )
+    allowlist_start = app_source.find("JUMPGATE_RELEASE_VALIDATION_SCENARIOS{")
+    allowlist_end = app_source.find("};", allowlist_start)
+    if allowlist_start < 0 or allowlist_end < 0:
+        raise AssertionError("release-validation scenario allowlist is missing")
+    allowlist = app_source[allowlist_start:allowlist_end]
+    for scenario in expected_scenarios:
+        if allowlist.count(f'"{scenario}"') != 1:
+            raise AssertionError(
+                f"release-validation scenario allowlist drifted for {scenario!r}"
+            )
+    if len(re.findall(r'"[a-z][a-z-]+"', allowlist)) != len(expected_scenarios):
+        raise AssertionError("release-validation scenario allowlist is not exact")
+
+    manager = extract_braced_block(
+        app_source, "void CXBMCApp::ShowJumpgateReleaseValidationManager()"
+    )
+    for forbidden in ("ShowAndGetInput", "GetPairingOrigin", "bridgeOrigin"):
+        if forbidden in manager:
+            raise AssertionError(
+                f"release-validation manager exposes arbitrary origin input via {forbidden}"
+            )
+    require_in_order(
+        manager,
+        "Release Validation - Maintainers Only",
+        "StartBridgePairing",
+        "JUMPGATE_RELEASE_VALIDATION_SCENARIOS[selected]",
+    )
+
+    pairing_start = extract_braced_block(
+        app_source, "void CXBMCApp::StartBridgePairing("
+    )
+    for contract in (
+        "IsJumpgateReleaseValidationScenario(validationScenario)",
+        "validationScenario.empty() ? m_jumpgateProfileRuntime->GetPairingOrigin()",
+        "JUMPGATE_RELEASE_VALIDATION_ORIGIN",
+        "request.validationScenario = validationScenario",
+    ):
+        if contract not in pairing_start:
+            raise AssertionError(f"release-validation pairing is missing {contract!r}")
+    if "StartBridgePairing(const std::string& validationScenario = {})" not in app_header:
+        raise AssertionError("normal pairing no longer defaults to an empty validation scenario")
+
+    if "std::string validationScenario;" not in coordinator_header:
+        raise AssertionError("pairing request lacks its bounded validation scenario")
+    issuance = extract_braced_block(
+        coordinator_source, "void CJumpgatePairingCoordinator::Run()"
+    )
+    require_in_order(
+        issuance,
+        "if (!request.validationScenario.empty())",
+        'issueBody["validationScenario"] = request.validationScenario',
+        "m_transport->Post(request.bridgeOrigin + \"/pair/device/code\"",
+    )
+    for test_name in (
+        "NormalIssuanceOmitsReleaseValidationScenario",
+        "ValidationIssuanceIncludesExactScenario",
+    ):
+        if f"TEST(TestJumpgatePairingCoordinator, {test_name})" not in coordinator_test:
+            raise AssertionError(f"pairing coordinator lacks {test_name} coverage")
+
+
 def main(arguments):
     if arguments:
         if len(arguments) != 2 or arguments[0] != "--verify-gtest-inventory":
@@ -3651,6 +3739,7 @@ def main(arguments):
     verify_credential_context_wiring()
     verify_back_lifecycle_rejection_contract()
     verify_native_back_wiring()
+    verify_release_validation_pairing_contract()
     print(
         f"Jumpgate host-test policy: {host_test_count} source-declared tests selected"
     )
